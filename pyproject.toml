@@ -4,9 +4,12 @@ version = "0.1.0"
 description = "PDF parser used to convert PDFs for the D3 Annotation Hub"
 authors = [{ name = "Emanuel Quadros", email = "emanuel.quadros@dsmz.de" }]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "<3.14,>=3.12"
 license = "GPL-3.0-or-later"
-dependencies = []
+dependencies = [
+  "gmft>=0.4.3",
+  "transformers>=4.46,<5",
+]
 
 [build-system]
 requires = ["pdm-backend"]
@@ -51,7 +54,7 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 known-first-party = ["pdfparser"]
 
 [tool.mypy]
-python_version = "{{ cookiecutter.python_version | replace('>=', '') | replace('~=', '') | replace('==', '') | replace('>', '') }}"
+python_version = "3.13"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

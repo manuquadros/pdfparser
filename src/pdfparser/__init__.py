@@ -8,3 +8,7 @@ try:
     beartype_this_package()
 except ImportError:
     pass
+
+from pdfparser.tables import ExtractedTable, extract_tables
+
+__all__ = ["ExtractedTable", "extract_tables"]
