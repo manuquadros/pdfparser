@@ -9,6 +9,9 @@ license = "GPL-3.0-or-later"
 dependencies = [
   "gmft>=0.4.3",
   "transformers>=4.46,<5",
+  "httpx>=0.28.1",
+  "lxml>=6.1.1",
+  "xmlparser @ git+https://github.com/manuquadros/xmlparser.git@master",
 ]
 
 [build-system]
@@ -17,18 +20,21 @@ build-backend = "pdm.backend"
 
 [dependency-groups]
 dev = [
-  "beartype>=0.21",
-  "ruff>=0.9",
-  "mypy>=1.13",
-  "pytest>=8",
-  "pytest-cov>=6",
-  "pytest-sugar>=1",
-  "pytest-asyncio>=1",
-  "pre-commit>=4",
-  "sphinx>=8",
-  "pydata-sphinx-theme>=0.16",
-  "sphinx-autodoc-typehints>=3",
-  "sphinx-autobuild>=2024",
+    "beartype>=0.21",
+    "ruff>=0.9",
+    "mypy>=1.13",
+    "pytest>=8",
+    "pytest-cov>=6",
+    "pytest-sugar>=1",
+    "pytest-asyncio>=1",
+    "pre-commit>=4",
+    "sphinx>=8",
+    "pydata-sphinx-theme>=0.16",
+    "sphinx-autodoc-typehints>=3",
+    "sphinx-autobuild>=2024",
+    "pandas-stubs>=3.0.0.260204",
+    "lxml-stubs>=0.5.1",
+    "ipython-autotime>=0.3.2",
 ]
 
 [tool.pdm.scripts]

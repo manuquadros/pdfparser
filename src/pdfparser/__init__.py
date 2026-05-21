@@ -9,6 +9,7 @@ try:
 except ImportError:
     pass
 
+from pdfparser.document import pdf_to_html
 from pdfparser.tables import ExtractedTable, extract_tables
 
-__all__ = ["ExtractedTable", "extract_tables"]
+__all__ = ["ExtractedTable", "extract_tables", "pdf_to_html"]

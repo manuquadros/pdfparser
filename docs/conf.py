@@ -4,7 +4,7 @@ import datetime
 import sys
 from pathlib import Path
 
-# Make the package importable without installation (fallback for CI without editable install)
+# Make the package importable without installation.
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 project = "pdfparser"

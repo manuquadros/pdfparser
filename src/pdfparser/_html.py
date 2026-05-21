@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import pandas as pd
+import pandas as pd  # noqa: TCH002 — beartype resolves annotations at runtime
 
 
 def clean_col_name(name: object) -> str:
