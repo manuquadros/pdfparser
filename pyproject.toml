@@ -1,0 +1,70 @@
+[project]
+name = "pdfparser"
+version = "0.1.0"
+description = "PDF parser used to convert PDFs for the D3 Annotation Hub"
+authors = [{ name = "Emanuel Quadros", email = "emanuel.quadros@dsmz.de" }]
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+dependencies = []
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[dependency-groups]
+dev = [
+  "beartype>=0.21",
+  "ruff>=0.9",
+  "mypy>=1.13",
+  "pytest>=8",
+  "pytest-cov>=6",
+  "pytest-sugar>=1",
+  "pytest-asyncio>=1",
+  "pre-commit>=4",
+  "sphinx>=8",
+  "pydata-sphinx-theme>=0.16",
+  "sphinx-autodoc-typehints>=3",
+  "sphinx-autobuild>=2024",
+]
+
+[tool.pdm.scripts]
+test = "pytest"
+test-cov = "pytest --cov=src/pdfparser --cov-report=term-missing"
+lint = "ruff check ."
+fmt = "ruff format ."
+fmt-check = "ruff format --check ."
+typecheck = "mypy src"
+docs-build.shell = "sphinx-apidoc -o docs/api src/pdfparser --force && sphinx-build docs docs/_build/html"
+docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pdfparser"]
+
+[tool.mypy]
+python_version = "{{ cookiecutter.python_version | replace('>=', '') | replace('~=', '') | replace('==', '') | replace('>', '') }}"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/pdfparser"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

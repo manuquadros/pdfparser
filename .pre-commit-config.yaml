@@ -1,0 +1,14 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pdm-project/pdm
+    rev: 2.26.1
+    hooks:
+      - id: pdm-export
+        args: ["-o", "requirements.txt", "--without-hashes"]
+        files: ^pylock\.toml$

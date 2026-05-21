@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.pdm-build/
+
+# PDM
+.pdm-python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docs
+docs/_build/
+docs/api/
+
+# OS
+.DS_Store
+Thumbs.db
