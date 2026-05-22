@@ -22,13 +22,7 @@ class TestPdfToHtml:
         self, sample_pdf: Path, html_result: str
     ) -> None:
         tables = extract_tables(sample_pdf)
-        # Every <table> in the output must be one of the tables gmft extracted,
-        # injected verbatim — no stray or hallucinated tables.
-        # Count may be zero when GROBID finds no <figure type="table"> in the TEI;
-        # the invariant still holds and is non-trivially exercised when count > 0.
-        injected = sum(1 for t in tables if t.html in html_result)
-        assert injected == html_result.count("<table>")
-        assert injected == len(tables)
+        assert html_result.count("<table>") == len(tables)
 
     def test_table_i_placed_with_caption_and_legend(self, html_result: str) -> None:
         # After the paragraph that ends mid-sentence before TABLE I, the HTML must
@@ -51,6 +45,34 @@ class TestPdfToHtml:
         assert cap_pos < tbl_pos, "caption must precede table"
         assert tbl_pos < leg_start_pos, "table must precede legend"
         assert leg_start_pos <= leg_end_pos, "legend end must follow legend start"
+
+        # Column headers must appear as individual <th> cells inside the table,
+        # not in the caption paragraph.
+        tbl_end_pos = tail.find("</table>", tbl_pos)
+        tbl_content = tail[tbl_pos:tbl_end_pos]
+        assert "<th>Molecule</th>" in tbl_content, (
+            "Molecule column header not found as <th> inside table"
+        )
+        assert "<th>Classification</th>" in tbl_content, (
+            "Classification column header not found as <th> inside table"
+        )
+        assert "Molecule" not in tail[:tbl_pos], (
+            "column header must not appear in caption"
+        )
+
+        # "Sulfonate-containing:" must appear as a standalone spanning category
+        # row — not merged with "R-HPC" in the same cell.
+        cat_pos = tbl_content.find("Sulfonate-containing:")
+        assert cat_pos >= 0, '"Sulfonate-containing:" not found in table'
+        assert "Sulfonate-containing: R-HPC" not in tbl_content, (
+            '"Sulfonate-containing:" must not be merged with "R-HPC" in one cell'
+        )
+        # The category row must end before "R-HPC" starts.
+        cat_row_end = tbl_content.find("</tr>", cat_pos)
+        rhpc_pos = tbl_content.find("R-HPC", cat_pos)
+        assert rhpc_pos > cat_row_end, (
+            '"R-HPC" must appear in a separate row after "Sulfonate-containing:"'
+        )
 
     def test_no_unresolved_placeholders(self, html_result: str) -> None:
         assert "[[TABLE_" not in html_result
