@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import html as _stdlib_html
+import re
+
 import pandas as pd  # noqa: TCH002 — beartype resolves annotations at runtime
+
+
+def strip_html_tags(html_str: str) -> str:
+    """Strip HTML markup and decode entities, returning plain text."""
+    return _stdlib_html.unescape(re.sub(r"<[^>]+>", " ", html_str))
 
 
 def clean_col_name(name: object) -> str:

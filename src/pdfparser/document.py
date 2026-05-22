@@ -12,6 +12,7 @@ from pathlib import Path
 
 from lxml import html as lxhtml
 
+from pdfparser._html import strip_html_tags
 from pdfparser._tei import _TABLE_PLACEHOLDER_RE, tei_to_parts
 from pdfparser.grobid import DEFAULT_GROBID_URL, pdf_to_tei
 from pdfparser.tables import (
@@ -128,8 +129,6 @@ def _inject_tables(html: str, tables: list[ExtractedTable]) -> str:
     return re.sub(_TABLE_PLACEHOLDER_RE, _replace, html)
 
 
-# Matches a <p> element (with optional attributes) whose text content starts
-# with a table label such as "TABLE I", "TABLE 3", etc.
 _TABLE_PARA_RE = re.compile(
     r"<p[^>]*>\s*TABLE\s+(?:[IVXLCDM]+|\d+)(.*?)</p>",
     re.IGNORECASE | re.DOTALL,
@@ -153,16 +152,16 @@ def _place_unplaced_tables(body_html: str, tables: list[ExtractedTable]) -> str:
     if not unplaced:
         return body_html
 
-    counter = [0]
+    idx = 0
 
     def _replace(m: re.Match[str]) -> str:
-        idx = counter[0]
+        nonlocal idx
         if idx >= len(unplaced):
             return m.group(0)
-        counter[0] += 1
         table = unplaced[idx]
+        idx += 1
 
-        plain = _html.unescape(re.sub(r"<[^>]+>", " ", m.group(1))).strip()
+        plain = strip_html_tags(m.group(1)).strip()
         caption, legend = _split_caption_legend(plain, table)
 
         parts: list[str] = []
@@ -174,47 +173,43 @@ def _place_unplaced_tables(body_html: str, tables: list[ExtractedTable]) -> str:
         return "\n".join(parts)
 
     result = _TABLE_PARA_RE.sub(_replace, body_html)
-
-    for table in unplaced[counter[0] :]:
-        result += table.html
-
+    result += "".join(t.html for t in unplaced[idx:])
     return result
 
 
 def _split_caption_legend(text: str, table: ExtractedTable) -> tuple[str, str]:
     """Split a table paragraph's body text into ``(caption, legend)``.
 
-    Scans ``text`` for the first and last occurrence of any gmft table cell
-    value that looks like data (digit-containing tokens ≥ 4 chars, or plain
-    text tokens ≥ 6 chars).  The text before the first match is the caption;
-    the text after the last match is the legend.  If no anchors are found
-    the whole text is treated as the caption.
+    Builds a set of bigrams (consecutive whitespace-delimited token pairs,
+    ≥ 8 chars) from every gmft cell and searches for them verbatim in
+    ``text``.  The text before the first match is the caption; the text after
+    the last match is the legend.  If no bigrams match, the whole text is
+    treated as the caption.
     """
     table_root = lxhtml.fragment_fromstring(table.html)
-    anchors: list[str] = []
+    anchors: set[str] = set()
     for cell in table_root.iter("th", "td"):
-        for tok in re.split(r"\s+", cell.text_content()):
-            tok = tok.strip()
-            if (len(tok) >= 4 and any(c.isdigit() for c in tok)) or len(tok) >= 6:
-                anchors.append(tok)
+        tokens = [t for t in re.split(r"\s+", cell.text_content().strip()) if t]
+        for i in range(len(tokens) - 1):
+            bigram = f"{tokens[i]} {tokens[i + 1]}"
+            if len(bigram) >= 8:
+                anchors.add(bigram)
 
     if not anchors:
         return text, ""
 
-    first_start = len(text)
-    last_end = 0
-    found = False
-    for tok in set(anchors):
-        for m in re.finditer(re.escape(tok), text, re.IGNORECASE):
-            found = True
-            if m.start() < first_start:
-                first_start = m.start()
-            if m.end() > last_end:
-                last_end = m.end()
+    pattern = re.compile(
+        "|".join(re.escape(b) for b in sorted(anchors, key=len, reverse=True)),
+        re.IGNORECASE,
+    )
+    first_start = last_end = None
+    for m in pattern.finditer(text):
+        if first_start is None:
+            first_start = m.start()
+        last_end = m.end()
 
-    if not found:
+    if first_start is None:
         return text, ""
-
     return text[:first_start].strip(), text[last_end:].strip()
 
 
