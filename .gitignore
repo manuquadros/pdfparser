@@ -12,6 +12,7 @@ build/
 
 # PDM
 .pdm-python
+pdm-tool
 
 # Virtual environments
 .venv/
