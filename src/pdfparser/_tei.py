@@ -18,7 +18,6 @@ _RENAME: dict[str, str] = {
     "listItem": "list-item",
 }
 
-# Inline elements whose tags are stripped but whose text content is kept.
 _UNWRAP_TAGS = {"ref", "note", "formula"}
 
 # Shared with document.py so both sides of the placeholder contract stay in sync.
