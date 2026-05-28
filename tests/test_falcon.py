@@ -316,6 +316,24 @@ class TestBodyColumnMerge:
         assert len(result) == 2
         assert "which is As a testament" not in " ".join(result)
 
+    def test_document_type_label_suppressed(self) -> None:
+        regions = self._regions(
+            ("Normal body text begins here.", [0, 120, 800, 170]),
+        )
+        # Insert a paragraph_title region with a journal document-type label.
+        regions.insert(
+            2,
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 110, 800, 118],
+                "text": "Article",
+            },
+        )
+        body = _body(_run_falcon([regions]))
+
+        assert "<h2>Article</h2>" not in body
+        assert "Normal body text begins here." in body
+
     def test_function_word_end_merges_lowercase_continuation(self) -> None:
         from pdfparser.falcon import _merge_split_paragraphs
 

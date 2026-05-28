@@ -193,6 +193,19 @@ _FUNCTION_WORD_END_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_FLOATS_TO_SKIP = 2
+_DOCUMENT_TYPE_LABELS = frozenset(
+    {
+        "article",
+        "research article",
+        "original article",
+        "letter",
+        "review",
+        "communication",
+        "report",
+        "brief communication",
+        "short communication",
+    }
+)
 
 
 def _plain_p_text(s: str) -> str | None:
@@ -424,6 +437,9 @@ def falcon_pdf_to_html(
 
             if cat == "abstract":
                 abstract_parts.append(f"<p>{_inline_md_to_html(text)}</p>")
+                continue
+
+            if cat == "paragraph_title" and text.lower() in _DOCUMENT_TYPE_LABELS:
                 continue
 
             if cat == "text" and title_norm:
