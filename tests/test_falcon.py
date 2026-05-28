@@ -377,6 +377,44 @@ class TestBodyColumnMerge:
         assert "First page body." in body
         assert "Second page body." in body
 
+    def test_footnotes_placed_before_references(self) -> None:
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "footnote",
+                "bbox": [0, 110, 800, 130],
+                "text": "Abbreviations: X, xylene.",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 140, 800, 200],
+                "text": "Main body paragraph.",
+            },
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 210, 800, 230],
+                "text": "References",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 240, 800, 270],
+                "text": "[1] Smith et al. 2020.",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+
+        fn_pos = body.find("Abbreviations: X")
+        ref_heading_pos = body.find("<h2>References</h2>")
+        body_pos = body.find("Main body paragraph.")
+        ref_pos = body.find("[1] Smith et al.")
+
+        assert body_pos < fn_pos, "footnote must come after body text"
+        assert fn_pos < ref_heading_pos, "footnote must come before References heading"
+        assert ref_heading_pos < ref_pos, (
+            "References heading must precede reference items"
+        )
+
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
@@ -431,3 +469,17 @@ class TestFalconPipeline:
             " clearly showed interaction of the R152"
         )
         assert expected in falcon_html
+
+    def test_paper_footnotes_after_body_before_references(
+        self, falcon_html: str
+    ) -> None:
+        correspondence = "To whom correspondence should be addressed"
+        assert correspondence in falcon_html
+        fn_pos = falcon_html.find(correspondence)
+        # Must follow substantial body content, not appear near the top.
+        body_start = falcon_html.find('<div class="body">')
+        assert fn_pos - body_start > 2000
+        # Must precede the reference list.
+        first_ref_pos = falcon_html.find("<p>[1]")
+        if first_ref_pos != -1:
+            assert fn_pos < first_ref_pos

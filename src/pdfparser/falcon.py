@@ -168,10 +168,10 @@ def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
     return [r for _, r in sorted(classified, key=lambda item: key(item[0]))]
 
 
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 # re.DOTALL intentionally omitted: italic spans in academic text don't cross
 # line boundaries, and DOTALL would cause two stray footnote asterisks anywhere
 # in a multi-line region to wrap the entire intervening content in <em>.
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _ITALIC_RE = re.compile(r"\*(.+?)\*")
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+")
 _REF_LIST_RE = re.compile(r"^\[1\]")
@@ -196,6 +196,7 @@ _FUNCTION_WORD_END_RE = re.compile(
 _MAX_FLOATS_TO_SKIP = 2
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
+        "abstract",
         "article",
         "research article",
         "original article",
@@ -206,6 +207,11 @@ _DOCUMENT_TYPE_LABELS = frozenset(
         "brief communication",
         "short communication",
     }
+)
+# re.IGNORECASE: OCR output casing is unreliable ("REFERENCES", "References").
+# <h\d[^>]*> tolerates class/id attributes the model may inject.
+_REF_SECTION_RE = re.compile(
+    r"^(?:<h\d[^>]*>\s*References\s*</h\d>|<p>\[1\])", re.IGNORECASE
 )
 
 
@@ -266,6 +272,9 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
 
 
 _RUNNING_HEADER_MAX_LEN = 200
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_WHITESPACE_RE = re.compile(r"\s+")
+_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 
 
 def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
@@ -273,11 +282,12 @@ def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
     are always structural artefacts (running headers, footers, page labels) that
     the layout model mis-classified as text.
     """
-    counts: Counter[str] = Counter()
-    for p in parts:
-        inner = _plain_p_text(p)
-        if inner is not None and len(inner) <= _RUNNING_HEADER_MAX_LEN:
-            counts[p] += 1
+    counts: Counter[str] = Counter(
+        p
+        for p in parts
+        if (inner := _plain_p_text(p)) is not None
+        and len(inner) <= _RUNNING_HEADER_MAX_LEN
+    )
     repeated = {p for p, n in counts.items() if n > 1}
     return [p for p in parts if p not in repeated]
 
@@ -367,7 +377,7 @@ def _extract_meta(page0_regions: list[dict], page_width: float) -> dict[str, str
         if not text:
             continue
         if cat == "doc_title" and not title:
-            title = re.sub(r"<[^>]+>", "", text).strip()
+            title = _STRIP_TAGS_RE.sub("", text).strip()
         elif (
             cat == "text"
             and not author
@@ -375,7 +385,7 @@ def _extract_meta(page0_regions: list[dict], page_width: float) -> dict[str, str
             and text.count("\n") <= 2
             and len(text) < 200
         ):
-            author = re.sub(r"<[^>]+>", "", text).strip()
+            author = _STRIP_TAGS_RE.sub("", text).strip()
     return {"title": title or "Untitled", "authors": author, "year": ""}
 
 
@@ -407,11 +417,12 @@ def falcon_pdf_to_html(
 
     images = _render_pages(pdf_path)
 
+    cuda_available = torch.cuda.is_available()
     all_regions: list[list[dict]] = []
     for img in images:
         with torch.inference_mode():
             results = model.generate_with_layout([img], ocr_batch_size=ocr_batch_size)
-        if torch.cuda.is_available():
+        if cuda_available:
             torch.cuda.empty_cache()
         # Guard against blank/image-only pages that return no regions.
         all_regions.append(results[0] if results else [])
@@ -425,12 +436,14 @@ def falcon_pdf_to_html(
 
     abstract_parts: list[str] = []
     body_parts: list[str] = []
+    footnote_parts: list[str] = []
     # figure_title regions are buffered so the next table can absorb them as
     # <caption> rather than emitting a detached <figure><figcaption>.
     pending_fig_title: str | None = None
 
-    _punct_re = re.compile(r"[^\w\s]")
-    title_norm = re.sub(r"\s+", " ", _punct_re.sub("", meta["title"])).lower().strip()
+    title_norm = (
+        _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", meta["title"])).lower().strip()
+    )
 
     def _flush_fig_title() -> None:
         nonlocal pending_fig_title
@@ -461,7 +474,9 @@ def falcon_pdf_to_html(
                 continue
 
             if cat == "text" and title_norm:
-                text_norm = re.sub(r"\s+", " ", _punct_re.sub("", text)).lower().strip()
+                text_norm = (
+                    _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", text)).lower().strip()
+                )
                 if text_norm == title_norm:
                     continue
 
@@ -471,6 +486,11 @@ def falcon_pdf_to_html(
                 continue
 
             html_chunk = _region_to_html(r)
+
+            if cat == "footnote":
+                # Footnotes don't break a pending figure_title → table pairing.
+                footnote_parts.append(html_chunk)
+                continue
 
             if cat == "table" and pending_fig_title:
                 html_chunk = _inject_caption(html_chunk, pending_fig_title)
@@ -494,11 +514,16 @@ def falcon_pdf_to_html(
         if abstract_parts
         else ""
     )
-    body_html = "\n".join(
-        _merge_split_paragraphs(
-            _merge_split_paragraphs(_remove_repeated_short_paragraphs(body_parts))
-        )
+    processed_body = _merge_split_paragraphs(
+        _merge_split_paragraphs(_remove_repeated_short_paragraphs(body_parts))
     )
+    if footnote_parts:
+        ref_idx = next(
+            (i for i, p in enumerate(processed_body) if _REF_SECTION_RE.match(p)),
+            len(processed_body),
+        )
+        processed_body[ref_idx:ref_idx] = footnote_parts
+    body_html = "\n".join(processed_body)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
