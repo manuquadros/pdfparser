@@ -347,6 +347,36 @@ class TestBodyColumnMerge:
         assert len(result) == 1
         assert "enzyme is bound to the cofactor" in result[0]
 
+    def test_running_footer_suppressed_across_pages(self) -> None:
+        footer = {
+            "category": "text",
+            "bbox": [0, 950, 800, 980],
+            "text": "Running Footer Text",
+        }
+        page1 = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "text",
+                "bbox": [0, 120, 800, 170],
+                "text": "First page body.",
+            },
+            footer,
+        ]
+        page2 = [
+            {
+                "category": "text",
+                "bbox": [0, 120, 800, 170],
+                "text": "Second page body.",
+            },
+            footer,
+        ]
+        body = _body(_run_falcon([page1, page2]))
+
+        assert "Running Footer Text" not in body
+        assert "First page body." in body
+        assert "Second page body." in body
+
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"

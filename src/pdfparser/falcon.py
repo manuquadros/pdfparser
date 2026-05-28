@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import html as _html
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ _MAX_LONG_SIDE = 1024
 _DEFAULT_OCR_BATCH_SIZE = 2
 
 _HTML_CATS = frozenset({"table", "vision_footnote"})
-_SKIP_CATS = frozenset({"header", "page-header"})
+_SKIP_CATS = frozenset({"header", "page-header", "footer", "page-footer"})
 
 _WRAPPER_CSS = """
 body {
@@ -264,6 +265,23 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     return out
 
 
+_RUNNING_HEADER_MAX_LEN = 200
+
+
+def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
+    """Legitimate prose never repeats verbatim; repeated identical short paragraphs
+    are always structural artefacts (running headers, footers, page labels) that
+    the layout model mis-classified as text.
+    """
+    counts: Counter[str] = Counter()
+    for p in parts:
+        inner = _plain_p_text(p)
+        if inner is not None and len(inner) <= _RUNNING_HEADER_MAX_LEN:
+            counts[p] += 1
+    repeated = {p for p, n in counts.items() if n > 1}
+    return [p for p in parts if p not in repeated]
+
+
 def _inline_md_to_html(text: str) -> str:
     text = _BOLD_RE.sub(r"<strong>\1</strong>", text)
     text = _ITALIC_RE.sub(r"<em>\1</em>", text)
@@ -476,7 +494,11 @@ def falcon_pdf_to_html(
         if abstract_parts
         else ""
     )
-    body_html = "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(body_parts)))
+    body_html = "\n".join(
+        _merge_split_paragraphs(
+            _merge_split_paragraphs(_remove_repeated_short_paragraphs(body_parts))
+        )
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
