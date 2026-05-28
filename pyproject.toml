@@ -40,6 +40,8 @@ dev = [
   "pandas-stubs>=3.0.0.260204",
   "lxml-stubs>=0.5.1",
   "ipython-autotime>=0.3.2",
+  "starlette>=1.0.1",
+  "transformers>=5.0.0rc3",
 ]
 
 [[tool.pdm.source]]

@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from PIL import Image
 
 
@@ -22,6 +23,29 @@ def _run_falcon(regions_per_page: list[list[dict]]) -> str:
 
     with patch("pdfparser.falcon._render_pages", return_value=fake_images):
         return falcon_pdf_to_html(Path("/fake/paper.pdf"), model=fake_model)
+
+
+def _body(html: str) -> str:
+    """Extract the content of the <div class="body"> element.
+
+    Depth-aware so nested </div> inside model-emitted HTML doesn't truncate.
+    """
+    start = html.find('<div class="body">')
+    assert start >= 0, "body div not found"
+    pos = start
+    depth = 0
+    while pos < len(html):
+        if html.startswith("<div", pos):
+            depth += 1
+            pos += 4
+        elif html.startswith("</div>", pos):
+            depth -= 1
+            if depth == 0:
+                return html[start:pos]
+            pos += 6
+        else:
+            pos += 1
+    raise AssertionError("unclosed body div")
 
 
 class TestAbstractColumnMerge:
@@ -48,7 +72,6 @@ class TestAbstractColumnMerge:
         ]
         html = _run_falcon([regions])
 
-        # The two fragments must not appear as separate <p> elements.
         assert "<p>experimental biochemistry.</p>" not in html
         assert "classical and contemporary</p>" not in html
 
@@ -71,7 +94,6 @@ class TestAbstractColumnMerge:
         ]
         html = _run_falcon([regions])
 
-        # A single space must separate the two joined fragments.
         assert "classical and contemporary experimental biochemistry." in html
 
     def test_single_abstract_region_unchanged(self) -> None:
@@ -87,7 +109,7 @@ class TestAbstractColumnMerge:
         assert "A straightforward single-region abstract." in html
         assert html.count("<p>A straightforward") == 1
 
-    def test_abstract_text_appears_in_abstract_section(self) -> None:
+    def test_abstract_text_in_single_paragraph(self) -> None:
         regions = [
             {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
             {
@@ -103,13 +125,174 @@ class TestAbstractColumnMerge:
         ]
         html = _run_falcon([regions])
 
-        abstract_start = html.find("<section class='abstract'>")
-        abstract_end = html.find("</section>", abstract_start)
-        assert abstract_start >= 0, "abstract section not found"
-        abstract_block = html[abstract_start:abstract_end]
+        start = html.find("<section class='abstract'>")
+        end = html.find("</section>", start)
+        assert start >= 0
+        block = html[start:end]
 
-        assert "First fragment without terminal punctuation" in abstract_block
-        assert "second fragment closes the sentence." in abstract_block
-        assert abstract_block.count("<p>") == 1, (
-            "expected exactly one <p> inside abstract, got multiple"
+        assert "First fragment without terminal punctuation" in block
+        assert "second fragment closes the sentence." in block
+        assert block.count("<p>") == 1, "expected one <p> inside abstract"
+
+
+class TestBodyColumnMerge:
+    """The same column-wrap merging must apply to body text regions."""
+
+    def _regions(self, *text_pairs: tuple[str, list[int]]) -> list[dict]:
+        regions: list[dict] = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {
+                "category": "abstract",
+                "bbox": [0, 50, 800, 100],
+                "text": "Abstract sentence.",
+            },
+        ]
+        for text, bbox in text_pairs:
+            regions.append({"category": "text", "bbox": bbox, "text": text})
+        return regions
+
+    def test_body_mid_sentence_split_merges(self) -> None:
+        regions = self._regions(
+            (
+                "The enzyme catalyzes the stereospecific oxidation of",
+                [0, 120, 380, 170],
+            ),
+            ("(R)-hydroxypropyl-coenzyme M.", [420, 120, 800, 170]),
         )
+        body = _body(_run_falcon([regions]))
+
+        assert "<p>(R)-hydroxypropyl-coenzyme M.</p>" not in body
+        assert "stereospecific oxidation of (R)-hydroxypropyl-coenzyme M." in body
+
+    def test_body_complete_paragraph_not_merged(self) -> None:
+        regions = self._regions(
+            ("First complete sentence ends here.", [0, 120, 800, 170]),
+            ("Second complete sentence, independent.", [0, 180, 800, 230]),
+        )
+        body = _body(_run_falcon([regions]))
+
+        assert "First complete sentence ends here." in body
+        assert "Second complete sentence, independent." in body
+        assert body.count("<p>") == 2
+
+    def test_table_between_fragments_moves_after_merged_paragraph(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        table = "<table><tr><td>val</td></tr></table>"
+        parts = [
+            "<p>The rate constants are</p>",
+            table,
+            "<p>consistent with the proposed mechanism.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+
+        assert len(result) == 2
+        assert "rate constants are consistent with the proposed mechanism." in result[0]
+        assert result[1] == table
+
+    def test_heading_between_fragments_is_a_barrier(self) -> None:
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {
+                "category": "abstract",
+                "bbox": [0, 50, 800, 100],
+                "text": "Abstract sentence.",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 120, 380, 170],
+                "text": "End of introduction without terminal punctuation",
+            },
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 180, 800, 210],
+                "text": "Methods",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 220, 800, 270],
+                "text": "We used mass spectrometry.",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+
+        assert "<h2>Methods</h2>" in body
+        assert "We used mass spectrometry." in body
+        heading_pos = body.find("<h2>Methods</h2>")
+        intro_frag_pos = body.find("End of introduction")
+        methods_pos = body.find("We used mass spectrometry.")
+
+        assert intro_frag_pos < heading_pos < methods_pos
+
+    def test_enum_item_not_merged_into_preceding_paragraph(self) -> None:
+        regions = self._regions(
+            ("Results for all conditions are presented below", [0, 120, 380, 170]),
+            ("1. Condition A yielded the highest activity.", [420, 120, 800, 170]),
+        )
+        body = _body(_run_falcon([regions]))
+
+        assert "presented below" in body
+        assert "1. Condition A yielded" in body
+        assert "presented below 1." not in body
+
+    def test_parenthetical_enum_not_merged(self) -> None:
+        regions = self._regions(
+            ("Samples were processed in three steps", [0, 120, 380, 170]),
+            ("(a) centrifugation at 3000 rpm.", [420, 120, 800, 170]),
+        )
+        body = _body(_run_falcon([regions]))
+
+        assert "processed in three steps" in body
+        assert "(a) centrifugation" in body
+        assert "three steps (a)" not in body
+
+    def test_three_fragment_chain_fully_merged(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        parts = [
+            "<p>The enzyme catalyzes the stereospecific</p>",
+            "<p>oxidation of (R)-hydroxypropyl-coenzyme</p>",
+            "<p>M to the corresponding ketone.</p>",
+        ]
+        result = _merge_split_paragraphs(_merge_split_paragraphs(parts))
+
+        assert len(result) == 1
+        assert (
+            "stereospecific oxidation of (R)-hydroxypropyl-coenzyme M to the"
+            " corresponding ketone."
+        ) in result[0]
+
+
+_SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
+
+
+@pytest.fixture(scope="module")
+def spike_html() -> str:
+    if not _SPIKE_HTML.exists():
+        pytest.skip("spike_results/falcon_full.html not found")
+    return _SPIKE_HTML.read_text()
+
+
+class TestFalconSpikeOutput:
+    """Regression tests against the actual Falcon-OCR output for 30592559.pdf.
+
+    These tests run against the pre-generated spike_results/falcon_full.html
+    and are skipped when that file is absent.  They document bugs that must
+    be fixed before the spike file is regenerated.
+    """
+
+    def test_which_is_not_merged_with_as_a_testament(self, spike_html: str) -> None:
+        # "...epoxypropane, which is" ends without terminal punctuation, but
+        # "As a testament to the utility..." starts a new sentence — the two
+        # must remain in separate paragraphs.
+        assert "which is As a testament to the utility" not in spike_html
+
+    def test_ternary_complex_followed_by_clearly_showed(self, spike_html: str) -> None:
+        # "The 1.8 Å ternary complex (enzyme + 2-KPC + NAD⁺)" ends mid-sentence;
+        # "clearly showed interaction of the R152" is its direct continuation and
+        # must appear immediately after with only a space between them.
+        expected = (
+            "The 1.8 Å ternary complex (enzyme + 2-KPC + NAD⁺)"
+            " clearly showed interaction of the R152"
+        )
+        assert expected in spike_html

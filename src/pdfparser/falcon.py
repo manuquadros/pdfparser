@@ -146,7 +146,7 @@ def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
         else:
             col = 1  # left column
         band = int(y0 / est_height * 25)
-        return (band, col, y0)
+        return (band, col, float(y0))
 
     return sorted(regions, key=key)
 
@@ -159,6 +159,61 @@ _ITALIC_RE = re.compile(r"\*(.+?)\*")
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+")
 _REF_LIST_RE = re.compile(r"^\[1\]")
 _REF_SPLIT_RE = re.compile(r"\n(?=\[\d+\])")
+_SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
+_FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
+_ENUM_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s|\[\d|[•\-]\s|\([a-z0-9ivx]+\)\s)", re.IGNORECASE
+)
+_MAX_FLOATS_TO_SKIP = 2
+
+
+def _plain_p_text(s: str) -> str | None:
+    """Return the inner content of a plain ``<p>…</p>`` block, or ``None``.
+
+    Returns ``None`` for footnote/class paragraphs, multi-paragraph strings
+    (reference lists), headings, tables, figures, and any other element.
+    """
+    if s.startswith("<p>") and s.endswith("</p>") and s.count("</p>") == 1:
+        return s[3:-4]
+    return None
+
+
+def _merge_split_paragraphs(parts: list[str]) -> list[str]:
+    """Stitch paragraph fragments broken by two-column PDF layout.
+
+    When a plain ``<p>`` ends without terminal punctuation the next plain
+    ``<p>`` is treated as a continuation.  Intervening tables and figures
+    (up to ``_MAX_FLOATS_TO_SKIP``) are collected and re-emitted *after*
+    the merged paragraph so the float stays near its reference text.
+
+    Headings, footnote paragraphs, and apparent enumeration items act as
+    merge barriers and are never absorbed into an adjacent paragraph.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        inner = _plain_p_text(part)
+        if inner is not None and not _SENTENCE_END_RE.search(inner.rstrip()):
+            j = i + 1
+            floats: list[str] = []
+            while (
+                j < len(parts)
+                and _FLOAT_RE.match(parts[j])
+                and len(floats) < _MAX_FLOATS_TO_SKIP
+            ):
+                floats.append(parts[j])
+                j += 1
+            if j < len(parts):
+                cont = _plain_p_text(parts[j])
+                if cont is not None and not _ENUM_RE.match(cont):
+                    out.append(f"<p>{inner.rstrip()} {cont.lstrip()}</p>")
+                    out.extend(floats)
+                    i = j + 1
+                    continue
+        out.append(part)
+        i += 1
+    return out
 
 
 def _inline_md_to_html(text: str) -> str:
@@ -370,11 +425,13 @@ def falcon_pdf_to_html(
     byline_safe = _html.escape("; ".join(filter(None, [meta["authors"], meta["year"]])))
 
     abstract_html = (
-        "<section class='abstract'>\n" + "\n".join(abstract_parts) + "\n</section>"
+        "<section class='abstract'>\n"
+        + "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(abstract_parts)))
+        + "\n</section>"
         if abstract_parts
         else ""
     )
-    body_html = "\n".join(body_parts)
+    body_html = "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(body_parts)))
 
     return f"""<!DOCTYPE html>
 <html lang="en">
