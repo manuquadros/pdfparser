@@ -347,6 +347,29 @@ class TestBodyColumnMerge:
         assert len(result) == 1
         assert "enzyme is bound to the cofactor" in result[0]
 
+    def test_bold_label_not_merged_into_preceding_paragraph(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        parts = [
+            "<p>California State University-Chico, Chico, California, 95929</p>",
+            "<p><strong>Keywords:</strong> enzyme kinetics; stereoselectivity.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+        assert len(result) == 2
+        assert "95929 <strong>Keywords:" not in " ".join(result)
+
+    def test_hyphenated_word_break_joined_without_space(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        parts = [
+            "<p>enzyme mechanism is some-</p>",
+            "<p>times lost on students.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+        assert len(result) == 1
+        assert "some- times" not in result[0]
+        assert "sometimes" in result[0]
+
     def test_running_footer_suppressed_across_pages(self) -> None:
         footer = {
             "category": "text",
@@ -414,6 +437,34 @@ class TestBodyColumnMerge:
         assert ref_heading_pos < ref_pos, (
             "References heading must precede reference items"
         )
+
+    def test_split_table_label_and_title_concatenated(self) -> None:
+        """Falcon sometimes emits a table label ("TABLE I") and its descriptive
+        title as two consecutive figure_title regions.  Both must appear in the
+        injected <caption>."""
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "figure_title",
+                "bbox": [0, 120, 800, 140],
+                "text": "TABLE I",
+            },
+            {
+                "category": "figure_title",
+                "bbox": [0, 142, 800, 162],
+                "text": "Selected substrates and inhibitors.",
+            },
+            {
+                "category": "table",
+                "bbox": [0, 170, 800, 400],
+                "text": "<table><tr><td>data</td></tr></table>",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert "TABLE I" in body
+        assert "Selected substrates and inhibitors." in body
+        assert "<caption>TABLE I Selected substrates and inhibitors.</caption>" in body
 
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"

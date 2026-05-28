@@ -178,9 +178,13 @@ _REF_LIST_RE = re.compile(r"^\[1\]")
 _REF_SPLIT_RE = re.compile(r"\n(?=\[\d+\])")
 _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
+_HYPHEN_BREAK_RE = re.compile(r"-\s*$")
 _ENUM_RE = re.compile(
     r"^\s*(?:\d+[.)]\s|\[\d|[•\-]\s|\([a-z0-9ivx]+\)\s)", re.IGNORECASE
 )
+# Paragraphs that open with a bold label ("Keywords:", "Abbreviations:", "Note:")
+# are structured metadata, never mid-sentence continuations.
+_BOLD_LABEL_RE = re.compile(r"^<strong>[^<]+:</strong>")
 # A fragment ending with a function word is *definitively* grammatically
 # incomplete: its continuation must be a predicate, object, or complement,
 # which in normal prose starts lowercase.  If the next region starts with an
@@ -242,30 +246,37 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     while i < len(parts):
         part = parts[i]
         inner = _plain_p_text(part)
-        if inner is not None and not _SENTENCE_END_RE.search(inner.rstrip()):
-            j = i + 1
-            floats: list[str] = []
-            while (
-                j < len(parts)
-                and _FLOAT_RE.match(parts[j])
-                and len(floats) < _MAX_FLOATS_TO_SKIP
+        if inner is not None:
+            stripped = inner.rstrip()
+            if not _SENTENCE_END_RE.search(stripped) and not _BOLD_LABEL_RE.match(
+                inner
             ):
-                floats.append(parts[j])
-                j += 1
-            if j < len(parts):
-                cont = _plain_p_text(parts[j])
-                if (
-                    cont is not None
-                    and not _ENUM_RE.match(cont)
-                    and not (
-                        _FUNCTION_WORD_END_RE.search(inner.rstrip())
-                        and cont[:1].isupper()
-                    )
+                j = i + 1
+                floats: list[str] = []
+                while (
+                    j < len(parts)
+                    and _FLOAT_RE.match(parts[j])
+                    and len(floats) < _MAX_FLOATS_TO_SKIP
                 ):
-                    out.append(f"<p>{inner.rstrip()} {cont.lstrip()}</p>")
-                    out.extend(floats)
-                    i = j + 1
-                    continue
+                    floats.append(parts[j])
+                    j += 1
+                if j < len(parts):
+                    cont = _plain_p_text(parts[j])
+                    if (
+                        cont is not None
+                        and not _ENUM_RE.match(cont)
+                        and not _BOLD_LABEL_RE.match(cont)
+                        and not (
+                            _FUNCTION_WORD_END_RE.search(stripped)
+                            and cont[:1].isupper()
+                        )
+                    ):
+                        dehyphenated, n = _HYPHEN_BREAK_RE.subn("", stripped)
+                        joined = dehyphenated + ("" if n else " ") + cont.lstrip()
+                        out.append(f"<p>{joined}</p>")
+                        out.extend(floats)
+                        i = j + 1
+                        continue
         out.append(part)
         i += 1
     return out
@@ -481,8 +492,10 @@ def falcon_pdf_to_html(
                     continue
 
             if cat == "figure_title":
-                _flush_fig_title()
-                pending_fig_title = text
+                if pending_fig_title is not None:
+                    pending_fig_title = pending_fig_title + " " + text
+                else:
+                    pending_fig_title = text
                 continue
 
             html_chunk = _region_to_html(r)
