@@ -135,6 +135,46 @@ class TestAbstractColumnMerge:
         assert block.count("<p>") == 1, "expected one <p> inside abstract"
 
 
+class TestSortRegions:
+    """Unit tests for _sort_regions reading-order logic."""
+
+    def test_right_col_low_y_follows_left_col_high_y(self) -> None:
+        from pdfparser.falcon import _sort_regions
+
+        # Simulate a paragraph whose left-column fragment is near the bottom
+        # of the page (y=700) and whose right-column continuation is near the
+        # top (y=80).  The right fragment must sort AFTER the left fragment.
+        regions = [
+            {"category": "text", "bbox": [0, 700, 380, 750], "text": "left bottom"},
+            {"category": "text", "bbox": [420, 80, 800, 130], "text": "right top"},
+        ]
+        result = _sort_regions(regions, page_width=800.0)
+        assert [r["text"] for r in result] == ["left bottom", "right top"]
+
+    def test_full_width_boundary_separates_sections(self) -> None:
+        from pdfparser.falcon import _sort_regions
+
+        # A full-width heading at y=400 creates two sections.  A right-column
+        # region at y=50 (above the heading, section 0) must come AFTER the
+        # left-column region at y=300 (also above, section 0) but BEFORE the
+        # left-column region at y=500 (below the heading, section 1).
+        regions = [
+            {"category": "text", "bbox": [0, 300, 380, 340], "text": "left top"},
+            {"category": "text", "bbox": [420, 50, 800, 90], "text": "right top"},
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 400, 800, 430],
+                "text": "Heading",
+            },
+            {"category": "text", "bbox": [0, 500, 380, 540], "text": "left below"},
+        ]
+        result = _sort_regions(regions, page_width=800.0)
+        texts = [r["text"] for r in result]
+        assert texts.index("left top") < texts.index("right top")
+        assert texts.index("right top") < texts.index("Heading")
+        assert texts.index("Heading") < texts.index("left below")
+
+
 class TestBodyColumnMerge:
     """The same column-wrap merging must apply to body text regions."""
 
@@ -262,37 +302,84 @@ class TestBodyColumnMerge:
             " corresponding ketone."
         ) in result[0]
 
+    def test_function_word_end_blocks_uppercase_continuation(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
 
+        # Fragment ends with "is" (function word): the continuation MUST start
+        # lowercase in normal prose.  An uppercase start signals the real
+        # continuation was dropped and a new sentence follows — don't merge.
+        parts = [
+            "<p>Propylene is metabolized into epoxypropane, which is</p>",
+            "<p>As a testament to the utility of enzyme kinetics.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+        assert len(result) == 2
+        assert "which is As a testament" not in " ".join(result)
+
+    def test_function_word_end_merges_lowercase_continuation(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        # Same function-word ending, but the continuation starts lowercase —
+        # that IS a valid column-break continuation, so the merge proceeds.
+        parts = [
+            "<p>The rate constant depends on whether the enzyme is</p>",
+            "<p>bound to the cofactor in the ternary complex.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+        assert len(result) == 1
+        assert "enzyme is bound to the cofactor" in result[0]
+
+
+_FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
 
 
-@pytest.fixture(scope="module")
-def spike_html() -> str:
-    if not _SPIKE_HTML.exists():
-        pytest.skip("spike_results/falcon_full.html not found")
-    return _SPIKE_HTML.read_text()
+@pytest.fixture(scope="session")
+def falcon_html() -> str:
+    """Run the full Falcon pipeline; skip if the model is unavailable.
+
+    Writes the result back to spike_results/falcon_full.html so the file
+    stays current after each integration run.
+    """
+    if not _FIXTURE_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_FIXTURE_PDF}")
+    try:
+        from pdfparser.falcon import falcon_pdf_to_html, load_model
+
+        model = load_model()
+    except Exception as e:
+        pytest.skip(f"Falcon model not available: {e}")
+
+    html = falcon_pdf_to_html(_FIXTURE_PDF, model=model)
+    _SPIKE_HTML.write_text(html, encoding="utf-8")
+    return html
 
 
-class TestFalconSpikeOutput:
-    """Regression tests against the actual Falcon-OCR output for 30592559.pdf.
+@pytest.mark.integration
+class TestFalconPipeline:
+    """Integration tests: run the full Falcon pipeline on the fixture PDF.
 
-    These tests run against the pre-generated spike_results/falcon_full.html
-    and are skipped when that file is absent.  They document bugs that must
-    be fixed before the spike file is regenerated.
+    Skipped when the model is not available (no GPU, weights not downloaded).
+    Each run also refreshes spike_results/falcon_full.html.
     """
 
-    def test_which_is_not_merged_with_as_a_testament(self, spike_html: str) -> None:
-        # "...epoxypropane, which is" ends without terminal punctuation, but
-        # "As a testament to the utility..." starts a new sentence — the two
-        # must remain in separate paragraphs.
-        assert "which is As a testament to the utility" not in spike_html
+    def test_abstract_no_column_break(self, falcon_html: str) -> None:
+        abstract_start = falcon_html.find("<section class='abstract'>")
+        abstract_end = falcon_html.find("</section>", abstract_start)
+        abstract_block = falcon_html[abstract_start:abstract_end]
+        # Both halves must be collected: if either is absent the pipeline
+        # dropped a fragment it should have kept.
+        assert "classical and contemporary" in abstract_block
+        assert "experimental biochemistry." in abstract_block
+        # And they must appear in the same paragraph — no split <p>.
+        assert "classical and contemporary</p>" not in abstract_block
 
-    def test_ternary_complex_followed_by_clearly_showed(self, spike_html: str) -> None:
-        # "The 1.8 Å ternary complex (enzyme + 2-KPC + NAD⁺)" ends mid-sentence;
-        # "clearly showed interaction of the R152" is its direct continuation and
-        # must appear immediately after with only a space between them.
+    def test_which_is_not_merged_with_as_a_testament(self, falcon_html: str) -> None:
+        assert "which is As a testament to the utility" not in falcon_html
+
+    def test_ternary_complex_followed_by_clearly_showed(self, falcon_html: str) -> None:
         expected = (
             "The 1.8 Å ternary complex (enzyme + 2-KPC + NAD⁺)"
             " clearly showed interaction of the R152"
         )
-        assert expected in spike_html
+        assert expected in falcon_html

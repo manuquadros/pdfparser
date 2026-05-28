@@ -13,6 +13,7 @@ Typical use::
 
 from __future__ import annotations
 
+import bisect
 import html as _html
 import re
 from pathlib import Path
@@ -127,28 +128,43 @@ def _render_pages(pdf_path: Path) -> list[Any]:
 def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
     """Sort regions into reading order for two-column PDF layouts.
 
-    Regions that span more than 55% of the page width are treated as
-    full-width (column 0).  The remaining regions are assigned to the left
-    (column 1) or right (column 2) half.  Within each coarse vertical band
-    (1/25th of estimated page height) the column order determines priority.
+    Full-width regions (spanning > 55 % of the page) act as section
+    boundaries.  Within each section, left-column content (col 1) is read
+    before right-column content (col 2); within a column, regions are ordered
+    top-to-bottom by y0.
+
+    This correctly handles paragraphs that start near the bottom of the left
+    column and continue near the top of the right column: the left fragment
+    always precedes the right fragment within the same section, regardless of
+    their absolute y positions.
     """
     half = page_width / 2
-    est_height = page_width * 1.3  # portrait approximation
 
-    def key(r: dict) -> tuple[int, int, float]:
-        x0, y0, x1, _ = r["bbox"]
-        span = x1 - x0
+    def classify(r: dict) -> tuple[int, float]:
+        bbox = r.get("bbox")
+        if not bbox:
+            return 1, 0.0  # treat bbox-less regions as left-column at top
+        x0, y0, x1, _ = bbox
         cx = (x0 + x1) / 2
-        if span > 0.55 * page_width:
-            col = 0  # full-width
-        elif cx > half:
-            col = 2  # right column
-        else:
-            col = 1  # left column
-        band = int(y0 / est_height * 25)
-        return (band, col, float(y0))
+        if (x1 - x0) > 0.55 * page_width:
+            return 0, float(y0)
+        return (2 if cx > half else 1), float(y0)
 
-    return sorted(regions, key=key)
+    # Classify once per region; reuse results for both boundaries and sort key.
+    classified = [(classify(r), r) for r in regions]
+
+    # y-positions of full-width elements divide the page into sections.
+    # bisect_right(boundaries, y0) gives the section index: 0 = before the
+    # first full-width element, 1 = after it but before the second, etc.
+    # Full-width elements themselves get the section AFTER their own y0,
+    # so they sort first within that section (col 0 < col 1 < col 2).
+    boundaries: list[float] = sorted(y0 for (col, y0), _ in classified if col == 0)
+
+    def key(col_y0: tuple[int, float]) -> tuple[int, int, float]:
+        col, y0 = col_y0
+        return (bisect.bisect_right(boundaries, y0), col, y0)
+
+    return [r for _, r in sorted(classified, key=lambda item: key(item[0]))]
 
 
 # re.DOTALL intentionally omitted: italic spans in academic text don't cross
@@ -163,6 +179,18 @@ _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
 _ENUM_RE = re.compile(
     r"^\s*(?:\d+[.)]\s|\[\d|[•\-]\s|\([a-z0-9ivx]+\)\s)", re.IGNORECASE
+)
+# A fragment ending with a function word is *definitively* grammatically
+# incomplete: its continuation must be a predicate, object, or complement,
+# which in normal prose starts lowercase.  If the next region starts with an
+# uppercase letter in this context the real continuation was likely dropped by
+# OCR, so we refuse the merge rather than joining unrelated sentences.
+_FUNCTION_WORD_END_RE = re.compile(
+    r"\b(?:a|an|the|is|are|was|were|be|been|being|have|has|had|"
+    r"will|would|can|could|should|may|might|must|do|does|did|"
+    r"of|in|on|at|by|for|with|to|from|and|or|but|nor|"
+    r"that|which|who|whom|this|these|those)\s*$",
+    re.IGNORECASE,
 )
 _MAX_FLOATS_TO_SKIP = 2
 
@@ -206,7 +234,14 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                 j += 1
             if j < len(parts):
                 cont = _plain_p_text(parts[j])
-                if cont is not None and not _ENUM_RE.match(cont):
+                if (
+                    cont is not None
+                    and not _ENUM_RE.match(cont)
+                    and not (
+                        _FUNCTION_WORD_END_RE.search(inner.rstrip())
+                        and cont[:1].isupper()
+                    )
+                ):
                     out.append(f"<p>{inner.rstrip()} {cont.lstrip()}</p>")
                     out.extend(floats)
                     i = j + 1
@@ -359,7 +394,6 @@ def falcon_pdf_to_html(
 
     abstract_parts: list[str] = []
     body_parts: list[str] = []
-    abstract_done = False
     # figure_title regions are buffered so the next table can absorb them as
     # <caption> rather than emitting a detached <figure><figcaption>.
     pending_fig_title: str | None = None
@@ -389,13 +423,8 @@ def falcon_pdf_to_html(
                 continue  # already captured in meta; skip body duplicate
 
             if cat == "abstract":
-                if not abstract_done:
-                    abstract_parts.append(f"<p>{_inline_md_to_html(text)}</p>")
-                # Always skip abstract regions from body, even after abstract_done.
+                abstract_parts.append(f"<p>{_inline_md_to_html(text)}</p>")
                 continue
-
-            if abstract_parts and not abstract_done:
-                abstract_done = True
 
             if cat == "text" and title_norm:
                 text_norm = re.sub(r"\s+", " ", _punct_re.sub("", text)).lower().strip()
