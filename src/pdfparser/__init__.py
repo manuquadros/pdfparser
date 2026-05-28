@@ -9,7 +9,6 @@ try:
 except ImportError:
     pass
 
-from pdfparser.document import pdf_to_html
-from pdfparser.tables import ExtractedTable, extract_tables
+from pdfparser.falcon import falcon_pdf_to_html, load_model
 
-__all__ = ["ExtractedTable", "extract_tables", "pdf_to_html"]
+__all__ = ["falcon_pdf_to_html", "load_model"]
