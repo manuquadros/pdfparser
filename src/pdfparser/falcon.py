@@ -13,15 +13,20 @@ Typical use::
 
 from __future__ import annotations
 
+import base64
 import bisect
 import html as _html
+import io
 import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import pypdfium2 as pdfium
 import torch
 import torch._dynamo
+from PIL import Image
+from transformers import AutoModelForCausalLM
 
 # flex_attention inside Falcon-OCR compiles with fullgraph=True and recompiles
 # as sequence length grows during autoregressive decoding.
@@ -87,8 +92,6 @@ def load_model(device: str | None = None) -> Any:
     )
     paddle.set_device("cpu")
 
-    from transformers import AutoModelForCausalLM
-
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -107,10 +110,7 @@ def load_model(device: str | None = None) -> Any:
     )
 
 
-def _render_pages(pdf_path: Path) -> list[Any]:
-    import pypdfium2 as pdfium
-    from PIL import Image
-
+def _render_pages(pdf_path: Path) -> list[Image.Image]:
     with pdfium.PdfDocument(str(pdf_path)) as pdf:
         pages = []
         for page in pdf:
@@ -289,15 +289,20 @@ _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 
 
 def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
-    """Legitimate prose never repeats verbatim; repeated identical short paragraphs
-    are always structural artefacts (running headers, footers, page labels) that
-    the layout model mis-classified as text.
+    """Drop repeated short paragraphs that are structural artefacts (running
+    headers, footers, page labels) the layout model mis-classified as text.
+
+    Only sentence-*fragment* repeats are removed: running headers carry no
+    terminal punctuation, whereas a legitimately repeated short sentence does,
+    so requiring the absence of sentence-ending punctuation preserves real
+    prose that happens to recur verbatim.
     """
     counts: Counter[str] = Counter(
         p
         for p in parts
         if (inner := _plain_p_text(p)) is not None
         and len(inner) <= _RUNNING_HEADER_MAX_LEN
+        and not _SENTENCE_END_RE.search(inner.rstrip())
     )
     repeated = {p for p, n in counts.items() if n > 1}
     return [p for p in parts if p not in repeated]
@@ -345,9 +350,6 @@ def _region_to_html(r: dict) -> str:
     if cat == "paragraph_title":
         return _heading_html(text)
 
-    if cat == "figure_title":
-        return f"<figure><figcaption>{_inline_md_to_html(text)}</figcaption></figure>"
-
     if cat == "footnote":
         return f'<p class="footnote">{_inline_md_to_html(text)}</p>'
 
@@ -363,6 +365,100 @@ def _region_to_html(r: dict) -> str:
         return f'<p class="footnote">{text}</p>'
 
     return f"<p>{_inline_md_to_html(text)}</p>"
+
+
+_MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
+
+
+def _figure_html(crop: Image.Image, caption_text: str | None) -> str:
+    """Encode a figure crop as a base64 PNG and return a <figure> element."""
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    data_uri = f"data:image/png;base64,{b64}"
+    caption_html = (
+        f"<figcaption>{_inline_md_to_html(caption_text)}</figcaption>"
+        if caption_text
+        else ""
+    )
+    return f'<figure><img src="{data_uri}" alt="">{caption_html}</figure>'
+
+
+def _infer_figure_crop(
+    fig_title_region: dict,
+    all_regions: list[dict],
+    img: Image.Image,
+) -> Image.Image | None:
+    """Crop the figure area adjacent to a caption region from the page image.
+
+    The figure shares the caption's column.  On a two-column page the crop is
+    confined to that column (left or right half) and the vertical gap is
+    measured only against same-column regions, so a figure never absorbs the
+    neighbouring column's text.  Single-column pages and figures whose caption
+    spans the page use the full page width.
+
+    Finds the nearest same-column content boundary above and below the caption,
+    then crops whichever gap is larger.  Returns None if neither gap reaches
+    _MIN_FIGURE_HEIGHT.
+    """
+    bbox = fig_title_region.get("bbox")
+    if not bbox:
+        return None
+
+    fy0, fy1 = float(bbox[1]), float(bbox[3])
+    page_w, page_h = float(img.size[0]), float(img.size[1])
+    half = page_w / 2
+
+    def is_full_width(rb: list[float | int]) -> bool:
+        return (float(rb[2]) - float(rb[0])) > 0.55 * page_w
+
+    def left_of_gutter(rb: list[float | int]) -> bool:
+        return (float(rb[0]) + float(rb[2])) / 2 <= half
+
+    # A two-column page has narrow regions on both sides of the gutter; only
+    # then is it safe to confine the crop to a single column.
+    sides = {
+        left_of_gutter(rb)
+        for r in all_regions
+        if (rb := r.get("bbox")) and not is_full_width(rb)
+    }
+    confine_to_column = len(sides) == 2 and not is_full_width(bbox)
+    caption_left = left_of_gutter(bbox)
+
+    def same_column(rb: list[float | int]) -> bool:
+        # Full-width regions (section headings, rules) bound the figure
+        # vertically regardless of which column it sits in.
+        return (
+            not confine_to_column
+            or is_full_width(rb)
+            or left_of_gutter(rb) == caption_left
+        )
+
+    above_y1 = 0.0
+    below_y0 = page_h
+    for r in all_regions:
+        if r is fig_title_region:
+            continue
+        rb = r.get("bbox")
+        if not rb or not same_column(rb):
+            continue
+        ry0, ry1 = float(rb[1]), float(rb[3])
+        if ry1 <= fy0:
+            above_y1 = max(above_y1, ry1)
+        if ry0 >= fy1:
+            below_y0 = min(below_y0, ry0)
+
+    gap_above = fy0 - above_y1
+    gap_below = below_y0 - fy1
+    if max(gap_above, gap_below) < _MIN_FIGURE_HEIGHT:
+        return None
+
+    gy0, gy1 = (above_y1, fy0) if gap_above >= gap_below else (fy1, below_y0)
+    if confine_to_column:
+        cx0, cx1 = (0.0, half) if caption_left else (half, page_w)
+    else:
+        cx0, cx1 = 0.0, page_w
+    return img.crop((int(cx0), int(gy0), int(cx1), int(gy1)))
 
 
 def _inject_caption(table_html: str, caption_text: str) -> str:
@@ -451,28 +547,34 @@ def falcon_pdf_to_html(
     # figure_title regions are buffered so the next table can absorb them as
     # <caption> rather than emitting a detached <figure><figcaption>.
     pending_fig_title: str | None = None
+    pending_fig_crop: Image.Image | None = None
 
     title_norm = (
         _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", meta["title"])).lower().strip()
     )
 
     def _flush_fig_title() -> None:
-        nonlocal pending_fig_title
-        if pending_fig_title:
-            body_parts.append(
-                f"<figure><figcaption>{_inline_md_to_html(pending_fig_title)}</figcaption></figure>"
-            )
+        nonlocal pending_fig_title, pending_fig_crop
+        if pending_fig_title is not None:
+            if pending_fig_crop is not None:
+                body_parts.append(_figure_html(pending_fig_crop, pending_fig_title))
+            else:
+                body_parts.append(
+                    f"<figure><figcaption>{_inline_md_to_html(pending_fig_title)}</figcaption></figure>"
+                )
             pending_fig_title = None
+            pending_fig_crop = None
 
     for regions, img in zip(all_regions, images, strict=True):
         # Use the rendered image width as the authoritative page width so that
         # single-column pages (where max(bbox.x1) ≪ page width) don't cause
         # the column-split heuristic to misclassify left-column content.
         pw = float(img.size[0])
+
         for r in _sort_regions(regions, pw):
             cat = r.get("category", "text")
             text = r.get("text", "").strip()
-            if not text or cat in _SKIP_CATS:
+            if (not text and cat != "figure") or cat in _SKIP_CATS:
                 continue
             if cat == "doc_title":
                 continue  # already captured in meta; skip body duplicate
@@ -492,10 +594,29 @@ def falcon_pdf_to_html(
                     continue
 
             if cat == "figure_title":
-                if pending_fig_title is not None:
-                    pending_fig_title = pending_fig_title + " " + text
-                else:
+                if pending_fig_title is None:
+                    pending_fig_crop = _infer_figure_crop(r, regions, img)
                     pending_fig_title = text
+                else:
+                    pending_fig_title = pending_fig_title + " " + text
+                continue
+
+            if cat == "figure":
+                bbox = r.get("bbox")
+                if bbox:
+                    x0, y0, x1, y1 = (
+                        int(bbox[0]),
+                        int(bbox[1]),
+                        int(bbox[2]),
+                        int(bbox[3]),
+                    )
+                    body_parts.append(
+                        _figure_html(img.crop((x0, y0, x1, y1)), pending_fig_title)
+                    )
+                    pending_fig_title = None
+                    pending_fig_crop = None
+                else:
+                    _flush_fig_title()
                 continue
 
             html_chunk = _region_to_html(r)
@@ -505,9 +626,10 @@ def falcon_pdf_to_html(
                 footnote_parts.append(html_chunk)
                 continue
 
-            if cat == "table" and pending_fig_title:
+            if cat == "table" and pending_fig_title is not None:
                 html_chunk = _inject_caption(html_chunk, pending_fig_title)
                 pending_fig_title = None
+                pending_fig_crop = None
             else:
                 _flush_fig_title()
 

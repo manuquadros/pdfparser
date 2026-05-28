@@ -466,6 +466,137 @@ class TestBodyColumnMerge:
         assert "Selected substrates and inhibitors." in body
         assert "<caption>TABLE I Selected substrates and inhibitors.</caption>" in body
 
+    def test_figure_region_embedded_as_img(self) -> None:
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "figure_title",
+                "bbox": [0, 120, 800, 140],
+                "text": "Figure 1. A diagram.",
+            },
+            {
+                "category": "figure",
+                "bbox": [0, 150, 800, 500],
+                "text": "",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert '<img src="data:image/png;base64,' in body
+        assert "<figcaption>Figure 1. A diagram.</figcaption>" in body
+
+    def test_figure_inferred_from_gap_above_caption(self) -> None:
+        # Large gap (y=170–550) sits above the caption (y=550–570); the gap
+        # is > _MIN_FIGURE_HEIGHT so it should be cropped and embedded.
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "text",
+                "bbox": [0, 120, 800, 170],
+                "text": "Body text above figure.",
+            },
+            {"category": "figure_title", "bbox": [0, 550, 800, 570], "text": "Fig. 1."},
+            {
+                "category": "text",
+                "bbox": [0, 590, 800, 640],
+                "text": "Body text below figure.",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert '<img src="data:image/png;base64,' in body
+        assert "<figcaption>Fig. 1.</figcaption>" in body
+
+    def test_figure_caption_for_table_gets_no_image(self) -> None:
+        # figure_title immediately adjacent to a table (small gaps) → no crop,
+        # caption is absorbed by the table as <caption>.
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "figure_title",
+                "bbox": [0, 120, 800, 140],
+                "text": "Table I.",
+            },
+            {
+                "category": "table",
+                "bbox": [0, 145, 800, 400],
+                "text": "<table><tr><td>x</td></tr></table>",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert '<img src="data:image/png;base64,' not in body
+        assert "<caption>Table I.</caption>" in body
+
+    def test_figure_region_without_caption(self) -> None:
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "figure",
+                "bbox": [0, 150, 800, 500],
+                "text": "",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert '<img src="data:image/png;base64,' in body
+        assert "<figcaption>" not in body
+
+
+class TestInferFigureCrop:
+    """Inferred figure crops must stay inside the caption's column on
+    two-column pages and span the full width on single-column pages."""
+
+    def test_two_column_crop_excludes_other_column(self) -> None:
+        from pdfparser.falcon import _infer_figure_crop
+
+        img = _fake_image(800, 1000)
+        caption = {"category": "figure_title", "bbox": [40, 600, 380, 620]}
+        # Right-column text straddles the figure's vertical gap; it must not be
+        # baked into the crop, and must not bound the gap either.
+        regions = [
+            {"category": "text", "bbox": [40, 0, 380, 100]},
+            caption,
+            {"category": "text", "bbox": [420, 0, 760, 900]},
+        ]
+        crop = _infer_figure_crop(caption, regions, img)
+        assert crop is not None
+        assert crop.width <= 400  # left half only, not the full 800px page
+
+    def test_single_column_narrow_caption_uses_full_width(self) -> None:
+        from pdfparser.falcon import _infer_figure_crop
+
+        img = _fake_image(800, 1000)
+        caption = {"category": "figure_title", "bbox": [300, 600, 500, 620]}
+        regions = [
+            {"category": "text", "bbox": [50, 0, 750, 100]},
+            caption,
+        ]
+        crop = _infer_figure_crop(caption, regions, img)
+        assert crop is not None
+        assert crop.width == 800
+
+
+class TestRepeatedShortParagraphs:
+    """Repeated short fragments are running-header artefacts; repeated short
+    sentences are legitimate prose and must survive."""
+
+    def test_repeated_running_header_removed(self) -> None:
+        from pdfparser.falcon import _remove_repeated_short_paragraphs
+
+        header = "<p>Smith et al  Journal of Examples</p>"
+        parts = [header, "<p>Real body sentence.</p>", header]
+        assert _remove_repeated_short_paragraphs(parts) == [
+            "<p>Real body sentence.</p>"
+        ]
+
+    def test_repeated_short_sentence_preserved(self) -> None:
+        from pdfparser.falcon import _remove_repeated_short_paragraphs
+
+        sentence = "<p>Not applicable.</p>"
+        parts = [sentence, "<p>Other text.</p>", sentence]
+        assert _remove_repeated_short_paragraphs(parts) == parts
+
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
