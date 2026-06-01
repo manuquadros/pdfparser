@@ -151,8 +151,10 @@ _SUPERSCRIPT_MAP = {
 _NO_SPACE_BEFORE = frozenset(")]},.;:!?%")
 _NO_SPACE_AFTER = frozenset("([{")
 # Literal asterisks in the text layer would be parsed as emphasis markers by
-# _inline_md_to_html, so they are emitted as the HTML entity instead.
-_ASTERISK_ENTITY = "&#42;"
+# _inline_md_to_html, so they are emitted as the asterisk operator (U+2217)
+# instead — visually an asterisk, but not "*" and not a punctuation character
+# that the sentence-boundary / paragraph-merge heuristics key on.
+_ASTERISK_SUBSTITUTE = "∗"
 
 # A layout region as produced by Falcon: category + bbox + text (+ Falcon OCR).
 Region = dict[str, Any]
@@ -502,7 +504,7 @@ def _region_markdown(page_chars: list[_PageChar], rect: _Rect) -> str | None:
                     bold and not base_bold,
                     italic and not base_italic,
                     int(is_sup),
-                    _ASTERISK_ENTITY if ch == "*" else ch,
+                    _ASTERISK_SUBSTITUTE if ch == "*" else ch,
                 )
             )
     return _runs_to_markdown(runs)
@@ -784,6 +786,25 @@ def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
     )
     repeated = {p for p, n in counts.items() if n > 1}
     return [p for p in parts if p not in repeated]
+
+
+# When the layout model runs text generation over a figure/diagram (e.g. a
+# phylogenetic tree) it can emit one label repeated dozens of times
+# ("AaTRI, AaTRI, AaTRI, …").  Such a region is OCR noise, not prose: it has
+# many tokens but almost no diversity.
+_MIN_REPEAT_TOKENS = 8
+_MAX_REPEAT_SHARE = 0.6
+_TOKEN_RE = re.compile(r"\w+")
+
+
+def _is_degenerate_repetition(text: str) -> bool:
+    # Tokenize the visible text only; stripping tags first keeps element names
+    # (e.g. "sup" from a superscript) from counting as repeated tokens.
+    tokens = _TOKEN_RE.findall(_STRIP_TAGS_RE.sub("", text))
+    if len(tokens) < _MIN_REPEAT_TOKENS:
+        return False
+    top = Counter(tokens).most_common(1)[0][1]
+    return top / len(tokens) >= _MAX_REPEAT_SHARE
 
 
 def _inline_md_to_html(text: str) -> str:
@@ -1072,6 +1093,16 @@ def falcon_pdf_to_html(
             cat = r.get("category", "text")
             text = r.get("text", "").strip()
             if (not text and cat != "figure") or cat in _SKIP_CATS:
+                continue
+            # Drop OCR noise from text generation run over a figure/diagram
+            # (a single label repeated dozens of times).  Skipped for table HTML
+            # (_HTML_CATS) and for `figure` regions, which are emitted as an
+            # image crop regardless of any stray text.
+            if (
+                cat not in _HTML_CATS
+                and cat != "figure"
+                and _is_degenerate_repetition(text)
+            ):
                 continue
             if cat == "doc_title":
                 continue  # already captured in meta; skip body duplicate

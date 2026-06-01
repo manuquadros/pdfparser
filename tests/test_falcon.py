@@ -977,6 +977,176 @@ class TestApplyTextLayer:
         _apply_text_layer([regions], [page], force=False)
         assert regions[0]["text"] == "falcon"
 
+    def test_substantial_shorter_extraction_replaces_falcon(self) -> None:
+        # Falcon over-read (e.g. duplicated) the region, so its text is >2× the
+        # layer's; the layer text is still substantial (≥ abs floor) so it wins,
+        # rather than being discarded by the bare length-ratio.
+        from pdfparser.falcon import _apply_text_layer
+
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "y" * 100}]
+        page = self._page()
+        with (
+            patch("pdfparser.falcon._page_char_styles", return_value=[]),
+            patch("pdfparser.falcon._region_markdown", return_value="x" * 40),
+        ):
+            _apply_text_layer([regions], [page], force=False)
+        assert regions[0]["text"] == "x" * 40
+
+    def test_band_narrowing_extracts_only_in_band_glyphs(self) -> None:
+        # The bisect y-band must include every glyph the region spans and drop
+        # those outside it (here a stray glyph far below the region).
+        import pypdfium2 as pdfium
+
+        from pdfparser.falcon import RenderedPage, _apply_text_layer
+
+        page = RenderedPage(
+            image=_fake_image(),
+            scale=1.0,  # points == pixels; bbox [0,0,100,50] → PDF y in [452, 498]
+            page_height_pt=500.0,
+            text_page=MagicMock(spec=pdfium.PdfTextPage),
+        )
+        chars = [
+            (0, 10.0, 475.0, 470.0, 480.0, "H", False, False),
+            (1, 11.0, 475.0, 470.0, 480.0, "i", False, False),
+            (2, 12.0, 100.0, 95.0, 105.0, "Z", False, False),  # below the band
+        ]
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "falcon"}]
+        with patch("pdfparser.falcon._page_char_styles", return_value=chars):
+            _apply_text_layer([regions], [page], force=True)
+        assert regions[0]["text"] == "Hi"
+
+
+class TestDegenerateRepetition:
+    """Text-generation run over a figure can emit one label repeated dozens of
+    times; such OCR noise must be detected and dropped, while real prose (even
+    with some repetition) is kept."""
+
+    def test_repeated_label_detected(self) -> None:
+        from pdfparser.falcon import _is_degenerate_repetition
+
+        assert _is_degenerate_repetition("AaTRI, " * 40) is True
+
+    def test_real_prose_not_flagged(self) -> None:
+        from pdfparser.falcon import _is_degenerate_repetition
+
+        prose = (
+            "The enzyme catalyzes the stereospecific oxidation of the substrate"
+            " to the corresponding ketone under physiological conditions."
+        )
+        assert _is_degenerate_repetition(prose) is False
+
+    def test_short_text_never_flagged(self) -> None:
+        from pdfparser.falcon import _is_degenerate_repetition
+
+        assert _is_degenerate_repetition("yes yes yes") is False
+
+    def test_figure_ocr_noise_region_dropped(self) -> None:
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {
+                "category": "text",
+                "bbox": [0, 120, 800, 600],
+                "text": "AaTRI, " * 50,
+            },
+            {
+                "category": "text",
+                "bbox": [0, 620, 800, 680],
+                "text": "Real body sentence after the figure.",
+            },
+        ]
+        body = _body(_run_falcon([regions]))
+        assert "AaTRI" not in body
+        assert "Real body sentence after the figure." in body
+
+    def test_figure_region_with_stray_text_still_cropped(self) -> None:
+        # A `figure` region is an image crop; degenerate stray text on it must
+        # not suppress the <img> (the guard targets text-bearing prose only).
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Test Paper"},
+            {"category": "abstract", "bbox": [0, 50, 800, 100], "text": "Abstract."},
+            {"category": "figure", "bbox": [0, 150, 800, 500], "text": "AaTRI, " * 50},
+        ]
+        body = _body(_run_falcon([regions]))
+        assert '<img src="data:image/png;base64,' in body
+
+
+class TestExtractMetaAuthor:
+    """Author detection must not pick a flowing sentence that precedes the
+    byline (the old newline-count guard is a no-op once the text layer collapses
+    newlines)."""
+
+    def test_byline_chosen_over_preceding_sentence(self) -> None:
+        from pdfparser.falcon import _extract_meta
+
+        regions = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "A Great Paper"},
+            {
+                "category": "text",
+                "bbox": [0, 50, 800, 70],
+                "text": "Received 1 May 2020; accepted 3 June 2020.",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 80, 800, 100],
+                "text": "Jane Doe, John Smith",
+            },
+        ]
+        meta = _extract_meta(regions, 800.0)
+        assert meta["authors"] == "Jane Doe, John Smith"
+
+
+class TestRegionToHtmlSuperscriptMarker:
+    """A leading reconstructed superscript must only be read as a footnote
+    marker when it is short; a longer leading superscript is body prose."""
+
+    def test_short_leading_sup_is_footnote(self) -> None:
+        from pdfparser.falcon import _region_to_html
+
+        out = _region_to_html(
+            {"category": "text", "text": "<sup>a</sup> Footnote text."}
+        )
+        assert out == '<p class="footnote"><sup>a</sup> Footnote text.</p>'
+
+    def test_long_leading_sup_is_paragraph(self) -> None:
+        from pdfparser.falcon import _region_to_html
+
+        out = _region_to_html(
+            {"category": "text", "text": "<sup>(R)-</sup>configuration was observed."}
+        )
+        assert out.startswith("<p>")
+        assert 'class="footnote"' not in out
+
+
+class TestRegionMarkdownAsterisk:
+    """Literal asterisks from the text layer must not be parsed as emphasis, nor
+    introduce punctuation that the sentence-boundary heuristics key on."""
+
+    def test_literal_asterisks_substituted(self) -> None:
+        from pdfparser.falcon import _inline_md_to_html, _region_markdown
+
+        spec = [(c, False, False) for c in "a*b*c"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        assert md == "a∗b∗c"
+        assert "*" not in md
+        assert "<em>" not in _inline_md_to_html(md)
+
+    def test_substitute_is_not_sentence_terminator(self) -> None:
+        # A fragment ending in a substituted asterisk must still merge with its
+        # continuation — the substitute must not look like terminal punctuation.
+        from pdfparser.falcon import (
+            _ASTERISK_SUBSTITUTE,
+            _SENTENCE_END_RE,
+            _merge_split_paragraphs,
+        )
+
+        assert not _SENTENCE_END_RE.search(f"see note{_ASTERISK_SUBSTITUTE}")
+        parts = [
+            f"<p>the rate constant{_ASTERISK_SUBSTITUTE}</p>",
+            "<p>was measured precisely.</p>",
+        ]
+        assert len(_merge_split_paragraphs(parts)) == 1
+
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
