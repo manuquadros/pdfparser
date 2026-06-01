@@ -110,20 +110,21 @@ def load_model(device: str | None = None) -> Any:
     )
 
 
+def _render_page(page: pdfium.PdfPage) -> Image.Image:
+    img: Image.Image = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
+    long_side = max(img.size)
+    if long_side > _MAX_LONG_SIDE:
+        ratio = _MAX_LONG_SIDE / long_side
+        img = img.resize(
+            (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+            Image.LANCZOS,
+        )
+    return img
+
+
 def _render_pages(pdf_path: Path) -> list[Image.Image]:
     with pdfium.PdfDocument(str(pdf_path)) as pdf:
-        pages = []
-        for page in pdf:
-            img = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
-            long_side = max(img.size)
-            if long_side > _MAX_LONG_SIDE:
-                ratio = _MAX_LONG_SIDE / long_side
-                img = img.resize(
-                    (int(img.size[0] * ratio), int(img.size[1] * ratio)),
-                    Image.LANCZOS,
-                )
-            pages.append(img)
-    return pages
+        return [_render_page(page) for page in pdf]
 
 
 def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
