@@ -1,5 +1,6 @@
 """Unit tests for falcon.py — no model loading, no PDF rendering."""
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -598,12 +599,125 @@ class TestRepeatedShortParagraphs:
         assert _remove_repeated_short_paragraphs(parts) == parts
 
 
+class TestLeadingNonArticlePages:
+    """Pages bound before the article proper (cover ads, mastheads) must be
+    dropped so metadata and body come from the real first article page."""
+
+    def test_leading_ad_page_dropped(self) -> None:
+        ad_page = [
+            {
+                "category": "text",
+                "bbox": [0, 0, 800, 200],
+                "text": "Order our reagents today and save 20% on your next purchase!",
+            }
+        ]
+        article_page = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Real Title"},
+            {
+                "category": "abstract",
+                "bbox": [0, 50, 800, 120],
+                "text": "We characterized the enzyme.",
+            },
+        ]
+        html = _run_falcon([ad_page, article_page])
+
+        assert "<h1>Real Title</h1>" in html
+        assert "Order our reagents today" not in html
+        assert "We characterized the enzyme." in html
+
+    def test_introduction_marker_qualifies_page(self) -> None:
+        from pdfparser.falcon import _is_article_page
+
+        regions = [
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 0, 800, 30],
+                "text": "Introduction",
+            }
+        ]
+        assert _is_article_page(regions) is True
+
+    def test_ad_body_mentioning_introduction_still_dropped(self) -> None:
+        # "introduction" buried in advertising body copy is not a heading and
+        # must not qualify the ad page as the article start.
+        ad_page = [
+            {
+                "category": "text",
+                "bbox": [0, 0, 800, 200],
+                "text": "An introduction to our new assay kit — order today!",
+            }
+        ]
+        article_page = [
+            {"category": "doc_title", "bbox": [0, 0, 800, 40], "text": "Real Title"},
+            {"category": "abstract", "bbox": [0, 50, 800, 120], "text": "We did it."},
+        ]
+        html = _run_falcon([ad_page, article_page])
+
+        assert "<h1>Real Title</h1>" in html
+        assert "introduction to our new assay kit" not in html
+
+    def test_leading_page_with_figure_title_not_dropped(self) -> None:
+        # The model missed the title/abstract on the real first page but tagged
+        # a figure caption there; the page is genuine content, so nothing is
+        # dropped even though a later page has an "Introduction" heading.
+        first_page = [
+            {
+                "category": "figure_title",
+                "bbox": [0, 600, 800, 620],
+                "text": "Figure 1. Graphical abstract.",
+            },
+            {"category": "text", "bbox": [0, 60, 800, 120], "text": "Title page body."},
+        ]
+        second_page = [
+            {
+                "category": "paragraph_title",
+                "bbox": [0, 0, 800, 30],
+                "text": "Introduction",
+            },
+            {
+                "category": "text",
+                "bbox": [0, 60, 800, 120],
+                "text": "Second page body.",
+            },
+        ]
+        html = _run_falcon([first_page, second_page])
+
+        assert "Title page body." in html
+        assert "Second page body." in html
+
+    def test_no_article_marker_keeps_all_pages(self) -> None:
+        # No page carries any marker → _first_article_page falls back to 0 and
+        # nothing is dropped.
+        page1 = [
+            {"category": "text", "bbox": [0, 0, 800, 100], "text": "Page one content."}
+        ]
+        page2 = [
+            {"category": "text", "bbox": [0, 0, 800, 100], "text": "Page two content."}
+        ]
+        html = _run_falcon([page1, page2])
+
+        assert "Page one content." in html
+        assert "Page two content." in html
+
+
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
+_AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
 
 
 @pytest.fixture(scope="session")
-def falcon_html() -> str:
+def falcon_model() -> object:
+    """Load the Falcon-OCR model once per session; skip if unavailable."""
+    try:
+        from pdfparser.falcon import load_model
+
+        return load_model()
+    except Exception as e:
+        pytest.skip(f"Falcon model not available: {e}")
+
+
+@pytest.fixture(scope="session")
+def falcon_html(falcon_model: object) -> str:
     """Run the full Falcon pipeline; skip if the model is unavailable.
 
     Writes the result back to spike_results/falcon_full.html so the file
@@ -611,16 +725,18 @@ def falcon_html() -> str:
     """
     if not _FIXTURE_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_FIXTURE_PDF}")
-    try:
-        from pdfparser.falcon import falcon_pdf_to_html, load_model
+    from pdfparser.falcon import falcon_pdf_to_html
 
-        model = load_model()
-    except Exception as e:
-        pytest.skip(f"Falcon model not available: {e}")
-
-    html = falcon_pdf_to_html(_FIXTURE_PDF, model=model)
+    html = falcon_pdf_to_html(_FIXTURE_PDF, model=falcon_model)
     _SPIKE_HTML.write_text(html, encoding="utf-8")
     return html
+
+
+def _header_h1(html: str) -> str:
+    """Return the text of the document's <header><h1> title element."""
+    m = re.search(r"<header>.*?<h1>(.*?)</h1>", html, re.DOTALL)
+    assert m, "header <h1> not found"
+    return m.group(1)
 
 
 @pytest.mark.integration
@@ -665,3 +781,20 @@ class TestFalconPipeline:
         first_ref_pos = falcon_html.find("<p>[1]")
         if first_ref_pos != -1:
             assert fn_pos < first_ref_pos
+
+
+@pytest.mark.integration
+class TestFalconAdPageExclusion:
+    """The 31051047.pdf fixture has an advertisement as its first page; the
+    pipeline must drop it and start the document at the real article title."""
+
+    def test_title_starts_with_article_title(self, falcon_model: object) -> None:
+        if not _AD_PREFIX_PDF.exists():
+            pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
+        from pdfparser.falcon import falcon_pdf_to_html
+
+        html = falcon_pdf_to_html(_AD_PREFIX_PDF, model=falcon_model)
+        title = _header_h1(html)
+        assert title.startswith(
+            "Biochemical characterization reveals the functional divergence"
+        )

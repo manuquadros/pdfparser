@@ -227,6 +227,49 @@ _REF_SECTION_RE = re.compile(
     r"^(?:<h\d[^>]*>\s*References\s*</h\d>|<p>\[1\])", re.IGNORECASE
 )
 
+# A page begins the article if it carries the paper title or abstract, or an
+# "Abstract"/"Introduction" *heading* — the word must head a paragraph_title,
+# not merely appear in body or advertising copy, so a cover ad mentioning
+# "introduction" isn't mistaken for the article start.
+_ARTICLE_PAGE_CATS = frozenset({"abstract", "doc_title"})
+_ARTICLE_HEADING_RE = re.compile(
+    r"^\s*(?:\d+[.)]?\s+)?(?:abstract|introduction)\b", re.IGNORECASE
+)
+# Categories the layout model emits only for genuine article content; a leading
+# page carrying any of these is real content, never a droppable cover/masthead.
+_CONTENT_CATS = frozenset({"abstract", "doc_title", "figure_title"})
+
+
+def _is_article_page(regions: list[dict]) -> bool:
+    for r in regions:
+        cat = r.get("category")
+        if cat in _ARTICLE_PAGE_CATS:
+            return True
+        if cat == "paragraph_title" and _ARTICLE_HEADING_RE.match(r.get("text") or ""):
+            return True
+    return False
+
+
+def _has_structural_content(regions: list[dict]) -> bool:
+    return any(r.get("category") in _CONTENT_CATS for r in regions)
+
+
+def _leading_pages_to_skip(all_regions: list[list[dict]]) -> int:
+    """Number of leading non-article pages (cover ads, mastheads) to drop.
+
+    A leading page is dropped only when *no* page before the article start
+    carries structural content of its own, so a real first page the layout
+    model under-tagged (its title/abstract missed) is never discarded just
+    because a later page has an "Introduction" heading.
+    """
+    first_article = next(
+        (i for i, regions in enumerate(all_regions) if _is_article_page(regions)),
+        0,
+    )
+    if any(_has_structural_content(regions) for regions in all_regions[:first_article]):
+        return 0
+    return first_article
+
 
 def _plain_p_text(s: str) -> str | None:
     """Return the inner content of a plain ``<p>…</p>`` block, or ``None``.
@@ -542,6 +585,11 @@ def falcon_pdf_to_html(
             torch.cuda.empty_cache()
         # Guard against blank/image-only pages that return no regions.
         all_regions.append(results[0] if results else [])
+
+    start = _leading_pages_to_skip(all_regions)
+    if start:
+        all_regions = all_regions[start:]
+        images = images[start:]
 
     page0_width = float(images[0].size[0]) if images else 800.0
     meta = (
