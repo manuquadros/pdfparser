@@ -1,6 +1,7 @@
 """Unit tests for falcon.py — no model loading, no PDF rendering."""
 
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,16 +14,32 @@ def _fake_image(width: int = 800, height: int = 1000) -> Image.Image:
 
 
 def _run_falcon(regions_per_page: list[list[dict]]) -> str:
-    """Run falcon_pdf_to_html with a stub model and synthetic page images."""
-    from pdfparser.falcon import falcon_pdf_to_html
+    """Run falcon_pdf_to_html with a stub model and synthetic pages.
 
-    fake_images = [_fake_image() for _ in regions_per_page]
+    The stubbed pages carry no text layer (``text_page=None``), so the pipeline
+    uses Falcon's region text exactly as in production for scanned input.
+    """
+    from pdfparser.falcon import RenderedPage, falcon_pdf_to_html
+
+    fake_pages = [
+        RenderedPage(
+            image=_fake_image(),
+            scale=200 / 72,
+            page_height_pt=1000.0,
+            text_page=None,
+        )
+        for _ in regions_per_page
+    ]
     fake_model = MagicMock()
     fake_model.generate_with_layout.side_effect = [
         [page_regions] for page_regions in regions_per_page
     ]
 
-    with patch("pdfparser.falcon._render_pages", return_value=fake_images):
+    @contextmanager
+    def fake_render(_pdf_path: Path):
+        yield fake_pages
+
+    with patch("pdfparser.falcon._render_pages", fake_render):
         return falcon_pdf_to_html(Path("/fake/paper.pdf"), model=fake_model)
 
 
@@ -718,6 +735,249 @@ class TestLeadingNonArticlePages:
         assert "Page two content." in html
 
 
+class TestRegionPdfRect:
+    """Image-pixel bbox → PDF-point rect mapping is pure arithmetic."""
+
+    def test_maps_and_flips_y_with_inset(self) -> None:
+        from pdfparser.falcon import _REGION_INSET_PX, _region_pdf_rect
+
+        # scale=2 px/pt, page 500pt tall, bbox in pixels.
+        left, bottom, right, top = _region_pdf_rect(
+            [100.0, 200.0, 300.0, 400.0], 2.0, 500.0
+        )
+        inset = _REGION_INSET_PX / 2.0
+        assert left == 100 / 2 + inset
+        assert right == 300 / 2 - inset
+        # y flips: image-top (y0=200px) maps to the higher PDF-y edge.
+        assert top == 500.0 - 200 / 2 - inset
+        assert bottom == 500.0 - 400 / 2 + inset
+        assert top > bottom
+
+
+class TestPageHasTextLayer:
+    def test_threshold(self) -> None:
+        import pypdfium2 as pdfium
+
+        from pdfparser.falcon import _MIN_TEXT_LAYER_CHARS, _page_has_text_layer
+
+        scanned = MagicMock(spec=pdfium.PdfTextPage)
+        scanned.count_chars.return_value = 0
+        assert _page_has_text_layer(scanned) is False
+
+        digital = MagicMock(spec=pdfium.PdfTextPage)
+        digital.count_chars.return_value = _MIN_TEXT_LAYER_CHARS + 1
+        assert _page_has_text_layer(digital) is True
+
+
+def _chars(spec: list[tuple], *, y: float = 50.0, height: float = 10.0) -> list[tuple]:
+    """Build a page_chars list (index, cx, cy, bottom, top, ch, bold, italic) on
+    a single line at the given baseline, laid out left-to-right."""
+    out = []
+    for i, (ch, bold, italic) in enumerate(spec):
+        out.append((i, 10.0 + i, y + height / 2, y, y + height, ch, bold, italic))
+    return out
+
+
+def _line_chars(
+    text: str, start_index: int, *, y: float = 50.0, height: float = 10.0
+) -> list[tuple]:
+    """Plain (non-styled) glyphs at consecutive indices from ``start_index``.
+
+    A gap between one line's last index and the next line's ``start_index``
+    stands in for the line-ending control characters and triggers a line break.
+    """
+    return [
+        (start_index + k, 10.0 + k, y + height / 2, y, y + height, ch, False, False)
+        for k, ch in enumerate(text)
+    ]
+
+
+_FULL_RECT = (0.0, 0.0, 1000.0, 1000.0)
+
+
+class TestRegionMarkdownEmphasis:
+    """Font metadata → markdown emphasis, coalesced into contiguous runs."""
+
+    def test_italic_run_wrapped(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        spec = [(c, False, False) for c in "see "] + [(c, False, True) for c in "Homo"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        assert md == "see *Homo*"
+
+    def test_bold_run_wrapped(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        spec = [(c, True, False) for c in "Key"] + [(c, False, False) for c in ": v"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        assert md == "**Key**: v"
+
+    def test_bold_italic_run_uses_triple(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        # A bold+italic word as a minority within otherwise plain prose.
+        spec = [(c, False, False) for c in "the "] + [(c, True, True) for c in "Genus"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        assert md == "the ***Genus***"
+
+    def test_uniformly_bold_region_not_marked(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        # A wholly-bold heading is the region's base style, not emphasis.
+        spec = [(c, True, False) for c in "Methods"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        assert md == "Methods"
+
+    def test_trailing_space_kept_outside_markers(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        spec = [(c, False, True) for c in "ab "] + [(c, False, False) for c in "cd"]
+        md = _region_markdown(_chars(spec), _FULL_RECT)
+        # The space between the italic and plain run must sit outside the *…*.
+        assert md == "*ab* cd"
+
+    def test_chars_outside_rect_excluded(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        inside = _chars([(c, False, False) for c in "in"])
+        # A char far to the right, outside a narrow rect.
+        outside = [(99, 5000.0, 55.0, 50.0, 60.0, "X", False, False)]
+        md = _region_markdown(inside + outside, (0.0, 0.0, 100.0, 1000.0))
+        assert md == "in"
+
+
+class TestRegionMarkdownSuperscript:
+    def test_raised_small_glyph_becomes_unicode_superscript(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        # "NAD" on the baseline, then a "+" raised well above it.
+        line = [
+            (0, 10.0, 55.0, 50.0, 60.0, "N", False, False),
+            (1, 11.0, 55.0, 50.0, 60.0, "A", False, False),
+            (2, 12.0, 55.0, 50.0, 60.0, "D", False, False),
+            (3, 13.0, 60.0, 57.0, 63.0, "+", False, False),
+        ]
+        md = _region_markdown(line, _FULL_RECT)
+        assert md == "NAD⁺"
+
+    def test_baseline_plus_not_superscripted(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        line = [
+            (0, 10.0, 55.0, 50.0, 60.0, "a", False, False),
+            (1, 11.0, 55.0, 50.0, 60.0, " ", False, False),
+            (2, 12.0, 55.0, 50.0, 60.0, "+", False, False),
+            (3, 13.0, 55.0, 50.0, 60.0, " ", False, False),
+            (4, 14.0, 55.0, 50.0, 60.0, "b", False, False),
+        ]
+        md = _region_markdown(line, _FULL_RECT)
+        assert md == "a + b"
+
+
+class TestRegionMarkdownLineBreaks:
+    def test_hyphenated_word_joined_without_space(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        # "some-" then a line break (index gap) then "times": the trailing
+        # hyphen is dropped and the halves join without a space.
+        line1 = _line_chars("some-", 0, y=50.0)
+        line2 = _line_chars("times", 7, y=30.0)
+        md = _region_markdown(line1 + line2, _FULL_RECT)
+        assert md == "sometimes"
+
+    def test_no_space_before_close_paren_at_break(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        line1 = _line_chars("NAD", 0, y=50.0)
+        line2 = _line_chars(")", 7, y=30.0)
+        md = _region_markdown(line1 + line2, _FULL_RECT)
+        assert md == "NAD)"
+
+    def test_word_break_inserts_space(self) -> None:
+        from pdfparser.falcon import _region_markdown
+
+        line1 = _line_chars("foo", 0, y=50.0)
+        line2 = _line_chars("bar", 7, y=30.0)
+        md = _region_markdown(line1 + line2, _FULL_RECT)
+        assert md == "foo bar"
+
+
+class TestApplyTextLayer:
+    """Per-region replacement, fallback, and the falcon/pdf escape hatches."""
+
+    def _page(self) -> object:
+        import pypdfium2 as pdfium
+
+        from pdfparser.falcon import RenderedPage
+
+        return RenderedPage(
+            image=_fake_image(),
+            scale=2.0,
+            page_height_pt=500.0,
+            text_page=MagicMock(spec=pdfium.PdfTextPage),  # non-None ⇒ has layer
+        )
+
+    def test_short_extraction_keeps_falcon_text(self) -> None:
+        from pdfparser.falcon import _apply_text_layer
+
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "x" * 100}]
+        page = self._page()
+        with (
+            patch("pdfparser.falcon._page_char_styles", return_value=[]),
+            patch("pdfparser.falcon._region_markdown", return_value="tiny"),
+        ):
+            _apply_text_layer([regions], [page], force=False)
+        assert regions[0]["text"] == "x" * 100  # fallback: Falcon text kept
+
+    def test_good_extraction_replaces_text(self) -> None:
+        from pdfparser.falcon import _apply_text_layer
+
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "ocr garble"}]
+        page = self._page()
+        with (
+            patch("pdfparser.falcon._page_char_styles", return_value=[]),
+            patch("pdfparser.falcon._region_markdown", return_value="clean layer text"),
+        ):
+            _apply_text_layer([regions], [page], force=False)
+        assert regions[0]["text"] == "clean layer text"
+
+    def test_table_region_never_touched(self) -> None:
+        from pdfparser.falcon import _apply_text_layer
+
+        regions = [{"category": "table", "bbox": [0, 0, 100, 50], "text": "<table>"}]
+        page = self._page()
+        with (
+            patch("pdfparser.falcon._page_char_styles", return_value=[]),
+            patch(
+                "pdfparser.falcon._region_markdown", return_value="should not be used"
+            ),
+        ):
+            _apply_text_layer([regions], [page], force=False)
+        assert regions[0]["text"] == "<table>"
+
+    def test_force_replaces_even_when_short(self) -> None:
+        from pdfparser.falcon import _apply_text_layer
+
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "x" * 100}]
+        page = self._page()
+        with (
+            patch("pdfparser.falcon._page_char_styles", return_value=[]),
+            patch("pdfparser.falcon._region_markdown", return_value="tiny"),
+        ):
+            _apply_text_layer([regions], [page], force=True)
+        assert regions[0]["text"] == "tiny"
+
+    def test_page_without_text_layer_skipped(self) -> None:
+        from pdfparser.falcon import RenderedPage, _apply_text_layer
+
+        regions = [{"category": "text", "bbox": [0, 0, 100, 50], "text": "falcon"}]
+        page = RenderedPage(
+            image=_fake_image(), scale=2.0, page_height_pt=500.0, text_page=None
+        )
+        _apply_text_layer([regions], [page], force=False)
+        assert regions[0]["text"] == "falcon"
+
+
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
 _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "falcon_full.html"
@@ -826,6 +1086,16 @@ class TestFalconAdPageExclusion:
 
     def test_species_name_italicized(self, ad_prefix_html: str) -> None:
         assert "<em>Przewalskia tangutica</em>" in ad_prefix_html
+
+    def test_gene_names_not_collapsed_by_ocr(self, ad_prefix_html: str) -> None:
+        # The motivating bug: Falcon OCR misread both PtTRI and PtTRII as the
+        # single string "PITRI", collapsing two distinct genes.  Sourcing prose
+        # from the text layer keeps them distinct.  Tables still come from Falcon
+        # OCR (out of scope), so the "PITRI" check is restricted to the prose.
+        prose = re.sub(r"<table.*?</table>", "", ad_prefix_html, flags=re.DOTALL)
+        assert "PtTRI" in prose
+        assert "PtTRII" in prose
+        assert "PITRI" not in prose
 
     def test_cross_page_paragraph_not_split(self, ad_prefix_html: str) -> None:
         # The clause "…TRI and" / "TRII compete…" spans a page break; it must

@@ -77,6 +77,11 @@ warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
 
+# pypdfium2 ships no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = ["pypdfium2.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--tb=short"

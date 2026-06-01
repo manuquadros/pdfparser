@@ -15,14 +15,21 @@ from __future__ import annotations
 
 import base64
 import bisect
+import ctypes
 import html as _html
 import io
 import re
 from collections import Counter
+from collections.abc import Iterator  # noqa: TC003  (beartype needs it at runtime)
+from contextlib import contextmanager
+from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
-from typing import Any
+from statistics import median
+from typing import Any, Literal, NamedTuple
 
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_raw
 import torch
 import torch._dynamo
 from PIL import Image
@@ -39,6 +46,133 @@ _DEFAULT_OCR_BATCH_SIZE = 2
 
 _HTML_CATS = frozenset({"table", "vision_footnote"})
 _SKIP_CATS = frozenset({"header", "page-header", "footer", "page-footer"})
+
+# Categories whose prose can be sourced from the PDF text layer.  table/figure/
+# vision_footnote stay on Falcon: they need structure/vision recognition, not
+# plain glyphs.
+_PROSE_CATS = frozenset(
+    {"text", "doc_title", "abstract", "paragraph_title", "footnote", "figure_title"}
+)
+
+# A page with fewer than this many characters is treated as scanned (no usable
+# text layer) and falls back to Falcon OCR for all its regions.
+_MIN_TEXT_LAYER_CHARS = 16
+# Inward margin (render pixels) applied to a region rect before pulling text, so
+# glyphs sitting exactly on a neighbouring region's boundary aren't absorbed.
+_REGION_INSET_PX = 2.0
+# Falcon's OCR is kept over the text layer only when the extraction is BOTH a
+# small fraction of Falcon's text AND tiny in absolute terms — that combination
+# signals a bbox/text-layer mismatch (e.g. a rasterised region), whereas a
+# substantial-but-shorter extraction usually means Falcon padded/duplicated and
+# the text layer is the better source.
+_MIN_TEXT_LAYER_RATIO = 0.5
+_MIN_TEXT_LAYER_ABS_CHARS = 24
+
+# PDF font descriptor flag bit for an italic face (PDF 1.7 §9.8.2, Table 121).
+_FONT_FLAG_ITALIC = 0x40
+_BOLD_WEIGHT_MIN = 600
+_FONT_NAME_BUFLEN = 256
+
+# A glyph whose baseline sits this fraction of the line height above its own
+# line's baseline is a superscript.  Detection is per-line, so glyphs on a lower
+# neighbouring line can't drag the baseline down and make ordinary text look
+# raised.  Subscripts are intentionally not reconstructed: their baseline drop
+# is comparable to ordinary descenders, so detecting them geometrically would
+# corrupt words containing p/y/g/q/j.
+_SUPERSCRIPT_RAISE_FRAC = 0.35
+_MIN_CHARS_FOR_SCRIPT = 3
+# Only these glyphs are ever treated as superscripts.  Quotation marks,
+# apostrophes, accents and degree signs also sit high in the line but are never
+# superscripts, so restricting candidates to alphanumerics and scientific
+# operators avoids flagging them.
+_SUPERSCRIPT_CANDIDATE_SYMBOLS = frozenset("+-−=()")
+# A style is the region's *base* (not emphasis) only when it dominates this much
+# of the text — high enough that a uniformly bold/italic heading is treated as
+# unstyled while a minority of emphasised words is still marked.
+_BASE_STYLE_FRAC = 0.8
+
+_LIGATURES = {
+    "ﬁ": "fi",
+    "ﬂ": "fl",
+    "ﬀ": "ff",
+    "ﬃ": "ffi",
+    "ﬄ": "ffl",
+    "ﬅ": "ft",
+    "ﬆ": "st",
+}
+# Unicode superscript forms.  A superscript run is rendered with these glyphs
+# when every character has one (matching Falcon's "NAD⁺"); otherwise it falls
+# back to an HTML <sup> wrapper so nothing is lost.
+_SUPERSCRIPT_MAP = {
+    "0": "⁰",
+    "1": "¹",
+    "2": "²",
+    "3": "³",
+    "4": "⁴",
+    "5": "⁵",
+    "6": "⁶",
+    "7": "⁷",
+    "8": "⁸",
+    "9": "⁹",
+    "+": "⁺",
+    "-": "⁻",
+    "−": "⁻",
+    "=": "⁼",
+    "(": "⁽",
+    ")": "⁾",
+    "a": "ᵃ",
+    "b": "ᵇ",
+    "c": "ᶜ",
+    "d": "ᵈ",
+    "e": "ᵉ",
+    "f": "ᶠ",
+    "g": "ᵍ",
+    "h": "ʰ",
+    "i": "ⁱ",
+    "j": "ʲ",
+    "k": "ᵏ",
+    "l": "ˡ",
+    "m": "ᵐ",
+    "n": "ⁿ",
+    "o": "ᵒ",
+    "p": "ᵖ",
+    "r": "ʳ",
+    "s": "ˢ",
+    "t": "ᵗ",
+    "u": "ᵘ",
+    "v": "ᵛ",
+    "w": "ʷ",
+    "x": "ˣ",
+    "y": "ʸ",
+    "z": "ᶻ",
+}
+# Whitespace at a line break is suppressed adjacent to these so we don't emit
+# "NAD⁺ )" or "( enzyme".
+_NO_SPACE_BEFORE = frozenset(")]},.;:!?%")
+_NO_SPACE_AFTER = frozenset("([{")
+# Literal asterisks in the text layer would be parsed as emphasis markers by
+# _inline_md_to_html, so they are emitted as the HTML entity instead.
+_ASTERISK_ENTITY = "&#42;"
+
+# A layout region as produced by Falcon: category + bbox + text (+ Falcon OCR).
+Region = dict[str, Any]
+
+# Text-layer glyph records, in PDF points.
+_Rect = tuple[float, float, float, float]  # (left, bottom, right, top)
+# (index, center-x, center-y, bottom, top, char, bold, italic)
+_PageChar = tuple[int, float, float, float, float, str, bool, bool]
+# (char, bold, italic, bottom, top) — one glyph within a single line
+_LineChar = tuple[str, bool, bool, float, float]
+
+
+class _StyledRun(NamedTuple):
+    """A glyph tagged with the styling to coalesce into markdown."""
+
+    bold: bool
+    italic: bool
+    vshift: int  # 1 = superscript, 0 = baseline
+    char: str
+
 
 _WRAPPER_CSS = """
 body {
@@ -90,7 +224,8 @@ def load_model(device: str | None = None) -> Any:
             "FLAGS_allocator_strategy": "auto_growth",
         }
     )
-    paddle.set_device("cpu")
+    # paddle ships no stub for set_device.
+    paddle.set_device("cpu")  # type: ignore[attr-defined]
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,29 +248,309 @@ def load_model(device: str | None = None) -> Any:
     # attribute it never actually assigns, so PP-DocLayoutV3 is reloaded from
     # disk on every generate_with_layout() call. Prime it once and set the
     # sentinel the guard checks for, so later calls reuse the loaded detector.
-    model._load_layout_model()
+    # nn.Module.__getattr__ is typed as returning Tensor|Module, so mypy can't
+    # see these dynamic Falcon attributes.
+    model._load_layout_model()  # type: ignore[operator]
     model._layout_model = model._layout_det_model
     return model
 
 
-def _render_page(page: pdfium.PdfPage) -> Image.Image:
+@dataclass
+class RenderedPage:
+    """A rendered page plus the state needed to map Falcon's image-pixel bboxes
+    back onto the PDF text layer."""
+
+    image: Image.Image
+    scale: float  # points → final-image pixels
+    page_height_pt: float
+    text_page: pdfium.PdfTextPage | None  # None when the page has no text layer
+
+
+def _render_page(page: pdfium.PdfPage) -> tuple[Image.Image, float]:
+    """Render a page and return it with the points → final-pixel scale."""
     img: Image.Image = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
+    scale = _RENDER_SCALE
     long_side = max(img.size)
     if long_side > _MAX_LONG_SIDE:
         ratio = _MAX_LONG_SIDE / long_side
         img = img.resize(
             (int(img.size[0] * ratio), int(img.size[1] * ratio)),
-            Image.LANCZOS,
+            Image.Resampling.LANCZOS,
         )
-    return img
+        scale *= ratio
+    return img, scale
 
 
-def _render_pages(pdf_path: Path) -> list[Image.Image]:
-    with pdfium.PdfDocument(str(pdf_path)) as pdf:
-        return [_render_page(page) for page in pdf]
+def _page_has_text_layer(text_page: pdfium.PdfTextPage) -> bool:
+    return bool(text_page.count_chars() >= _MIN_TEXT_LAYER_CHARS)
 
 
-def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
+@contextmanager
+def _render_pages(pdf_path: Path) -> Iterator[list[RenderedPage]]:
+    """Render every page, keeping the document and text pages open for the
+    lifetime of the ``with`` block so region text can be pulled from the layer.
+
+    Text pages and the document are released in the ``finally`` clause.
+    """
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    rendered: list[RenderedPage] = []
+    try:
+        for page in pdf:
+            image, scale = _render_page(page)
+            _, height = page.get_size()
+            text_page = page.get_textpage()
+            if not _page_has_text_layer(text_page):
+                text_page.close()
+                text_page = None
+            rendered.append(RenderedPage(image, scale, float(height), text_page))
+        yield rendered
+    finally:
+        for rp in rendered:
+            if rp.text_page is not None:
+                rp.text_page.close()
+        pdf.close()
+
+
+def _char_style(text_page: pdfium.PdfTextPage, index: int) -> tuple[bool, bool]:
+    """Return ``(bold, italic)`` for the glyph at ``index``.
+
+    Reads the PDF font descriptor flags and weight; falls back to the font
+    name when the descriptor is missing (common in subset/embedded fonts).
+    """
+    buf = ctypes.create_string_buffer(_FONT_NAME_BUFLEN)
+    flags = ctypes.c_int(0)
+    n = pdfium_raw.FPDFText_GetFontInfo(
+        text_page, index, buf, _FONT_NAME_BUFLEN, ctypes.byref(flags)
+    )
+    name = (
+        buf.raw[:n].split(b"\x00", 1)[0].decode("utf-8", "replace").lower() if n else ""
+    )
+    weight = pdfium_raw.FPDFText_GetFontWeight(text_page, index)
+    italic = (
+        bool(flags.value & _FONT_FLAG_ITALIC) or "italic" in name or "oblique" in name
+    )
+    bold = weight >= _BOLD_WEIGHT_MIN or "bold" in name
+    return bold, italic
+
+
+def _page_char_styles(text_page: pdfium.PdfTextPage) -> list[_PageChar]:
+    """Precompute ``(index, cx, cy, bottom, top, char, bold, italic)`` for every
+    glyph on the page, once, so each region only filters this list."""
+    chars: list[_PageChar] = []
+    for i in range(text_page.count_chars()):
+        left, bottom, right, top = text_page.get_charbox(i)
+        ch = text_page.get_text_range(i, 1)
+        bold, italic = _char_style(text_page, i)
+        chars.append(
+            (i, (left + right) / 2, (bottom + top) / 2, bottom, top, ch, bold, italic)
+        )
+    return chars
+
+
+def _region_pdf_rect(
+    bbox: list[float | int], scale: float, page_height_pt: float
+) -> _Rect:
+    """Map an image-pixel bbox (top-left origin) to a PDF-point rect
+    (bottom-left origin), insetting slightly to avoid edge bleed."""
+    x0, y0, x1, y1 = (float(v) for v in bbox)
+    inset = _REGION_INSET_PX / scale
+    left = x0 / scale + inset
+    right = x1 / scale - inset
+    top = page_height_pt - y0 / scale - inset
+    bottom = page_height_pt - y1 / scale + inset
+    return left, bottom, right, top
+
+
+def _to_superscript(core: str) -> str:
+    if all(ch in _SUPERSCRIPT_MAP or ch.isspace() for ch in core):
+        return "".join(_SUPERSCRIPT_MAP.get(ch, ch) for ch in core)
+    return f"<sup>{core}</sup>"
+
+
+def _select_region_lines(
+    page_chars: list[_PageChar], rect: _Rect
+) -> list[list[_LineChar]]:
+    """Group the glyphs inside ``rect`` into lines, in storage (reading) order.
+
+    A line break is detected by a gap in the character index: the skipped
+    indices are line-ending and other non-printing characters (newlines, format
+    controls, the ``\\ufffe`` noncharacter some fonts emit) which carry no usable
+    box and are excluded from the line tuples.
+
+    ``page_chars`` may arrive in any order (callers narrow by position), so it is
+    re-sorted into storage order first for the index-gap heuristic to hold.
+    """
+    left, bottom, right, top = rect
+    lines: list[list[_LineChar]] = []
+    current: list[_LineChar] = []
+    prev_i: int | None = None
+    for i, cx, cy, cb, ct, ch, bold, italic in sorted(page_chars, key=lambda c: c[0]):
+        if not (left <= cx <= right and bottom <= cy <= top):
+            continue
+        if ch != " " and not ch.isprintable():
+            continue  # leaves an index gap → line break, without emitting a glyph
+        if prev_i is not None and i > prev_i + 1 and current:
+            lines.append(current)
+            current = []
+        current.append((ch, bold, italic, cb, ct))
+        prev_i = i
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _line_superscript_flags(line: list[_LineChar]) -> list[bool]:
+    """Per-line superscript mask: a glyph is a superscript when its baseline
+    sits a fraction of the line height above the line's own baseline.
+
+    Detection is confined to a single (index-gap segmented) line so glyphs from
+    a lower neighbouring line can never drag the baseline down and make ordinary
+    text look raised.
+    """
+    bottoms = [cb for ch, _b, _i, cb, _ct in line if not ch.isspace()]
+    tops = [ct for ch, _b, _i, _cb, ct in line if not ch.isspace()]
+    if len(bottoms) < _MIN_CHARS_FOR_SCRIPT:
+        return [False] * len(line)
+    baseline = median(bottoms)
+    scale = max(tops) - baseline
+    threshold = baseline + _SUPERSCRIPT_RAISE_FRAC * scale
+    return [
+        (ch.isalnum() or ch in _SUPERSCRIPT_CANDIDATE_SYMBOLS)
+        and scale > 0
+        and cb > threshold
+        for ch, _b, _i, cb, _ct in line
+    ]
+
+
+def _base_style(flat: list[_LineChar]) -> tuple[bool, bool]:
+    """The region's dominant ``(bold, italic)``.  Emphasis is only emitted where
+    a glyph *deviates* from this base, so a wholly-bold heading isn't wrapped in
+    ``**`` while an italic species name inside upright prose still is."""
+    styles = [(b, it) for ch, b, it, _cb, _ct in flat if not ch.isspace()]
+    n = len(styles)
+    if n == 0:
+        return False, False
+    base_bold = sum(b for b, _it in styles) > _BASE_STYLE_FRAC * n
+    base_italic = sum(it for _b, it in styles) > _BASE_STYLE_FRAC * n
+    return base_bold, base_italic
+
+
+def _wrap_run(segment: str, bold: bool, italic: bool, vshift: int) -> str:
+    core = segment.strip()
+    if not core:
+        return segment
+    lead = segment[: len(segment) - len(segment.lstrip())]
+    trail = segment[len(segment.rstrip()) :]
+    if vshift > 0:
+        core = _to_superscript(core)
+    if bold and italic:
+        core = f"***{core}***"
+    elif bold:
+        core = f"**{core}**"
+    elif italic:
+        core = f"*{core}*"
+    return f"{lead}{core}{trail}"
+
+
+def _runs_to_markdown(runs: list[_StyledRun]) -> str | None:
+    if not any(not r.char.isspace() for r in runs):
+        return None
+    parts = [
+        _wrap_run("".join(r.char for r in grp), bold, italic, vshift)
+        for (bold, italic, vshift), grp in groupby(
+            runs, key=lambda r: (r.bold, r.italic, r.vshift)
+        )
+    ]
+    return _normalize_text("".join(parts))
+
+
+def _normalize_text(text: str) -> str | None:
+    text = text.replace("\xad", "")  # soft hyphen
+    for lig, repl in _LIGATURES.items():
+        if lig in text:
+            text = text.replace(lig, repl)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    return text or None
+
+
+def _region_markdown(page_chars: list[_PageChar], rect: _Rect) -> str | None:
+    """Extract a region's text from the layer as light markdown, reconstructing
+    italic/bold from font metadata and superscripts from glyph geometry."""
+    left, bottom, right, top = rect
+    if right <= left or top <= bottom:
+        return None
+    lines = _select_region_lines(page_chars, rect)
+    base_bold, base_italic = _base_style([c for line in lines for c in line])
+
+    runs: list[_StyledRun] = []
+    for li, line in enumerate(lines):
+        if li > 0 and runs:
+            last_ch = runs[-1].char
+            first_ch = next((c[0] for c in line if not c[0].isspace()), "")
+            if last_ch == "-":
+                runs.pop()  # dehyphenate a word broken across the line break
+            elif (
+                not last_ch.isspace()
+                and first_ch not in _NO_SPACE_BEFORE
+                and last_ch not in _NO_SPACE_AFTER
+            ):
+                runs.append(_StyledRun(runs[-1].bold, runs[-1].italic, 0, " "))
+        superscript = _line_superscript_flags(line)
+        for (ch, bold, italic, _cb, _ct), is_sup in zip(line, superscript, strict=True):
+            runs.append(
+                _StyledRun(
+                    bold and not base_bold,
+                    italic and not base_italic,
+                    int(is_sup),
+                    _ASTERISK_ENTITY if ch == "*" else ch,
+                )
+            )
+    return _runs_to_markdown(runs)
+
+
+def _apply_text_layer(
+    all_regions: list[list[Region]], pages: list[RenderedPage], *, force: bool
+) -> None:
+    """Replace the text of prose regions with text-layer content, in place.
+
+    On pages without a text layer, or for regions where extraction fails or
+    returns far less than Falcon (and ``force`` is off), the original Falcon
+    text is kept, so switching sources can never lose content.
+    """
+    for regions, page in zip(all_regions, pages, strict=True):
+        if page.text_page is None:
+            continue
+        # Sort the page's glyphs by vertical position once so each region can
+        # bisect to the band it spans instead of rescanning every glyph.
+        char_styles = sorted(_page_char_styles(page.text_page), key=lambda c: c[2])
+        cys = [c[2] for c in char_styles]
+        for r in regions:
+            if r.get("category") not in _PROSE_CATS:
+                continue
+            bbox = r.get("bbox")
+            if not bbox:
+                continue
+            rect = _region_pdf_rect(bbox, page.scale, page.page_height_pt)
+            band = char_styles[
+                bisect.bisect_left(cys, rect[1]) : bisect.bisect_right(cys, rect[3])
+            ]
+            md = _region_markdown(band, rect)
+            if md is None:
+                continue
+            if not force:
+                falcon_text = (r.get("text") or "").strip()
+                # Defer to Falcon only when the extraction is both a small
+                # fraction of it AND tiny outright (a likely bbox mismatch).
+                if (
+                    falcon_text
+                    and len(md) < _MIN_TEXT_LAYER_RATIO * len(falcon_text)
+                    and len(md) < _MIN_TEXT_LAYER_ABS_CHARS
+                ):
+                    continue
+            r["text"] = md
+
+
+def _sort_regions(regions: list[Region], page_width: float) -> list[Region]:
     """Sort regions into reading order for two-column PDF layouts.
 
     Full-width regions (spanning > 55 % of the page) act as section
@@ -150,7 +565,7 @@ def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
     """
     half = page_width / 2
 
-    def classify(r: dict) -> tuple[int, float]:
+    def classify(r: Region) -> tuple[int, float]:
         bbox = r.get("bbox")
         if not bbox:
             return 1, 0.0  # treat bbox-less regions as left-column at top
@@ -177,6 +592,7 @@ def _sort_regions(regions: list[dict], page_width: float) -> list[dict]:
     return [r for _, r in sorted(classified, key=lambda item: key(item[0]))]
 
 
+_BOLDITALIC_RE = re.compile(r"\*\*\*(.+?)\*\*\*", re.DOTALL)
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 # re.DOTALL intentionally omitted: italic spans in academic text don't cross
 # line boundaries, and DOTALL would cause two stray footnote asterisks anywhere
@@ -184,6 +600,10 @@ _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _ITALIC_RE = re.compile(r"\*(.+?)\*")
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+")
 _REF_LIST_RE = re.compile(r"^\[1\]")
+# A leading footnote marker is a SHORT superscript ("<sup>a</sup>", "<sup>1</sup>").
+# Bounding the marker length stops a body paragraph that merely opens with a
+# reconstructed multi-character superscript from being mistaken for a footnote.
+_SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
 _REF_SPLIT_RE = re.compile(r"\n(?=\[\d+\])")
 _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
@@ -245,7 +665,7 @@ _ARTICLE_HEADING_RE = re.compile(
 _CONTENT_CATS = frozenset({"abstract", "doc_title", "figure_title"})
 
 
-def _is_article_page(regions: list[dict]) -> bool:
+def _is_article_page(regions: list[Region]) -> bool:
     for r in regions:
         cat = r.get("category")
         if cat in _ARTICLE_PAGE_CATS:
@@ -255,11 +675,11 @@ def _is_article_page(regions: list[dict]) -> bool:
     return False
 
 
-def _has_structural_content(regions: list[dict]) -> bool:
+def _has_structural_content(regions: list[Region]) -> bool:
     return any(r.get("category") in _CONTENT_CATS for r in regions)
 
 
-def _leading_pages_to_skip(all_regions: list[list[dict]]) -> int:
+def _leading_pages_to_skip(all_regions: list[list[Region]]) -> int:
     """Number of leading non-article pages (cover ads, mastheads) to drop.
 
     A leading page is dropped only when *no* page before the article start
@@ -367,6 +787,7 @@ def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
 
 
 def _inline_md_to_html(text: str) -> str:
+    text = _BOLDITALIC_RE.sub(r"<strong><em>\1</em></strong>", text)
     text = _BOLD_RE.sub(r"<strong>\1</strong>", text)
     text = _ITALIC_RE.sub(r"<em>\1</em>", text)
     return text.strip()
@@ -387,9 +808,9 @@ def _heading_html(text: str, default_level: int = 2) -> str:
     return f"<h{level}>{_inline_md_to_html(text)}</h{level}>"
 
 
-def _region_to_html(r: dict) -> str:
+def _region_to_html(r: Region) -> str:
     cat = r.get("category", "text")
-    text = r.get("text", "").strip()
+    text: str = r.get("text", "").strip()
     if not text:
         return ""
 
@@ -419,7 +840,7 @@ def _region_to_html(r: dict) -> str:
 
     # Table footnotes rendered by Falcon as inline HTML (e.g. "<sup>a</sup> …")
     # arrive via the text category when the model emits them outside a table.
-    if text.startswith("<sup>"):
+    if _SUP_MARKER_RE.match(text):
         return f'<p class="footnote">{text}</p>'
 
     return f"<p>{_inline_md_to_html(text)}</p>"
@@ -443,8 +864,8 @@ def _figure_html(crop: Image.Image, caption_text: str | None) -> str:
 
 
 def _infer_figure_crop(
-    fig_title_region: dict,
-    all_regions: list[dict],
+    fig_title_region: Region,
+    all_regions: list[Region],
     img: Image.Image,
 ) -> Image.Image | None:
     """Crop the figure area adjacent to a caption region from the page image.
@@ -530,7 +951,7 @@ def _inject_caption(table_html: str, caption_text: str) -> str:
     )
 
 
-def _extract_meta(page0_regions: list[dict], page_width: float) -> dict[str, str]:
+def _extract_meta(page0_regions: list[Region], page_width: float) -> dict[str, str]:
     """Heuristically pull title and author from the first page's regions."""
     title = ""
     author = ""
@@ -547,7 +968,10 @@ def _extract_meta(page0_regions: list[dict], page_width: float) -> dict[str, str
             cat == "text"
             and not author
             and title
-            and text.count("\n") <= 2
+            # A byline is short and not a flowing sentence.  (The text layer
+            # collapses newlines, so a line-count guard would be a no-op here;
+            # the absence of terminal punctuation is source-agnostic.)
+            and not _SENTENCE_END_RE.search(text)
             and len(text) < 200
         ):
             author = _STRIP_TAGS_RE.sub("", text).strip()
@@ -560,11 +984,13 @@ def falcon_pdf_to_html(
     model: Any = None,
     device: str | None = None,
     ocr_batch_size: int = _DEFAULT_OCR_BATCH_SIZE,
+    text_source: Literal["auto", "falcon", "pdf"] = "auto",
 ) -> str:
     """Convert a PDF to a self-contained HTML document using Falcon-OCR.
 
-    No GROBID or gmft dependency.  All text and table content comes from the
-    Falcon-OCR model.
+    Falcon supplies the layout and the table/figure content.  Prose is sourced
+    from the PDF text layer when one is present (correct glyphs and font-derived
+    emphasis), with a clean per-region fallback to Falcon OCR.
 
     Args:
         pdf_path: Path to the input PDF.
@@ -572,6 +998,9 @@ def falcon_pdf_to_html(
             called automatically (slow first call).
         device: Torch device string.  Only used when ``model`` is ``None``.
         ocr_batch_size: Number of region crops to batch per model call.
+        text_source: ``"auto"`` uses the text layer for prose on pages that have
+            one (else Falcon); ``"falcon"`` always uses Falcon OCR (scanned docs
+            / escape hatch); ``"pdf"`` forces the text layer (testing).
 
     Returns:
         Self-contained HTML document string.
@@ -580,17 +1009,22 @@ def falcon_pdf_to_html(
     if model is None:
         model = load_model(device)
 
-    images = _render_pages(pdf_path)
-
     cuda_available = torch.cuda.is_available()
-    all_regions: list[list[dict]] = []
-    for img in images:
-        with torch.inference_mode():
-            results = model.generate_with_layout([img], ocr_batch_size=ocr_batch_size)
-        if cuda_available:
-            torch.cuda.empty_cache()
-        # Guard against blank/image-only pages that return no regions.
-        all_regions.append(results[0] if results else [])
+    with _render_pages(pdf_path) as pages:
+        images = [p.image for p in pages]
+        all_regions: list[list[Region]] = []
+        for img in images:
+            with torch.inference_mode():
+                results = model.generate_with_layout(
+                    [img], ocr_batch_size=ocr_batch_size
+                )
+            if cuda_available:
+                torch.cuda.empty_cache()
+            # Guard against blank/image-only pages that return no regions.
+            all_regions.append(results[0] if results else [])
+
+        if text_source != "falcon":
+            _apply_text_layer(all_regions, pages, force=text_source == "pdf")
 
     start = _leading_pages_to_skip(all_regions)
     if start:
