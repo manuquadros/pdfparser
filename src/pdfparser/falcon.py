@@ -102,12 +102,20 @@ def load_model(device: str | None = None) -> Any:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.enable_flash_sdp(True)
 
-    return AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
         torch_dtype=dtype,
         device_map=device,
     )
+
+    # Falcon-OCR's _load_layout_model() short-circuits on a `_layout_model`
+    # attribute it never actually assigns, so PP-DocLayoutV3 is reloaded from
+    # disk on every generate_with_layout() call. Prime it once and set the
+    # sentinel the guard checks for, so later calls reuse the loaded detector.
+    model._load_layout_model()
+    model._layout_model = model._layout_det_model
+    return model
 
 
 def _render_page(page: pdfium.PdfPage) -> Image.Image:
