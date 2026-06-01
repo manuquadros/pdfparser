@@ -335,6 +335,24 @@ class TestBodyColumnMerge:
         assert "<h2>Article</h2>" not in body
         assert "Normal body text begins here." in body
 
+    def test_function_word_end_merges_acronym_continuation(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        # Fragment ends with "and" (function word) and the continuation opens
+        # with an all-caps acronym ("TRII"): a real clause split across a
+        # page break, not a dropped-sentence artefact, so the two must merge.
+        parts = [
+            "<p>This suggests that TRI and</p>",
+            "<p>TRII compete for the same substrate tropinone. TRI plays an"
+            " important role in TA biosynthesis.</p>",
+        ]
+        result = _merge_split_paragraphs(parts)
+        assert len(result) == 1
+        assert (
+            "This suggests that TRI and TRII compete for the same substrate"
+            in result[0]
+        )
+
     def test_function_word_end_merges_lowercase_continuation(self) -> None:
         from pdfparser.falcon import _merge_split_paragraphs
 
@@ -783,18 +801,37 @@ class TestFalconPipeline:
             assert fn_pos < first_ref_pos
 
 
+@pytest.fixture(scope="session")
+def ad_prefix_html(falcon_model: object) -> str:
+    """Full pipeline output for the ad-prefixed 31051047.pdf fixture."""
+    if not _AD_PREFIX_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
+    from pdfparser.falcon import falcon_pdf_to_html
+
+    return falcon_pdf_to_html(_AD_PREFIX_PDF, model=falcon_model)
+
+
 @pytest.mark.integration
 class TestFalconAdPageExclusion:
     """The 31051047.pdf fixture has an advertisement as its first page; the
     pipeline must drop it and start the document at the real article title."""
 
-    def test_title_starts_with_article_title(self, falcon_model: object) -> None:
-        if not _AD_PREFIX_PDF.exists():
-            pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
-        from pdfparser.falcon import falcon_pdf_to_html
-
-        html = falcon_pdf_to_html(_AD_PREFIX_PDF, model=falcon_model)
-        title = _header_h1(html)
+    def test_title_starts_with_article_title(self, ad_prefix_html: str) -> None:
+        # The title carries the PDF's intra-title line breaks; normalize runs of
+        # whitespace before matching the prefix.
+        title = re.sub(r"\s+", " ", _header_h1(ad_prefix_html)).strip()
         assert title.startswith(
             "Biochemical characterization reveals the functional divergence"
         )
+
+    def test_species_name_italicized(self, ad_prefix_html: str) -> None:
+        assert "<em>Przewalskia tangutica</em>" in ad_prefix_html
+
+    def test_cross_page_paragraph_not_split(self, ad_prefix_html: str) -> None:
+        # The clause "…TRI and" / "TRII compete…" spans a page break; it must
+        # be a single paragraph, not split at the page boundary.
+        assert (
+            "This suggests that TRI and TRII compete for the same substrate"
+            in ad_prefix_html
+        )
+        assert "This suggests that TRI and</p>" not in ad_prefix_html

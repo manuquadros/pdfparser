@@ -48,6 +48,7 @@ url = "https://pypi.org/simple"
 exclude_packages = ["torch", "torchvision", "torchaudio"]
 
 [tool.pdm.scripts]
+to-html = "python -m pdfparser"
 test = "pytest"
 test-cov = "pytest --cov=src/pdfparser --cov-report=term-missing"
 lint = "ruff check ."

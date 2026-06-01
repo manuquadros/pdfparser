@@ -206,6 +206,11 @@ _FUNCTION_WORD_END_RE = re.compile(
     r"that|which|who|whom|this|these|those)\s*$",
     re.IGNORECASE,
 )
+# An all-caps acronym ("TRII", "DNA", "NAD") opening the continuation is part
+# of the same sentence, not a new-sentence capital, so it must not trip the
+# function-word guard — otherwise a clause split across a column/page break
+# ("…TRI and" / "TRII compete…") is wrongly left as two paragraphs.
+_ACRONYM_HEAD_RE = re.compile(r"^[A-Z]{2,}[0-9]*\b")
 _MAX_FLOATS_TO_SKIP = 2
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
@@ -321,6 +326,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and not (
                             _FUNCTION_WORD_END_RE.search(stripped)
                             and cont[:1].isupper()
+                            and not _ACRONYM_HEAD_RE.match(cont)
                         )
                     ):
                         dehyphenated, n = _HYPHEN_BREAK_RE.subn("", stripped)
