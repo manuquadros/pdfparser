@@ -9,6 +9,6 @@ try:
 except ImportError:
     pass
 
-from pdfparser.falcon import falcon_pdf_to_html, load_model
+from pdfparser.falcon import lightonocr_pdf_to_html, load_ocr_model
 
-__all__ = ["falcon_pdf_to_html", "load_model"]
+__all__ = ["lightonocr_pdf_to_html", "load_ocr_model"]

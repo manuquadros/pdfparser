@@ -7,12 +7,12 @@ readme = "README.md"
 requires-python = "<3.14,>=3.13"
 license = "GPL-3.0-or-later"
 dependencies = [
-  "transformers>=5.0.0rc3",
+  "transformers>=5.9",
   "torch",
   "torchvision",
-  "paddlepaddle>=3.3.0",
-  "paddleocr>=3.5.0",
-  "paddlex[ocr]==3.5.2",
+  "pypdfium2",
+  "pillow",
+  "markdown-it-py>=3",
 ]
 
 [build-system]

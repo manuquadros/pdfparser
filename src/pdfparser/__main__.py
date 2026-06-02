@@ -10,7 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from pdfparser.falcon import falcon_pdf_to_html
+from pdfparser.falcon import lightonocr_pdf_to_html
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,16 +30,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Torch device for the model (default: cuda if available, else cpu).",
     )
-    parser.add_argument(
-        "--text-source",
-        choices=["auto", "falcon", "pdf"],
-        default="auto",
-        help=(
-            "Prose source: 'auto' uses the PDF text layer when present else "
-            "Falcon OCR; 'falcon' forces OCR (scanned docs); 'pdf' forces the "
-            "text layer (default: auto)."
-        ),
-    )
     args = parser.parse_args(argv)
 
     if not args.pdf.is_file():
@@ -47,9 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 
     output = args.output or args.pdf.with_suffix(".html")
 
-    html = falcon_pdf_to_html(
-        args.pdf, device=args.device, text_source=args.text_source
-    )
+    html = lightonocr_pdf_to_html(args.pdf, device=args.device)
     output.write_text(html, encoding="utf-8")
     print(f"Wrote {output}")
     return 0

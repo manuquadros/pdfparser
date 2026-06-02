@@ -1,107 +1,48 @@
-"""PDF → HTML pipeline using Falcon-OCR
+"""PDF → HTML pipeline using LightOnOCR-2-1B-bbox.
 
-Falcon-OCR (tiiuae/Falcon-OCR) runs PP-DocLayoutV3 to detect page regions,
-then generates text for each crop.  Table regions come back as HTML directly;
-all other regions use light markdown (``**bold**``, ``*italic*``).
+LightOnOCR (lightonai/LightOnOCR-2-1B-bbox, Apache-2.0) is an end-to-end VLM that
+reconstructs each page as markdown — reading order, emphasis, ``<table>`` HTML,
+LaTeX math, and figure crop boxes appended to ``![image]`` placeholders.  The
+pipeline OCRs every page, converts the markdown to HTML, crops figures from the
+rendered page, and assembles a document shell.  (The module keeps the ``falcon``
+filename for import stability; the GRM/Falcon + Heron + text-layer engine it
+replaced is gone — see plans/replace-falcon-with-lightonocr.md.)
 
 Typical use::
 
-    model = load_model()
-    html = falcon_pdf_to_html("paper.pdf", model=model)
+    ocr = load_ocr_model()
+    html = lightonocr_pdf_to_html("paper.pdf", ocr=ocr)
     Path("out.html").write_text(html)
 """
 
 from __future__ import annotations
 
 import base64
-import bisect
-import ctypes
 import html as _html
 import io
 import re
 from collections import Counter
-from collections.abc import Iterator  # noqa: TC003  (beartype needs it at runtime)
-from contextlib import contextmanager
 from dataclasses import dataclass
-from itertools import groupby
 from pathlib import Path
-from statistics import median
-from typing import Any, Literal, NamedTuple
+from typing import Any
 
 import pypdfium2 as pdfium
-import pypdfium2.raw as pdfium_raw
 import torch
-import torch._dynamo
+from markdown_it import MarkdownIt
 from PIL import Image
-from transformers import AutoModelForCausalLM
 
-# flex_attention inside Falcon-OCR compiles with fullgraph=True and recompiles
-# as sequence length grows during autoregressive decoding.
-torch._dynamo.config.recompile_limit = 64
-
-MODEL_ID = "tiiuae/Falcon-OCR"
-_RENDER_SCALE = 200 / 72
-_MAX_LONG_SIDE = 1024
-_DEFAULT_OCR_BATCH_SIZE = 2
-
-_HTML_CATS = frozenset({"table", "vision_footnote"})
-_SKIP_CATS = frozenset({"header", "page-header", "footer", "page-footer"})
-
-# Categories whose prose can be sourced from the PDF text layer.  table/figure/
-# vision_footnote stay on Falcon: they need structure/vision recognition, not
-# plain glyphs.
-_PROSE_CATS = frozenset(
-    {"text", "doc_title", "abstract", "paragraph_title", "footnote", "figure_title"}
+# transformers' type stubs lag the LightOnOCR classes shipped at runtime (5.9+).
+from transformers import (  # type: ignore[attr-defined]
+    LightOnOcrForConditionalGeneration,
+    LightOnOcrProcessor,
 )
 
-# A page with fewer than this many characters is treated as scanned (no usable
-# text layer) and falls back to Falcon OCR for all its regions.
-_MIN_TEXT_LAYER_CHARS = 16
-# Inward margin (render pixels) applied to a region rect before pulling text, so
-# glyphs sitting exactly on a neighbouring region's boundary aren't absorbed.
-_REGION_INSET_PX = 2.0
-# Falcon's OCR is kept over the text layer only when the extraction is BOTH a
-# small fraction of Falcon's text AND tiny in absolute terms — that combination
-# signals a bbox/text-layer mismatch (e.g. a rasterised region), whereas a
-# substantial-but-shorter extraction usually means Falcon padded/duplicated and
-# the text layer is the better source.
-_MIN_TEXT_LAYER_RATIO = 0.5
-_MIN_TEXT_LAYER_ABS_CHARS = 24
+MODEL_ID_BBOX = "lightonai/LightOnOCR-2-1B-bbox"
+_OCR_MAX_NEW_TOKENS = 2048
+_RENDER_SCALE = 200 / 72  # 200 DPI per the model card
 
-# PDF font descriptor flag bit for an italic face (PDF 1.7 §9.8.2, Table 121).
-_FONT_FLAG_ITALIC = 0x40
-_BOLD_WEIGHT_MIN = 600
-_FONT_NAME_BUFLEN = 256
-
-# A glyph whose baseline sits this fraction of the line height above its own
-# line's baseline is a superscript.  Detection is per-line, so glyphs on a lower
-# neighbouring line can't drag the baseline down and make ordinary text look
-# raised.  Subscripts are intentionally not reconstructed: their baseline drop
-# is comparable to ordinary descenders, so detecting them geometrically would
-# corrupt words containing p/y/g/q/j.
-_SUPERSCRIPT_RAISE_FRAC = 0.35
-_MIN_CHARS_FOR_SCRIPT = 3
-# Only these glyphs are ever treated as superscripts.  Quotation marks,
-# apostrophes, accents and degree signs also sit high in the line but are never
-# superscripts, so restricting candidates to alphanumerics and scientific
-# operators avoids flagging them.
-_SUPERSCRIPT_CANDIDATE_SYMBOLS = frozenset("+-−=()")
-# A style is the region's *base* (not emphasis) only when it dominates this much
-# of the text — high enough that a uniformly bold/italic heading is treated as
-# unstyled while a minority of emphasised words is still marked.
-_BASE_STYLE_FRAC = 0.8
-
-_LIGATURES = {
-    "ﬁ": "fi",
-    "ﬂ": "fl",
-    "ﬀ": "ff",
-    "ﬃ": "ffi",
-    "ﬄ": "ffl",
-    "ﬅ": "ft",
-    "ﬆ": "st",
-}
-# Unicode superscript forms.  A superscript run is rendered with these glyphs
-# when every character has one (matching Falcon's "NAD⁺"); otherwise it falls
+# Unicode superscript forms.  A LaTeX ``$^{…}$`` run is rendered with these
+# glyphs when every character has one (so "NAD$^+$" → "NAD⁺"); otherwise it falls
 # back to an HTML <sup> wrapper so nothing is lost.
 _SUPERSCRIPT_MAP = {
     "0": "⁰",
@@ -146,34 +87,6 @@ _SUPERSCRIPT_MAP = {
     "y": "ʸ",
     "z": "ᶻ",
 }
-# Whitespace at a line break is suppressed adjacent to these so we don't emit
-# "NAD⁺ )" or "( enzyme".
-_NO_SPACE_BEFORE = frozenset(")]},.;:!?%")
-_NO_SPACE_AFTER = frozenset("([{")
-# Literal asterisks in the text layer would be parsed as emphasis markers by
-# _inline_md_to_html, so they are emitted as the asterisk operator (U+2217)
-# instead — visually an asterisk, but not "*" and not a punctuation character
-# that the sentence-boundary / paragraph-merge heuristics key on.
-_ASTERISK_SUBSTITUTE = "∗"
-
-# A layout region as produced by Falcon: category + bbox + text (+ Falcon OCR).
-Region = dict[str, Any]
-
-# Text-layer glyph records, in PDF points.
-_Rect = tuple[float, float, float, float]  # (left, bottom, right, top)
-# (index, center-x, center-y, bottom, top, char, bold, italic)
-_PageChar = tuple[int, float, float, float, float, str, bool, bool]
-# (char, bold, italic, bottom, top) — one glyph within a single line
-_LineChar = tuple[str, bool, bool, float, float]
-
-
-class _StyledRun(NamedTuple):
-    """A glyph tagged with the styling to coalesce into markdown."""
-
-    bold: bool
-    italic: bool
-    vshift: int  # 1 = superscript, 0 = baseline
-    char: str
 
 
 _WRAPPER_CSS = """
@@ -208,159 +121,86 @@ hr { border: none; border-top: 1px solid #ddd; margin: 2rem 0; }
 """
 
 
-def load_model(device: str | None = None) -> Any:
-    """Load Falcon-OCR, applying the project's paddle flags first.
+@dataclass
+class OcrModel:
+    """LightOnOCR model + processor bundle and the device/dtype to run on."""
+
+    model: Any
+    processor: Any
+    device: str
+    dtype: torch.dtype
+
+
+def load_ocr_model(device: str | None = None) -> OcrModel:
+    """Load LightOnOCR-2-1B-bbox (model + processor) for whole-page OCR.
 
     Args:
         device: Torch device string.  Defaults to ``"cuda"`` if available.
-
-    Returns:
-        Loaded ``AutoModelForCausalLM`` instance.
     """
-    import paddle
-
-    paddle.set_flags(
-        {
-            "FLAGS_use_mkldnn": False,
-            "FLAGS_enable_pir_api": False,
-            "FLAGS_allocator_strategy": "auto_growth",
-        }
-    )
-    # paddle ships no stub for set_device.
-    paddle.set_device("cpu")  # type: ignore[attr-defined]
-
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    if device == "cuda":
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cuda.enable_flash_sdp(True)
+    model = LightOnOcrForConditionalGeneration.from_pretrained(
+        MODEL_ID_BBOX, torch_dtype=dtype
+    ).to(device)
+    processor = LightOnOcrProcessor.from_pretrained(MODEL_ID_BBOX)
+    return OcrModel(model=model, processor=processor, device=device, dtype=dtype)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        device_map=device,
+
+def _ocr_page(
+    image: Image.Image, ocr: OcrModel, max_new_tokens: int = _OCR_MAX_NEW_TOKENS
+) -> str:
+    """Run LightOnOCR on a single page image and return its markdown."""
+    conversation = [{"role": "user", "content": [{"type": "image", "image": image}]}]
+    inputs = ocr.processor.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
     )
-
-    # Falcon-OCR's _load_layout_model() short-circuits on a `_layout_model`
-    # attribute it never actually assigns, so PP-DocLayoutV3 is reloaded from
-    # disk on every generate_with_layout() call. Prime it once and set the
-    # sentinel the guard checks for, so later calls reuse the loaded detector.
-    # nn.Module.__getattr__ is typed as returning Tensor|Module, so mypy can't
-    # see these dynamic Falcon attributes.
-    model._load_layout_model()  # type: ignore[operator]
-    model._layout_model = model._layout_det_model
-    return model
-
-
-@dataclass
-class RenderedPage:
-    """A rendered page plus the state needed to map Falcon's image-pixel bboxes
-    back onto the PDF text layer."""
-
-    image: Image.Image
-    scale: float  # points → final-image pixels
-    page_height_pt: float
-    text_page: pdfium.PdfTextPage | None  # None when the page has no text layer
-
-
-def _render_page(page: pdfium.PdfPage) -> tuple[Image.Image, float]:
-    """Render a page and return it with the points → final-pixel scale."""
-    img: Image.Image = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
-    scale = _RENDER_SCALE
-    long_side = max(img.size)
-    if long_side > _MAX_LONG_SIDE:
-        ratio = _MAX_LONG_SIDE / long_side
-        img = img.resize(
-            (int(img.size[0] * ratio), int(img.size[1] * ratio)),
-            Image.Resampling.LANCZOS,
+    inputs = {
+        k: (
+            v.to(device=ocr.device, dtype=ocr.dtype)
+            if v.is_floating_point()
+            else v.to(ocr.device)
         )
-        scale *= ratio
-    return img, scale
+        for k, v in inputs.items()
+    }
+    with torch.inference_mode():
+        output_ids = ocr.model.generate(**inputs, max_new_tokens=max_new_tokens)
+    generated = output_ids[0, inputs["input_ids"].shape[1] :]
+    text: str = ocr.processor.decode(generated, skip_special_tokens=True)
+    del inputs, output_ids, generated
+    if ocr.device == "cuda":
+        torch.cuda.empty_cache()
+    return text
 
 
-def _page_has_text_layer(text_page: pdfium.PdfTextPage) -> bool:
-    return bool(text_page.count_chars() >= _MIN_TEXT_LAYER_CHARS)
+# LightOnOCR-bbox emits figures as a markdown image placeholder with the crop
+# box appended as bare ``x0,y0,x1,y1`` integers **normalized to [0, 1000]** (per
+# the model card), e.g. ``![image](image_1.png)122,89,877,614``.  The base
+# variant omits the coordinates, so they are optional.
+_BBOX_NORM_MAX = 1000
+_FIGURE_PLACEHOLDER_RE = re.compile(
+    r"^!\[[^\]]*\]\([^)]*\)"
+    r"(?:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+))?\s*$"
+)
 
 
-@contextmanager
-def _render_pages(pdf_path: Path) -> Iterator[list[RenderedPage]]:
-    """Render every page, keeping the document and text pages open for the
-    lifetime of the ``with`` block so region text can be pulled from the layer.
+def _parse_figure_placeholder(line: str) -> tuple[int, int, int, int] | None | bool:
+    """Classify a single markdown line as a figure placeholder.
 
-    Text pages and the document are released in the ``finally`` clause.
+    Returns the ``(x0, y0, x1, y1)`` crop box (normalized to ``[0, 1000]``) when
+    present, ``True`` for a bbox-less placeholder (base-variant fallback), or
+    ``None`` when the line is not a figure placeholder at all.
     """
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    rendered: list[RenderedPage] = []
-    try:
-        for page in pdf:
-            image, scale = _render_page(page)
-            _, height = page.get_size()
-            text_page = page.get_textpage()
-            if not _page_has_text_layer(text_page):
-                text_page.close()
-                text_page = None
-            rendered.append(RenderedPage(image, scale, float(height), text_page))
-        yield rendered
-    finally:
-        for rp in rendered:
-            if rp.text_page is not None:
-                rp.text_page.close()
-        pdf.close()
-
-
-def _char_style(text_page: pdfium.PdfTextPage, index: int) -> tuple[bool, bool]:
-    """Return ``(bold, italic)`` for the glyph at ``index``.
-
-    Reads the PDF font descriptor flags and weight; falls back to the font
-    name when the descriptor is missing (common in subset/embedded fonts).
-    """
-    buf = ctypes.create_string_buffer(_FONT_NAME_BUFLEN)
-    flags = ctypes.c_int(0)
-    n = pdfium_raw.FPDFText_GetFontInfo(
-        text_page, index, buf, _FONT_NAME_BUFLEN, ctypes.byref(flags)
-    )
-    name = (
-        buf.raw[:n].split(b"\x00", 1)[0].decode("utf-8", "replace").lower() if n else ""
-    )
-    weight = pdfium_raw.FPDFText_GetFontWeight(text_page, index)
-    italic = (
-        bool(flags.value & _FONT_FLAG_ITALIC) or "italic" in name or "oblique" in name
-    )
-    bold = weight >= _BOLD_WEIGHT_MIN or "bold" in name
-    return bold, italic
-
-
-def _page_char_styles(text_page: pdfium.PdfTextPage) -> list[_PageChar]:
-    """Precompute ``(index, cx, cy, bottom, top, char, bold, italic)`` for every
-    glyph on the page, once, so each region only filters this list."""
-    chars: list[_PageChar] = []
-    for i in range(text_page.count_chars()):
-        left, bottom, right, top = text_page.get_charbox(i)
-        ch = text_page.get_text_range(i, 1)
-        bold, italic = _char_style(text_page, i)
-        chars.append(
-            (i, (left + right) / 2, (bottom + top) / 2, bottom, top, ch, bold, italic)
-        )
-    return chars
-
-
-def _region_pdf_rect(
-    bbox: list[float | int], scale: float, page_height_pt: float
-) -> _Rect:
-    """Map an image-pixel bbox (top-left origin) to a PDF-point rect
-    (bottom-left origin), insetting slightly to avoid edge bleed."""
-    x0, y0, x1, y1 = (float(v) for v in bbox)
-    inset = _REGION_INSET_PX / scale
-    left = x0 / scale + inset
-    right = x1 / scale - inset
-    top = page_height_pt - y0 / scale - inset
-    bottom = page_height_pt - y1 / scale + inset
-    return left, bottom, right, top
+    m = _FIGURE_PLACEHOLDER_RE.match(line.strip())
+    if m is None:
+        return None
+    if m.group(1) is None:
+        return True
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
 
 
 def _to_superscript(core: str) -> str:
@@ -369,244 +209,16 @@ def _to_superscript(core: str) -> str:
     return f"<sup>{core}</sup>"
 
 
-def _select_region_lines(
-    page_chars: list[_PageChar], rect: _Rect
-) -> list[list[_LineChar]]:
-    """Group the glyphs inside ``rect`` into lines, in storage (reading) order.
-
-    A line break is detected by a gap in the character index: the skipped
-    indices are line-ending and other non-printing characters (newlines, format
-    controls, the ``\\ufffe`` noncharacter some fonts emit) which carry no usable
-    box and are excluded from the line tuples.
-
-    ``page_chars`` may arrive in any order (callers narrow by position), so it is
-    re-sorted into storage order first for the index-gap heuristic to hold.
-    """
-    left, bottom, right, top = rect
-    lines: list[list[_LineChar]] = []
-    current: list[_LineChar] = []
-    prev_i: int | None = None
-    for i, cx, cy, cb, ct, ch, bold, italic in sorted(page_chars, key=lambda c: c[0]):
-        if not (left <= cx <= right and bottom <= cy <= top):
-            continue
-        if ch != " " and not ch.isprintable():
-            continue  # leaves an index gap → line break, without emitting a glyph
-        if prev_i is not None and i > prev_i + 1 and current:
-            lines.append(current)
-            current = []
-        current.append((ch, bold, italic, cb, ct))
-        prev_i = i
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _line_superscript_flags(line: list[_LineChar]) -> list[bool]:
-    """Per-line superscript mask: a glyph is a superscript when its baseline
-    sits a fraction of the line height above the line's own baseline.
-
-    Detection is confined to a single (index-gap segmented) line so glyphs from
-    a lower neighbouring line can never drag the baseline down and make ordinary
-    text look raised.
-    """
-    bottoms = [cb for ch, _b, _i, cb, _ct in line if not ch.isspace()]
-    tops = [ct for ch, _b, _i, _cb, ct in line if not ch.isspace()]
-    if len(bottoms) < _MIN_CHARS_FOR_SCRIPT:
-        return [False] * len(line)
-    baseline = median(bottoms)
-    scale = max(tops) - baseline
-    threshold = baseline + _SUPERSCRIPT_RAISE_FRAC * scale
-    return [
-        (ch.isalnum() or ch in _SUPERSCRIPT_CANDIDATE_SYMBOLS)
-        and scale > 0
-        and cb > threshold
-        for ch, _b, _i, cb, _ct in line
-    ]
-
-
-def _base_style(flat: list[_LineChar]) -> tuple[bool, bool]:
-    """The region's dominant ``(bold, italic)``.  Emphasis is only emitted where
-    a glyph *deviates* from this base, so a wholly-bold heading isn't wrapped in
-    ``**`` while an italic species name inside upright prose still is."""
-    styles = [(b, it) for ch, b, it, _cb, _ct in flat if not ch.isspace()]
-    n = len(styles)
-    if n == 0:
-        return False, False
-    base_bold = sum(b for b, _it in styles) > _BASE_STYLE_FRAC * n
-    base_italic = sum(it for _b, it in styles) > _BASE_STYLE_FRAC * n
-    return base_bold, base_italic
-
-
-def _wrap_run(segment: str, bold: bool, italic: bool, vshift: int) -> str:
-    core = segment.strip()
-    if not core:
-        return segment
-    lead = segment[: len(segment) - len(segment.lstrip())]
-    trail = segment[len(segment.rstrip()) :]
-    if vshift > 0:
-        core = _to_superscript(core)
-    if bold and italic:
-        core = f"***{core}***"
-    elif bold:
-        core = f"**{core}**"
-    elif italic:
-        core = f"*{core}*"
-    return f"{lead}{core}{trail}"
-
-
-def _runs_to_markdown(runs: list[_StyledRun]) -> str | None:
-    if not any(not r.char.isspace() for r in runs):
-        return None
-    parts = [
-        _wrap_run("".join(r.char for r in grp), bold, italic, vshift)
-        for (bold, italic, vshift), grp in groupby(
-            runs, key=lambda r: (r.bold, r.italic, r.vshift)
-        )
-    ]
-    return _normalize_text("".join(parts))
-
-
-def _normalize_text(text: str) -> str | None:
-    text = text.replace("\xad", "")  # soft hyphen
-    for lig, repl in _LIGATURES.items():
-        if lig in text:
-            text = text.replace(lig, repl)
-    text = _WHITESPACE_RE.sub(" ", text).strip()
-    return text or None
-
-
-def _region_markdown(page_chars: list[_PageChar], rect: _Rect) -> str | None:
-    """Extract a region's text from the layer as light markdown, reconstructing
-    italic/bold from font metadata and superscripts from glyph geometry."""
-    left, bottom, right, top = rect
-    if right <= left or top <= bottom:
-        return None
-    lines = _select_region_lines(page_chars, rect)
-    base_bold, base_italic = _base_style([c for line in lines for c in line])
-
-    runs: list[_StyledRun] = []
-    for li, line in enumerate(lines):
-        if li > 0 and runs:
-            last_ch = runs[-1].char
-            first_ch = next((c[0] for c in line if not c[0].isspace()), "")
-            if last_ch == "-":
-                runs.pop()  # dehyphenate a word broken across the line break
-            elif (
-                not last_ch.isspace()
-                and first_ch not in _NO_SPACE_BEFORE
-                and last_ch not in _NO_SPACE_AFTER
-            ):
-                runs.append(_StyledRun(runs[-1].bold, runs[-1].italic, 0, " "))
-        superscript = _line_superscript_flags(line)
-        for (ch, bold, italic, _cb, _ct), is_sup in zip(line, superscript, strict=True):
-            runs.append(
-                _StyledRun(
-                    bold and not base_bold,
-                    italic and not base_italic,
-                    int(is_sup),
-                    _ASTERISK_SUBSTITUTE if ch == "*" else ch,
-                )
-            )
-    return _runs_to_markdown(runs)
-
-
-def _apply_text_layer(
-    all_regions: list[list[Region]], pages: list[RenderedPage], *, force: bool
-) -> None:
-    """Replace the text of prose regions with text-layer content, in place.
-
-    On pages without a text layer, or for regions where extraction fails or
-    returns far less than Falcon (and ``force`` is off), the original Falcon
-    text is kept, so switching sources can never lose content.
-    """
-    for regions, page in zip(all_regions, pages, strict=True):
-        if page.text_page is None:
-            continue
-        # Sort the page's glyphs by vertical position once so each region can
-        # bisect to the band it spans instead of rescanning every glyph.
-        char_styles = sorted(_page_char_styles(page.text_page), key=lambda c: c[2])
-        cys = [c[2] for c in char_styles]
-        for r in regions:
-            if r.get("category") not in _PROSE_CATS:
-                continue
-            bbox = r.get("bbox")
-            if not bbox:
-                continue
-            rect = _region_pdf_rect(bbox, page.scale, page.page_height_pt)
-            band = char_styles[
-                bisect.bisect_left(cys, rect[1]) : bisect.bisect_right(cys, rect[3])
-            ]
-            md = _region_markdown(band, rect)
-            if md is None:
-                continue
-            if not force:
-                falcon_text = (r.get("text") or "").strip()
-                # Defer to Falcon only when the extraction is both a small
-                # fraction of it AND tiny outright (a likely bbox mismatch).
-                if (
-                    falcon_text
-                    and len(md) < _MIN_TEXT_LAYER_RATIO * len(falcon_text)
-                    and len(md) < _MIN_TEXT_LAYER_ABS_CHARS
-                ):
-                    continue
-            r["text"] = md
-
-
-def _sort_regions(regions: list[Region], page_width: float) -> list[Region]:
-    """Sort regions into reading order for two-column PDF layouts.
-
-    Full-width regions (spanning > 55 % of the page) act as section
-    boundaries.  Within each section, left-column content (col 1) is read
-    before right-column content (col 2); within a column, regions are ordered
-    top-to-bottom by y0.
-
-    This correctly handles paragraphs that start near the bottom of the left
-    column and continue near the top of the right column: the left fragment
-    always precedes the right fragment within the same section, regardless of
-    their absolute y positions.
-    """
-    half = page_width / 2
-
-    def classify(r: Region) -> tuple[int, float]:
-        bbox = r.get("bbox")
-        if not bbox:
-            return 1, 0.0  # treat bbox-less regions as left-column at top
-        x0, y0, x1, _ = bbox
-        cx = (x0 + x1) / 2
-        if (x1 - x0) > 0.55 * page_width:
-            return 0, float(y0)
-        return (2 if cx > half else 1), float(y0)
-
-    # Classify once per region; reuse results for both boundaries and sort key.
-    classified = [(classify(r), r) for r in regions]
-
-    # y-positions of full-width elements divide the page into sections.
-    # bisect_right(boundaries, y0) gives the section index: 0 = before the
-    # first full-width element, 1 = after it but before the second, etc.
-    # Full-width elements themselves get the section AFTER their own y0,
-    # so they sort first within that section (col 0 < col 1 < col 2).
-    boundaries: list[float] = sorted(y0 for (col, y0), _ in classified if col == 0)
-
-    def key(col_y0: tuple[int, float]) -> tuple[int, int, float]:
-        col, y0 = col_y0
-        return (bisect.bisect_right(boundaries, y0), col, y0)
-
-    return [r for _, r in sorted(classified, key=lambda item: key(item[0]))]
-
-
 _BOLDITALIC_RE = re.compile(r"\*\*\*(.+?)\*\*\*", re.DOTALL)
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 # re.DOTALL intentionally omitted: italic spans in academic text don't cross
 # line boundaries, and DOTALL would cause two stray footnote asterisks anywhere
 # in a multi-line region to wrap the entire intervening content in <em>.
 _ITALIC_RE = re.compile(r"\*(.+?)\*")
-_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+")
-_REF_LIST_RE = re.compile(r"^\[1\]")
 # A leading footnote marker is a SHORT superscript ("<sup>a</sup>", "<sup>1</sup>").
 # Bounding the marker length stops a body paragraph that merely opens with a
 # reconstructed multi-character superscript from being mistaken for a footnote.
 _SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
-_REF_SPLIT_RE = re.compile(r"\n(?=\[\d+\])")
 _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
 _HYPHEN_BREAK_RE = re.compile(r"-\s*$")
@@ -654,48 +266,11 @@ _REF_SECTION_RE = re.compile(
     r"^(?:<h\d[^>]*>\s*References\s*</h\d>|<p>\[1\])", re.IGNORECASE
 )
 
-# A page begins the article if it carries the paper title or abstract, or an
-# "Abstract"/"Introduction" *heading* — the word must head a paragraph_title,
-# not merely appear in body or advertising copy, so a cover ad mentioning
-# "introduction" isn't mistaken for the article start.
-_ARTICLE_PAGE_CATS = frozenset({"abstract", "doc_title"})
+# The article starts at the first page carrying an "Abstract"/"Introduction"
+# heading; a cover ad / masthead has neither.
 _ARTICLE_HEADING_RE = re.compile(
     r"^\s*(?:\d+[.)]?\s+)?(?:abstract|introduction)\b", re.IGNORECASE
 )
-# Categories the layout model emits only for genuine article content; a leading
-# page carrying any of these is real content, never a droppable cover/masthead.
-_CONTENT_CATS = frozenset({"abstract", "doc_title", "figure_title"})
-
-
-def _is_article_page(regions: list[Region]) -> bool:
-    for r in regions:
-        cat = r.get("category")
-        if cat in _ARTICLE_PAGE_CATS:
-            return True
-        if cat == "paragraph_title" and _ARTICLE_HEADING_RE.match(r.get("text") or ""):
-            return True
-    return False
-
-
-def _has_structural_content(regions: list[Region]) -> bool:
-    return any(r.get("category") in _CONTENT_CATS for r in regions)
-
-
-def _leading_pages_to_skip(all_regions: list[list[Region]]) -> int:
-    """Number of leading non-article pages (cover ads, mastheads) to drop.
-
-    A leading page is dropped only when *no* page before the article start
-    carries structural content of its own, so a real first page the layout
-    model under-tagged (its title/abstract missed) is never discarded just
-    because a later page has an "Introduction" heading.
-    """
-    first_article = next(
-        (i for i, regions in enumerate(all_regions) if _is_article_page(regions)),
-        0,
-    )
-    if any(_has_structural_content(regions) for regions in all_regions[:first_article]):
-        return 0
-    return first_article
 
 
 def _plain_p_text(s: str) -> str | None:
@@ -762,49 +337,9 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     return out
 
 
-_RUNNING_HEADER_MAX_LEN = 200
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
-
-
-def _remove_repeated_short_paragraphs(parts: list[str]) -> list[str]:
-    """Drop repeated short paragraphs that are structural artefacts (running
-    headers, footers, page labels) the layout model mis-classified as text.
-
-    Only sentence-*fragment* repeats are removed: running headers carry no
-    terminal punctuation, whereas a legitimately repeated short sentence does,
-    so requiring the absence of sentence-ending punctuation preserves real
-    prose that happens to recur verbatim.
-    """
-    counts: Counter[str] = Counter(
-        p
-        for p in parts
-        if (inner := _plain_p_text(p)) is not None
-        and len(inner) <= _RUNNING_HEADER_MAX_LEN
-        and not _SENTENCE_END_RE.search(inner.rstrip())
-    )
-    repeated = {p for p, n in counts.items() if n > 1}
-    return [p for p in parts if p not in repeated]
-
-
-# When the layout model runs text generation over a figure/diagram (e.g. a
-# phylogenetic tree) it can emit one label repeated dozens of times
-# ("AaTRI, AaTRI, AaTRI, …").  Such a region is OCR noise, not prose: it has
-# many tokens but almost no diversity.
-_MIN_REPEAT_TOKENS = 8
-_MAX_REPEAT_SHARE = 0.6
-_TOKEN_RE = re.compile(r"\w+")
-
-
-def _is_degenerate_repetition(text: str) -> bool:
-    # Tokenize the visible text only; stripping tags first keeps element names
-    # (e.g. "sup" from a superscript) from counting as repeated tokens.
-    tokens = _TOKEN_RE.findall(_STRIP_TAGS_RE.sub("", text))
-    if len(tokens) < _MIN_REPEAT_TOKENS:
-        return False
-    top = Counter(tokens).most_common(1)[0][1]
-    return top / len(tokens) >= _MAX_REPEAT_SHARE
 
 
 def _inline_md_to_html(text: str) -> str:
@@ -814,57 +349,76 @@ def _inline_md_to_html(text: str) -> str:
     return text.strip()
 
 
-def _heading_html(text: str, default_level: int = 2) -> str:
-    """Convert a paragraph_title to an ``<h2>`` or ``<h3>`` element.
+# LightOnOCR emits whole-page markdown mixed with raw HTML (<table>, <sup>) and
+# inline LaTeX.  CommonMark + the table plugin, with raw-HTML passthrough, covers
+# the structure; LaTeX sub/superscripts are converted to HTML beforehand.
+_MD = MarkdownIt("commonmark", {"html": True}).enable("table")
 
-    Falcon sometimes emits ``##`` markdown prefixes inside paragraph_title
-    regions to signal sub-headings.  Strip the prefix and use the level.
+# An inline math span: $…$ not preceded by a backslash, shortest match.
+_LATEX_SPAN_RE = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$", re.DOTALL)
+# Sub/superscript inside a math span: ^{multi} / ^x and _{multi} / _x.
+_LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}|\^(\S)")
+_LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}|_(\S)")
+# Font/style wrappers (\text{…}, \mathrm{…}) carry no semantics here — unwrap to
+# their content so the inner sub/superscript handling sees plain text.
+_LATEX_WRAP_RE = re.compile(
+    r"\\(?:text|mathrm|mathit|mathbf|mathsf|operatorname)\{([^{}]*)\}"
+)
+
+
+def _latex_span_to_html(content: str) -> str:
+    """Convert the inside of a ``$…$`` span: sub/superscripts to HTML, then drop
+    residual TeX syntax.  Full math is out of scope (a later MathJax option)."""
+    content = _LATEX_WRAP_RE.sub(r"\1", content)
+    content = _LATEX_SUP_RE.sub(
+        lambda m: _to_superscript(m.group(1) if m.group(1) is not None else m.group(2)),
+        content,
+    )
+    content = _LATEX_SUB_RE.sub(
+        lambda m: f"<sub>{m.group(1) if m.group(1) is not None else m.group(2)}</sub>",
+        content,
+    )
+    return content.replace("\\,", " ").replace("{", "").replace("}", "")
+
+
+def _latex_to_html(text: str) -> str:
+    """Replace every inline ``$…$`` math span with deterministic HTML.
+
+    Runs on the markdown *before* parsing so the emitted ``<sub>``/``<sup>`` pass
+    through as raw HTML and the ``_`` inside ``V_{max}`` isn't read as emphasis.
     """
-    m = _MD_HEADING_RE.match(text)
-    if m:
-        level = min(len(m.group(1)) + 1, 4)  # ## → h3, ### → h4
-        text = text[m.end() :]
-    else:
-        level = default_level
-    return f"<h{level}>{_inline_md_to_html(text)}</h{level}>"
+    return _LATEX_SPAN_RE.sub(lambda m: _latex_span_to_html(m.group(1)), text)
 
 
-def _region_to_html(r: Region) -> str:
-    cat = r.get("category", "text")
-    text: str = r.get("text", "").strip()
-    if not text:
-        return ""
+def _md_to_html_blocks(md_text: str) -> list[str]:
+    """Convert a page's markdown to a list of top-level block HTML strings.
 
-    if cat in _HTML_CATS:
-        # Sanity-check table regions: if the model returned plain text instead
-        # of HTML (failure path or version change), fall back to <pre> rather
-        # than injecting raw text into the document structure.
-        if cat == "table" and "<table" not in text.lower():
-            return f"<pre>{_html.escape(text)}</pre>"
-        # vision_footnote text is inline HTML (e.g. "<sup>a</sup> note…") but
-        # arrives without a wrapper element, so we supply one.
-        if cat == "vision_footnote":
-            return f'<p class="footnote">{text}</p>'
-        return text
-
-    if cat == "paragraph_title":
-        return _heading_html(text)
-
-    if cat == "footnote":
-        return f'<p class="footnote">{_inline_md_to_html(text)}</p>'
-
-    if _REF_LIST_RE.match(text):
-        refs = _REF_SPLIT_RE.split(text)
-        return "\n".join(
-            f"<p>{_inline_md_to_html(ref.strip())}</p>" for ref in refs if ref.strip()
-        )
-
-    # Table footnotes rendered by Falcon as inline HTML (e.g. "<sup>a</sup> …")
-    # arrive via the text category when the model emits them outside a table.
-    if _SUP_MARKER_RE.match(text):
-        return f'<p class="footnote">{text}</p>'
-
-    return f"<p>{_inline_md_to_html(text)}</p>"
+    One string per top-level block (heading, paragraph, list, raw-HTML table…),
+    so downstream cleanup (merge, header/footer strip, footnote reordering) can
+    operate block-by-block.  Thematic breaks (``---``) are dropped.
+    """
+    tokens = _MD.parse(_latex_to_html(md_text))
+    blocks: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.level != 0:
+            i += 1
+            continue
+        if token.nesting == 1:
+            depth, j = 0, i
+            while j < len(tokens):
+                depth += tokens[j].nesting
+                j += 1
+                if depth == 0:
+                    break
+            group, i = tokens[i:j], j
+        else:
+            group, i = [token], i + 1
+        html = _MD.renderer.render(group, _MD.options, {}).strip()
+        if html and not html.startswith("<hr"):
+            blocks.append(html)
+    return blocks
 
 
 _MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
@@ -884,309 +438,317 @@ def _figure_html(crop: Image.Image, caption_text: str | None) -> str:
     return f'<figure><img src="{data_uri}" alt="">{caption_html}</figure>'
 
 
-def _infer_figure_crop(
-    fig_title_region: Region,
-    all_regions: list[Region],
-    img: Image.Image,
+# ---------------------------------------------------------------------------
+# LightOnOCR markdown pipeline (design B-prime — see
+# plans/replace-falcon-with-lightonocr.md).  render → per-page markdown →
+# block HTML → cleanup/merge → document shell.
+# ---------------------------------------------------------------------------
+
+_OCR_MAX_LONG_SIDE = 1540  # model-card target; VRAM ≈ 2.7/6.1 GiB at this size
+
+# A caption opens with a figure/table label ("FIG. 2 …", "**Table 1.** …").
+_CAPTION_RE = re.compile(
+    r"^\*{0,2}(?:fig(?:ure|\.|\b)|table|scheme|supplement)", re.IGNORECASE
+)
+_HEADING_TAG_RE = re.compile(r"^<h([1-6])>(.*)</h\1>$", re.DOTALL)
+_ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
+# Running header/footer: a short, terminal-punctuation-free line that recurs
+# across pages.  Page numbers vary per page, so they are stripped before the
+# recurrence is counted (e.g. "Biotechnology … 601" / "… 602" share a key).
+_FURNITURE_MAX_LEN = 120
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _render_page_images(pdf_path: Path) -> list[Image.Image]:
+    """Render every page to an RGB image, long side ≤ ``_OCR_MAX_LONG_SIDE``.
+
+    ``convert("RGB")`` detaches each image from the pdfium bitmap, so the
+    document can be closed before the images are consumed.
+    """
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        images: list[Image.Image] = []
+        for page in pdf:
+            img = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
+            long_side = max(img.size)
+            if long_side > _OCR_MAX_LONG_SIDE:
+                ratio = _OCR_MAX_LONG_SIDE / long_side
+                img = img.resize(
+                    (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+                    Image.Resampling.LANCZOS,
+                )
+            images.append(img)
+        return images
+    finally:
+        pdf.close()
+
+
+def _looks_like_caption(block: str) -> bool:
+    return bool(_CAPTION_RE.match(block.strip()))
+
+
+def _denormalize_bbox(
+    bbox: tuple[int, int, int, int], image: Image.Image
+) -> tuple[int, int, int, int]:
+    """Scale a ``[0, 1000]``-normalized box to ``image``'s pixel coordinates."""
+    w, h = image.size
+    return (
+        round(bbox[0] / _BBOX_NORM_MAX * w),
+        round(bbox[1] / _BBOX_NORM_MAX * h),
+        round(bbox[2] / _BBOX_NORM_MAX * w),
+        round(bbox[3] / _BBOX_NORM_MAX * h),
+    )
+
+
+def _safe_crop(
+    image: Image.Image, bbox: tuple[int, int, int, int]
 ) -> Image.Image | None:
-    """Crop the figure area adjacent to a caption region from the page image.
-
-    The figure shares the caption's column.  On a two-column page the crop is
-    confined to that column (left or right half) and the vertical gap is
-    measured only against same-column regions, so a figure never absorbs the
-    neighbouring column's text.  Single-column pages and figures whose caption
-    spans the page use the full page width.
-
-    Finds the nearest same-column content boundary above and below the caption,
-    then crops whichever gap is larger.  Returns None if neither gap reaches
-    _MIN_FIGURE_HEIGHT.
-    """
-    bbox = fig_title_region.get("bbox")
-    if not bbox:
+    """Crop a pixel-space ``bbox`` from ``image``, clamped to bounds; ``None`` if
+    degenerate."""
+    w, h = image.size
+    x0 = max(0, min(bbox[0], w))
+    y0 = max(0, min(bbox[1], h))
+    x1 = max(0, min(bbox[2], w))
+    y1 = max(0, min(bbox[3], h))
+    if x1 - x0 < _MIN_FIGURE_HEIGHT or y1 - y0 < _MIN_FIGURE_HEIGHT:
         return None
+    return image.crop((x0, y0, x1, y1))
 
-    fy0, fy1 = float(bbox[1]), float(bbox[3])
-    page_w, page_h = float(img.size[0]), float(img.size[1])
-    half = page_w / 2
 
-    def is_full_width(rb: list[float | int]) -> bool:
-        return (float(rb[2]) - float(rb[0])) > 0.55 * page_w
+def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
+    """Convert one page's markdown to block HTML, replacing each ``![image]``
+    placeholder with a cropped <figure> (caption from the placeholder's own
+    trailing text, else the following caption-like block)."""
+    parts: list[str] = []
+    pending: list[str] = []
 
-    def left_of_gutter(rb: list[float | int]) -> bool:
-        return (float(rb[0]) + float(rb[2])) / 2 <= half
+    def flush() -> None:
+        if pending:
+            parts.extend(_md_to_html_blocks("\n\n".join(pending)))
+            pending.clear()
 
-    # A two-column page has narrow regions on both sides of the gutter; only
-    # then is it safe to confine the crop to a single column.
-    sides = {
-        left_of_gutter(rb)
-        for r in all_regions
-        if (rb := r.get("bbox")) and not is_full_width(rb)
-    }
-    confine_to_column = len(sides) == 2 and not is_full_width(bbox)
-    caption_left = left_of_gutter(bbox)
-
-    def same_column(rb: list[float | int]) -> bool:
-        # Full-width regions (section headings, rules) bound the figure
-        # vertically regardless of which column it sits in.
-        return (
-            not confine_to_column
-            or is_full_width(rb)
-            or left_of_gutter(rb) == caption_left
-        )
-
-    above_y1 = 0.0
-    below_y0 = page_h
-    for r in all_regions:
-        if r is fig_title_region:
+    raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
+    k = 0
+    while k < len(raw_blocks):
+        block = raw_blocks[k].strip()
+        lines = block.splitlines()
+        fig = _parse_figure_placeholder(lines[0]) if lines else None
+        if fig is None:
+            pending.append(block)
+            k += 1
             continue
-        rb = r.get("bbox")
-        if not rb or not same_column(rb):
-            continue
-        ry0, ry1 = float(rb[1]), float(rb[3])
-        if ry1 <= fy0:
-            above_y1 = max(above_y1, ry1)
-        if ry0 >= fy1:
-            below_y0 = min(below_y0, ry0)
-
-    gap_above = fy0 - above_y1
-    gap_below = below_y0 - fy1
-    if max(gap_above, gap_below) < _MIN_FIGURE_HEIGHT:
-        return None
-
-    gy0, gy1 = (above_y1, fy0) if gap_above >= gap_below else (fy1, below_y0)
-    if confine_to_column:
-        cx0, cx1 = (0.0, half) if caption_left else (half, page_w)
-    else:
-        cx0, cx1 = 0.0, page_w
-    return img.crop((int(cx0), int(gy0), int(cx1), int(gy1)))
-
-
-def _inject_caption(table_html: str, caption_text: str) -> str:
-    """Insert a <caption> element immediately after the opening <table> tag."""
-    caption_html = f"<caption>{_inline_md_to_html(caption_text)}</caption>"
-    return re.sub(
-        r"(<table(?:\s[^>]*)?>)",
-        lambda m: m.group(1) + caption_html,
-        table_html,
-        count=1,
-    )
-
-
-def _extract_meta(page0_regions: list[Region], page_width: float) -> dict[str, str]:
-    """Heuristically pull title and author from the first page's regions."""
-    title = ""
-    author = ""
-    # Sort into reading order so the first short text after the title is the
-    # author line, not an interceding journal label or correspondence fragment.
-    for r in _sort_regions(page0_regions, page_width):
-        cat = r.get("category", "")
-        text = r.get("text", "").strip()
-        if not text:
-            continue
-        if cat == "doc_title" and not title:
-            title = _STRIP_TAGS_RE.sub("", text).strip()
-        elif (
-            cat == "text"
-            and not author
-            and title
-            # A byline is short and not a flowing sentence.  (The text layer
-            # collapses newlines, so a line-count guard would be a no-op here;
-            # the absence of terminal punctuation is source-agnostic.)
-            and not _SENTENCE_END_RE.search(text)
-            and len(text) < 200
+        flush()
+        rest = "\n".join(lines[1:]).strip()
+        caption: str | None = rest or None
+        if (
+            caption is None
+            and k + 1 < len(raw_blocks)
+            and _looks_like_caption(raw_blocks[k + 1])
         ):
-            author = _STRIP_TAGS_RE.sub("", text).strip()
-    return {"title": title or "Untitled", "authors": author, "year": ""}
+            k += 1
+            caption = raw_blocks[k].strip()
+        caption_html = _latex_to_html(caption) if caption else None
+        crop = (
+            _safe_crop(image, _denormalize_bbox(fig, image))
+            if isinstance(fig, tuple)
+            else None
+        )
+        if crop is not None:
+            parts.append(_figure_html(crop, caption_html))
+        elif caption_html is not None:
+            parts.append(
+                f"<figure><figcaption>{_inline_md_to_html(caption_html)}"
+                "</figcaption></figure>"
+            )
+        k += 1
+    flush()
+    return parts
 
 
-def falcon_pdf_to_html(
-    pdf_path: Path | str,
-    *,
-    model: Any = None,
-    device: str | None = None,
-    ocr_batch_size: int = _DEFAULT_OCR_BATCH_SIZE,
-    text_source: Literal["auto", "falcon", "pdf"] = "auto",
-) -> str:
-    """Convert a PDF to a self-contained HTML document using Falcon-OCR.
+# A footer/header is identified by its digit-stripped text recurring across
+# pages ("… 601" / "… 602" share a key).  Require that text to be substantial so
+# stripping the digits can't collapse short enumerated labels ("Fig 1" / "Fig 2",
+# "Step 1" / "Step 2") into one key and delete them as furniture.
+_MIN_FURNITURE_KEY_LEN = 12
 
-    Falcon supplies the layout and the table/figure content.  Prose is sourced
-    from the PDF text layer when one is present (correct glyphs and font-derived
-    emphasis), with a clean per-region fallback to Falcon OCR.
 
-    Args:
-        pdf_path: Path to the input PDF.
-        model: Pre-loaded Falcon-OCR model.  If ``None``, ``load_model()`` is
-            called automatically (slow first call).
-        device: Torch device string.  Only used when ``model`` is ``None``.
-        ocr_batch_size: Number of region crops to batch per model call.
-        text_source: ``"auto"`` uses the text layer for prose on pages that have
-            one (else Falcon); ``"falcon"`` always uses Falcon OCR (scanned docs
-            / escape hatch); ``"pdf"`` forces the text layer (testing).
+def _furniture_key(inner: str) -> str:
+    text = _DIGITS_RE.sub("", _STRIP_TAGS_RE.sub("", inner))
+    return _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", text)).strip().lower()
 
-    Returns:
-        Self-contained HTML document string.
-    """
-    pdf_path = Path(pdf_path)
-    if model is None:
-        model = load_model(device)
 
-    cuda_available = torch.cuda.is_available()
-    with _render_pages(pdf_path) as pages:
-        images = [p.image for p in pages]
-        all_regions: list[list[Region]] = []
-        for img in images:
-            with torch.inference_mode():
-                results = model.generate_with_layout(
-                    [img], ocr_batch_size=ocr_batch_size
-                )
-            if cuda_available:
-                torch.cuda.empty_cache()
-            # Guard against blank/image-only pages that return no regions.
-            all_regions.append(results[0] if results else [])
+def _is_furniture_candidate(part: str) -> str | None:
+    inner = _plain_p_text(part)
+    if inner is None:
+        return None
+    plain = _STRIP_TAGS_RE.sub("", inner)
+    if len(plain) > _FURNITURE_MAX_LEN or _SENTENCE_END_RE.search(plain.rstrip()):
+        return None
+    key = _furniture_key(inner)
+    return key if len(key) >= _MIN_FURNITURE_KEY_LEN else None
 
-        if text_source != "falcon":
-            _apply_text_layer(all_regions, pages, force=text_source == "pdf")
 
-    start = _leading_pages_to_skip(all_regions)
-    if start:
-        all_regions = all_regions[start:]
-        images = images[start:]
+def _strip_running_furniture(parts: list[str]) -> list[str]:
+    """Drop short, recurring header/footer lines (page-number-insensitive)."""
+    counts: Counter[str] = Counter(
+        key for part in parts if (key := _is_furniture_candidate(part)) is not None
+    )
+    repeated = {key for key, n in counts.items() if n > 1}
+    return [p for p in parts if _is_furniture_candidate(p) not in repeated]
 
-    page0_width = float(images[0].size[0]) if images else 800.0
-    meta = (
-        _extract_meta(all_regions[0], page0_width)
-        if all_regions
-        else {"title": "Untitled", "authors": "", "year": ""}
+
+# Even though LightOnOCR-bbox usually boxes figures (so they never reach the text
+# stream), a diagram it misses can still be OCRed into one label repeated dozens
+# of times ("AaTRI, AaTRI, …") — many tokens, almost no diversity.  This drops
+# such a paragraph from the body; real prose (even with some repetition) stays.
+_MIN_REPEAT_TOKENS = 8
+_MAX_REPEAT_SHARE = 0.6
+_TOKEN_RE = re.compile(r"\w+")
+
+
+def _is_degenerate_repetition(text: str) -> bool:
+    tokens = _TOKEN_RE.findall(_STRIP_TAGS_RE.sub("", text))
+    if len(tokens) < _MIN_REPEAT_TOKENS:
+        return False
+    top = Counter(tokens).most_common(1)[0][1]
+    return top / len(tokens) >= _MAX_REPEAT_SHARE
+
+
+def _heading_inner(part: str) -> tuple[int, str] | None:
+    m = _HEADING_TAG_RE.match(part)
+    return (int(m.group(1)), m.group(2).strip()) if m else None
+
+
+def _is_title_heading(inner: str) -> bool:
+    plain = _STRIP_TAGS_RE.sub("", inner).strip().lower()
+    return plain not in _DOCUMENT_TYPE_LABELS and not _ARTICLE_HEADING_RE.match(plain)
+
+
+def _is_byline(inner: str) -> bool:
+    plain = _STRIP_TAGS_RE.sub("", inner).strip()
+    return (
+        bool(plain)
+        and len(plain) < 400
+        and not _SENTENCE_END_RE.search(plain)
+        and not _BOLD_LABEL_RE.match(inner)
     )
 
-    abstract_parts: list[str] = []
-    body_parts: list[str] = []
-    footnote_parts: list[str] = []
-    # figure_title regions are buffered so the next table can absorb them as
-    # <caption> rather than emitting a detached <figure><figcaption>.
-    pending_fig_title: str | None = None
-    pending_fig_crop: Image.Image | None = None
 
-    title_norm = (
-        _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", meta["title"])).lower().strip()
+def _byline_text(inner: str) -> str:
+    return _STRIP_TAGS_RE.sub("", re.sub(r"<br\s*/?>", "; ", inner)).strip()
+
+
+def _is_article_page_md(md: str) -> bool:
+    """A page is the article start if it carries an Abstract/Introduction
+    heading (a cover ad / masthead has neither)."""
+    for line in md.splitlines():
+        m = re.match(r"^#{1,6}\s+(.*)", line.strip())
+        if m and _ARTICLE_HEADING_RE.match(_STRIP_TAGS_RE.sub("", m.group(1)).strip()):
+            return True
+    return False
+
+
+def _leading_pages_to_skip_md(pages_md: list[str]) -> int:
+    return next(
+        (i for i, md in enumerate(pages_md) if _is_article_page_md(md)),
+        0,
     )
 
-    def _flush_fig_title() -> None:
-        nonlocal pending_fig_title, pending_fig_crop
-        if pending_fig_title is not None:
-            if pending_fig_crop is not None:
-                body_parts.append(_figure_html(pending_fig_crop, pending_fig_title))
-            else:
-                body_parts.append(
-                    f"<figure><figcaption>{_inline_md_to_html(pending_fig_title)}</figcaption></figure>"
-                )
-            pending_fig_title = None
-            pending_fig_crop = None
 
-    for regions, img in zip(all_regions, images, strict=True):
-        # Use the rendered image width as the authoritative page width so that
-        # single-column pages (where max(bbox.x1) ≪ page width) don't cause
-        # the column-split heuristic to misclassify left-column content.
-        pw = float(img.size[0])
+@dataclass
+class _Meta:
+    title_html: str
+    byline_html: str
+    abstract: list[str]
+    body: list[str]
+    footnotes: list[str]
 
-        for r in _sort_regions(regions, pw):
-            cat = r.get("category", "text")
-            text = r.get("text", "").strip()
-            if (not text and cat != "figure") or cat in _SKIP_CATS:
+
+def _classify_parts(parts: list[str]) -> _Meta:
+    """Single pass: pull the title, byline, abstract and footnotes out of the
+    flat block list; everything else is body."""
+    title_html = ""
+    byline_html = ""
+    abstract: list[str] = []
+    body: list[str] = []
+    footnotes: list[str] = []
+    # The byline is only the block *immediately* after the title heading; this
+    # window closes at the next block so a body sentence is never mistaken for it.
+    expect_byline = False
+    in_abstract = False
+
+    for part in parts:
+        heading = _heading_inner(part)
+        if heading is not None:
+            _, inner = heading
+            if not title_html and _is_title_heading(inner):
+                title_html = inner
+                expect_byline = True
                 continue
-            # Drop OCR noise from text generation run over a figure/diagram
-            # (a single label repeated dozens of times).  Skipped for table HTML
-            # (_HTML_CATS) and for `figure` regions, which are emitted as an
-            # image crop regardless of any stray text.
-            if (
-                cat not in _HTML_CATS
-                and cat != "figure"
-                and _is_degenerate_repetition(text)
-            ):
+            expect_byline = False
+            if _ABSTRACT_HEADING_RE.match(_STRIP_TAGS_RE.sub("", inner)):
+                in_abstract = True
                 continue
-            if cat == "doc_title":
-                continue  # already captured in meta; skip body duplicate
-
-            if cat == "abstract":
-                abstract_parts.append(f"<p>{_inline_md_to_html(text)}</p>")
+            # A document-type label heading ("Article") is dropped entirely.
+            if _STRIP_TAGS_RE.sub("", inner).strip().lower() in _DOCUMENT_TYPE_LABELS:
                 continue
+            in_abstract = False
+            body.append(part)
+            continue
 
-            if cat == "paragraph_title" and text.lower() in _DOCUMENT_TYPE_LABELS:
+        inner_p = _plain_p_text(part)
+        if expect_byline:
+            expect_byline = False
+            if inner_p is not None and _is_byline(inner_p):
+                byline_html = _byline_text(inner_p)
                 continue
-
-            if cat == "text" and title_norm:
-                text_norm = (
-                    _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", text)).lower().strip()
-                )
-                if text_norm == title_norm:
-                    continue
-
-            if cat == "figure_title":
-                if pending_fig_title is None:
-                    pending_fig_crop = _infer_figure_crop(r, regions, img)
-                    pending_fig_title = text
-                else:
-                    pending_fig_title = pending_fig_title + " " + text
+        if in_abstract:
+            if inner_p is not None and not _BOLD_LABEL_RE.match(inner_p):
+                abstract.append(part)
                 continue
+            in_abstract = False
+        if inner_p is not None and _SUP_MARKER_RE.match(inner_p):
+            footnotes.append(f'<p class="footnote">{inner_p}</p>')
+            continue
+        if inner_p is not None and _is_degenerate_repetition(inner_p):
+            continue
+        body.append(part)
 
-            if cat == "figure":
-                bbox = r.get("bbox")
-                if bbox:
-                    x0, y0, x1, y1 = (
-                        int(bbox[0]),
-                        int(bbox[1]),
-                        int(bbox[2]),
-                        int(bbox[3]),
-                    )
-                    body_parts.append(
-                        _figure_html(img.crop((x0, y0, x1, y1)), pending_fig_title)
-                    )
-                    pending_fig_title = None
-                    pending_fig_crop = None
-                else:
-                    _flush_fig_title()
-                continue
+    return _Meta(title_html, byline_html, abstract, body, footnotes)
 
-            html_chunk = _region_to_html(r)
 
-            if cat == "footnote":
-                # Footnotes don't break a pending figure_title → table pairing.
-                footnote_parts.append(html_chunk)
-                continue
+def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
+    start = _leading_pages_to_skip_md(pages_md)
+    pages_md = pages_md[start:]
+    images = images[start:]
 
-            if cat == "table" and pending_fig_title is not None:
-                html_chunk = _inject_caption(html_chunk, pending_fig_title)
-                pending_fig_title = None
-                pending_fig_crop = None
-            else:
-                _flush_fig_title()
+    parts: list[str] = []
+    for md, img in zip(pages_md, images, strict=True):
+        parts.extend(_page_to_html_parts(md, img))
 
-            body_parts.append(html_chunk)
+    meta = _classify_parts(parts)
 
-    _flush_fig_title()
-
-    raw_title = meta["title"]
-    title_safe = _html.escape(re.sub(r"\*+", "", raw_title))
-    title_display = _inline_md_to_html(raw_title)
-    byline_safe = _html.escape("; ".join(filter(None, [meta["authors"], meta["year"]])))
+    title_html = meta.title_html or "Untitled"
+    title_safe = _html.escape(_STRIP_TAGS_RE.sub("", title_html))
+    byline_safe = _html.escape(meta.byline_html)
 
     abstract_html = (
         "<section class='abstract'>\n"
-        + "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(abstract_parts)))
+        + "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(meta.abstract)))
         + "\n</section>"
-        if abstract_parts
+        if meta.abstract
         else ""
     )
-    processed_body = _merge_split_paragraphs(
-        _merge_split_paragraphs(_remove_repeated_short_paragraphs(body_parts))
+
+    body = _merge_split_paragraphs(
+        _merge_split_paragraphs(_strip_running_furniture(meta.body))
     )
-    if footnote_parts:
+    if meta.footnotes:
         ref_idx = next(
-            (i for i, p in enumerate(processed_body) if _REF_SECTION_RE.match(p)),
-            len(processed_body),
+            (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
         )
-        processed_body[ref_idx:ref_idx] = footnote_parts
-    body_html = "\n".join(processed_body)
+        body[ref_idx:ref_idx] = meta.footnotes
+    body_html = "\n".join(body)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1197,7 +759,7 @@ def falcon_pdf_to_html(
 </head>
 <body>
 <header>
-  <h1>{title_display}</h1>
+  <h1>{title_html}</h1>
   <p>{byline_safe}</p>
 </header>
 {abstract_html}
@@ -1206,3 +768,23 @@ def falcon_pdf_to_html(
 </div>
 </body>
 </html>"""
+
+
+def lightonocr_pdf_to_html(
+    pdf_path: Path | str,
+    *,
+    ocr: OcrModel | None = None,
+    device: str | None = None,
+) -> str:
+    """Convert a PDF to self-contained HTML with LightOnOCR-2-1B-bbox.
+
+    Args:
+        pdf_path: Path to the input PDF.
+        ocr: Pre-loaded model bundle.  ``None`` calls ``load_ocr_model()``.
+        device: Torch device string.  Only used when ``ocr`` is ``None``.
+    """
+    if ocr is None:
+        ocr = load_ocr_model(device)
+    images = _render_page_images(Path(pdf_path))
+    pages_md = [_ocr_page(img, ocr) for img in images]
+    return _assemble_html(pages_md, images)
