@@ -762,14 +762,32 @@ def _is_title_heading(inner: str) -> bool:
     return plain not in _DOCUMENT_TYPE_LABELS and not _ARTICLE_HEADING_RE.match(plain)
 
 
-def _is_byline(inner: str) -> bool:
-    plain = _STRIP_TAGS_RE.sub("", inner).strip()
-    return (
-        bool(plain)
-        and len(plain) < 400
-        and not _SENTENCE_END_RE.search(plain)
-        and not _BOLD_LABEL_RE.match(inner)
+# Affiliation / corresponding-author markers that accompany author names:
+# superscript digits (¹²³, ⁰⁴–⁹), a <sup>, or footnote symbols.
+_AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰-ⁿ*†‡§]")
+# A comma / "and" / ";"-separated author segment: a short, capitalized,
+# digit-free name.
+_NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")
+
+
+def _looks_like_name_list(plain: str) -> bool:
+    segments = [s.strip() for s in re.split(r",|\s+and\s+|;", plain) if s.strip()]
+    return len(segments) >= 2 and all(
+        _NAME_SEGMENT_RE.match(s) and len(s.split()) <= 5 for s in segments
     )
+
+
+def _is_byline(inner: str) -> bool:
+    """A block right after the title is the byline only when it positively looks
+    like authors — it carries an affiliation/footnote marker or is a list of
+    names.  Anything else (a date, DOI, journal line) falls through to the body
+    rather than being silently moved into the header."""
+    plain = _byline_text(inner)
+    if not plain or len(plain) >= 400 or _SENTENCE_END_RE.search(plain):
+        return False
+    if _BOLD_LABEL_RE.match(inner):
+        return False
+    return bool(_AUTHOR_MARKER_RE.search(inner)) or _looks_like_name_list(plain)
 
 
 def _byline_text(inner: str) -> str:

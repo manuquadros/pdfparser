@@ -110,6 +110,51 @@ class TestRunningFurniture:
         assert _strip_running_furniture(parts) == parts
 
 
+class TestByline:
+    """The block after the title becomes the header byline only when it
+    positively looks like authors; otherwise it stays in the body."""
+
+    def test_marker_line_is_byline(self) -> None:
+        from pdfparser.falcon import _is_byline
+
+        assert _is_byline("Nianyang Wu¹") is True
+        assert _is_byline("Daniel D. Clark <sup>*</sup>") is True
+
+    def test_name_list_is_byline(self) -> None:
+        from pdfparser.falcon import _is_byline
+
+        assert _is_byline("Jane Doe and John Smith") is True
+
+    def test_metadata_lines_are_not_byline(self) -> None:
+        from pdfparser.falcon import _is_byline
+
+        assert _is_byline("Received 26 March 2019") is False
+        assert _is_byline("DOI: 10.1002/bab.1760") is False
+        assert _is_byline("This is a complete sentence.") is False
+
+    def test_unmarked_single_name_is_not_byline(self) -> None:
+        # No marker and not a list → ambiguous → not promoted (stays in body).
+        from pdfparser.falcon import _is_byline
+
+        assert _is_byline("Jane Doe") is False
+
+    def test_metadata_after_title_stays_in_body(self) -> None:
+        # The failure scenario: a date line under the title must not be moved
+        # into the header (and lost from the body).
+        md = "# T\n\nReceived 26 March 2019\n\n## Abstract\n\nThe abstract."
+        html = _run_lighton([md])
+        header = html[html.find("<header>") : html.find("</header>")]
+        assert "Received 26 March 2019" in _body(html)
+        assert "Received 26 March 2019" not in header
+
+    def test_marked_authors_after_title_are_promoted(self) -> None:
+        md = "# T\n\nNianyang Wu¹, Xiaoqiang Liu¹*\n\n## Abstract\n\nA."
+        html = _run_lighton([md])
+        header = html[html.find("<header>") : html.find("</header>")]
+        assert "Nianyang Wu" in header
+        assert "Nianyang Wu" not in _body(html)
+
+
 class TestDegenerateRepetition:
     """A figure the model fails to box can be OCRed into a repeated-token wall;
     such a paragraph is dropped from the body, real prose is kept."""
@@ -147,7 +192,7 @@ class TestLightonAssembly:
         assert "Article" not in _header_h1(html)
 
     def test_byline_extracted_and_dropped_from_body(self) -> None:
-        md = "# A Study of Things\n\nJane Doe\n\n## Abstract\n\nThe abstract body."
+        md = "# A Study of Things\n\nJane Doe¹\n\n## Abstract\n\nThe abstract body."
         html = _run_lighton([md])
         header = html[html.find("<header>") : html.find("</header>")]
         assert "Jane Doe" in header
