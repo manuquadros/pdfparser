@@ -502,6 +502,143 @@ class TestCrossPageMerge:
         assert "This suggests that TRI and</p>" not in html
 
 
+class TestCaptionMergeBarrier:
+    """A figure/table caption is never absorbed as a paragraph continuation,
+    even across intervening floats and even when wrapped in <strong>."""
+
+    def test_table_caption_after_floats_not_glued_to_fragment(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        parts = [
+            "<p>PtTRII catalyzed the reduction of tropinone to form</p>",
+            "<figure><img src='a' alt=''></figure>",
+            "<figure><img src='b' alt=''></figure>",
+            "<p><strong>TABLE 1</strong> Enzyme kinetics of PtTRI and PtTRII</p>",
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        # Caption stays its own block, immediately before its table; the
+        # fragment and the floats keep their order.
+        assert out == parts
+        assert "to form <strong>TABLE 1</strong>" not in "".join(out)
+
+    def test_real_continuation_still_merges(self) -> None:
+        from pdfparser.falcon import _merge_split_paragraphs
+
+        parts = [
+            "<p>This suggests that TRI and</p>",
+            "<p>TRII compete for the substrate.</p>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        assert out == [
+            "<p>This suggests that TRI and TRII compete for the substrate.</p>"
+        ]
+
+
+class TestTableCaptionColocation:
+    """A free-standing "Table N …" caption is folded into its <table> as a
+    <caption> first child so it renders with the table, not adrift."""
+
+    def test_caption_before_table_folded(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        parts = [
+            "<p><strong>TABLE 1</strong> Enzyme kinetics of PtTRI and PtTRII</p>",
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+        ]
+        assert _colocate_table_captions(parts) == [
+            "<table><caption><strong>TABLE 1</strong> Enzyme kinetics of PtTRI "
+            "and PtTRII</caption><tbody><tr><td>1</td></tr></tbody></table>"
+        ]
+
+    def test_caption_after_table_folded(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        parts = [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+            "<p>Table 2. Results.</p>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == [
+            "<table><caption>Table 2. Results.</caption>"
+            "<tbody><tr><td>1</td></tr></tbody></table>"
+        ]
+
+    def test_caption_separated_by_figure_folded(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        # The reported bug: a figure floats between the caption and its table.
+        parts = [
+            "<p>Table 3 Kinetic constants</p>",
+            "<figure><img src='x' alt=''></figure>",
+            "<table><tr><td>a</td></tr></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == [
+            "<figure><img src='x' alt=''></figure>",
+            "<table><caption>Table 3 Kinetic constants</caption>"
+            "<tr><td>a</td></tr></table>",
+        ]
+
+    def test_caption_not_pulled_across_prose(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        # A real paragraph between caption and table breaks the association.
+        parts = [
+            "<p>Table 4 X</p>",
+            "<p>Unrelated body sentence.</p>",
+            "<table><tr><td>a</td></tr></table>",
+        ]
+        assert _colocate_table_captions(parts) == parts
+
+    def test_orphan_caption_left_intact(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        parts = ["<p>Table 9 with no table near it.</p>", "<p>Prose.</p>"]
+        assert _colocate_table_captions(parts) == parts
+
+    def test_two_tables_pair_with_own_captions(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        parts = [
+            "<p>Table 1 A</p>",
+            "<table><tr><td>1</td></tr></table>",
+            "<p>Table 2 B</p>",
+            "<table><tr><td>2</td></tr></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert "<caption>Table 1 A</caption>" in out[0]
+        assert "<caption>Table 2 B</caption>" in out[1]
+        assert len(out) == 2
+
+    def test_existing_caption_not_duplicated(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        parts = [
+            "<p>Table 5 dup</p>",
+            "<table><caption>existing</caption><tr><td>1</td></tr></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        # The table keeps its own caption; the stray block is left, not lost.
+        assert out == parts
+
+    def test_end_to_end_caption_heads_table(self) -> None:
+        # Full assembly: the fragment must not absorb the caption, and the
+        # caption must end up inside its table, not before the figures.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Results\n\n"
+            "PtTRII catalyzed the reduction of tropinone to form\n\n"
+            "![image](0,0,500,500)\n\n"
+            "**TABLE 1** Enzyme kinetics of PtTRI and PtTRII\n\n"
+            "<table><tbody><tr><td>Km</td></tr></tbody></table>"
+        )
+        body = _body(_run_lighton([md]))
+        assert "<caption><strong>TABLE 1</strong> Enzyme kinetics" in body
+        assert "to form <strong>TABLE 1</strong>" not in body
+        # The caption no longer appears as a stand-alone paragraph.
+        assert "<p><strong>TABLE 1</strong>" not in body
+
+
 class TestLatexToHtml:
     """Inline `$…$` math is converted to deterministic sub/superscript HTML
     before markdown parsing."""

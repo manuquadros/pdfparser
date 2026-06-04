@@ -355,6 +355,17 @@ def _plain_p_text(s: str) -> str | None:
     return None
 
 
+def _opens_with_caption_label(text: str) -> bool:
+    """True when text's visible content opens with a figure/table caption label,
+    even when wrapped in inline markup (``<strong>Table 1</strong> …``).
+
+    A caption is a merge barrier: gluing it onto an adjacent paragraph both
+    garbles the sentence and strands the caption away from its float, so the
+    label must be recognised through the ``<strong>`` the model often wraps it
+    in (which ``_looks_like_caption``, matching raw markdown, would miss)."""
+    return bool(_CAPTION_RE.match(_STRIP_TAGS_RE.sub("", text).lstrip()))
+
+
 def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     """Stitch paragraph fragments broken by two-column PDF layout.
 
@@ -363,8 +374,9 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     (up to ``_MAX_FLOATS_TO_SKIP``) are collected and re-emitted *after*
     the merged paragraph so the float stays near its reference text.
 
-    Headings, footnote paragraphs, and apparent enumeration items act as
-    merge barriers and are never absorbed into an adjacent paragraph.
+    Headings, footnote paragraphs, enumeration items, and figure/table
+    captions act as merge barriers and are never absorbed into an adjacent
+    paragraph.
     """
     out: list[str] = []
     i = 0
@@ -373,8 +385,10 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
         inner = _plain_p_text(part)
         if inner is not None:
             stripped = inner.rstrip()
-            if not _SENTENCE_END_RE.search(stripped) and not _BOLD_LABEL_RE.match(
-                inner
+            if (
+                not _SENTENCE_END_RE.search(stripped)
+                and not _BOLD_LABEL_RE.match(inner)
+                and not _opens_with_caption_label(inner)
             ):
                 j = i + 1
                 floats: list[str] = []
@@ -391,6 +405,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         cont is not None
                         and not _ENUM_RE.match(cont)
                         and not _BOLD_LABEL_RE.match(cont)
+                        and not _opens_with_caption_label(cont)
                         and not (
                             _FUNCTION_WORD_END_RE.search(stripped)
                             and cont[:1].isupper()
@@ -405,6 +420,79 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         continue
         out.append(part)
         i += 1
+    return out
+
+
+def _is_table_caption(part: str) -> bool:
+    """True when a block is a stand-alone ``<p>`` table caption ("Table 1 …")."""
+    inner = _plain_p_text(part)
+    return inner is not None and bool(
+        _TABLE_CAPTION_RE.match(_STRIP_TAGS_RE.sub("", inner).lstrip())
+    )
+
+
+def _inject_table_caption(table_html: str, caption_part: str) -> str:
+    """Insert the caption's inner HTML as a ``<caption>`` first child of the table.
+
+    A lambda replacement keeps any backslash in the caption text (e.g. a literal
+    ``\\frac``) from being read as a regex backreference."""
+    inner = _plain_p_text(caption_part)
+    if inner is None:
+        return table_html
+    return _TABLE_OPEN_RE.sub(
+        lambda m: f"{m.group(0)}<caption>{inner}</caption>", table_html, count=1
+    )
+
+
+def _colocate_table_captions(parts: list[str]) -> list[str]:
+    """Fold a free-standing "Table N …" caption into its ``<table>`` as a
+    ``<caption>`` first child so it renders with the table rather than drifting
+    in the block stream.
+
+    Each captionless table claims the nearest unused table caption — preferring
+    one just *before* it (the usual convention), else just *after* — skipping
+    only intervening figures and never reaching across prose or another table.
+    A caption with no table nearby is left untouched as its own block.
+    """
+    n = len(parts)
+    is_caption = [_is_table_caption(p) for p in parts]
+    is_figure = [bool(_FIGURE_OPEN_RE.match(p)) for p in parts]
+    needs_caption = [
+        bool(_TABLE_OPEN_RE.match(p)) and "<caption" not in p.lower() for p in parts
+    ]
+    used = [False] * n
+    attached: dict[int, int] = {}
+
+    def claim(table_idx: int, step: int) -> int | None:
+        k = table_idx + step
+        while 0 <= k < n:
+            if is_caption[k] and not used[k]:
+                return k
+            if is_figure[k]:
+                k += step
+                continue
+            return None
+        return None
+
+    for t in range(n):
+        if not needs_caption[t]:
+            continue
+        c = claim(t, -1)
+        if c is None:
+            c = claim(t, 1)
+        if c is not None:
+            used[c] = True
+            attached[t] = c
+
+    out: list[str] = []
+    for idx, part in enumerate(parts):
+        if used[idx]:
+            continue
+        out.append(
+            _inject_table_caption(part, parts[attached[idx]])
+            if idx in attached
+            else part
+        )
     return out
 
 
@@ -553,6 +641,17 @@ _OCR_MAX_LONG_SIDE = 1540  # model-card target; VRAM ≈ 2.7/6.1 GiB at this siz
 _CAPTION_RE = re.compile(
     r"^\*{0,2}(?:fig(?:ure|\.|\b)|table|scheme|supplement)", re.IGNORECASE
 )
+# A figure placeholder only ever owns a *figure* caption; a "Table …" block sat
+# beside it belongs to its table (see _colocate_table_captions), so the
+# figure-caption test deliberately excludes the table label.
+_FIGURE_CAPTION_RE = re.compile(r"^\*{0,2}(?:fig(?:ure|\.|\b)|scheme)", re.IGNORECASE)
+# A table caption ("Table 1 …", "Supplementary Table 2 …").  Matched against a
+# block's *visible* text so it's recognised through a <strong> wrapper.
+_TABLE_CAPTION_RE = re.compile(
+    r"^\*{0,2}(?:supp(?:l(?:ementary)?)?\.?\s+)?table\b", re.IGNORECASE
+)
+_TABLE_OPEN_RE = re.compile(r"^<table[\s>]", re.IGNORECASE)
+_FIGURE_OPEN_RE = re.compile(r"^<figure[\s>]", re.IGNORECASE)
 _HEADING_TAG_RE = re.compile(r"^<h([1-6])>(.*)</h\1>$", re.DOTALL)
 _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
 # Running header/footer: a short, terminal-punctuation-free line that recurs
@@ -588,6 +687,10 @@ def _render_page_images(pdf_path: Path) -> list[Image.Image]:
 
 def _looks_like_caption(block: str) -> bool:
     return bool(_CAPTION_RE.match(block.strip()))
+
+
+def _looks_like_figure_caption(block: str) -> bool:
+    return bool(_FIGURE_CAPTION_RE.match(block.strip()))
 
 
 def _denormalize_bbox(
@@ -719,7 +822,7 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
         if (
             caption is None
             and k + 1 < len(raw_blocks)
-            and _looks_like_caption(raw_blocks[k + 1])
+            and _looks_like_figure_caption(raw_blocks[k + 1])
         ):
             k += 1
             caption = raw_blocks[k].strip()
@@ -1037,6 +1140,7 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     parts: list[str] = []
     for md, img in zip(pages_md, images, strict=True):
         parts.extend(_page_to_html_parts(md, img))
+    parts = _colocate_table_captions(parts)
 
     meta = _classify_parts(parts)
 
