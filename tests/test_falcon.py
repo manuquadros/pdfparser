@@ -555,18 +555,56 @@ class TestLatexToHtml:
 
         assert _latex_to_html(r"$T_\alpha$") == "T<sub>α</sub>"
 
-    def test_command_prefix_does_not_eat_longer_command(self) -> None:
+    def test_command_matched_as_whole_token(self) -> None:
         from pdfparser.falcon import _latex_to_html
 
-        # "\to"/"\sim" are mapped but must not match inside the unmapped
-        # "\top"/"\simeq"; without a trailing boundary they yielded "→p"/"~eq".
-        assert _latex_to_html(r"$\top$") == r"\top"
-        assert _latex_to_html(r"$A \simeq B$") == r"A \simeq B"
+        # Commands are matched as maximal "\name" tokens and looked up whole, so
+        # a short command never eats the head of a longer one ("\to" vs "\top",
+        # "\sim" vs "\simeq") — each resolves to its own glyph.
+        assert _latex_to_html(r"$\to$") == "→"
+        assert _latex_to_html(r"$\top$") == "⊤"
+        assert _latex_to_html(r"$A \simeq B$") == "A ≃ B"
 
     def test_command_still_terminated_by_digit(self) -> None:
         from pdfparser.falcon import _latex_to_html
 
         assert _latex_to_html(r"$\alpha2$") == "α2"
+
+    def test_unknown_command_left_literal(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # pylatexenc returns "" for an unknown macro; we keep the literal rather
+        # than silently dropping it.
+        assert _latex_to_html(r"$x\notacommand y$") == r"x\notacommand y"
+
+    def test_extended_symbol_coverage(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # Coverage we get for free from pylatexenc that the old hand map lacked.
+        assert _latex_to_html(r"$T_\beta + \nabla$") == "T<sub>β</sub> + ∇"
+
+    def test_arg_macro_that_raises_does_not_crash(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # pylatexenc raises when fed a bare arg-taking macro like \sqrt; the
+        # exception must be swallowed and the span left intact, not propagated
+        # up to crash the whole page conversion.
+        assert _latex_to_html(r"$\sqrt{x}$") == r"\sqrtx"
+
+    def test_arg_macro_template_not_leaked(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # \frac's substitution template ("%s/%s") must not reach the output; the
+        # command stays literal so real math survives for a later MathJax pass.
+        assert "%s" not in _latex_to_html(r"$\frac{a}{b}$")
+        assert _latex_to_html(r"$\frac{a}{b}$") == r"\fracab"
+
+    def test_extended_symbol_coverage_via_command_helper(self) -> None:
+        from pdfparser.falcon import _latex_command_to_unicode
+
+        assert _latex_command_to_unicode(r"\sqrt") == r"\sqrt"
+        assert _latex_command_to_unicode(r"\frac") == r"\frac"
+        assert _latex_command_to_unicode(r"\alpha") == "α"
 
     def test_plain_text_untouched(self) -> None:
         from pdfparser.falcon import _latex_to_html

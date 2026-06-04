@@ -18,6 +18,7 @@ Typical use::
 from __future__ import annotations
 
 import base64
+import functools
 import html as _html
 import io
 import re
@@ -31,6 +32,7 @@ import pypdfium2 as pdfium
 import torch
 from markdown_it import MarkdownIt
 from PIL import Image
+from pylatexenc.latex2text import LatexNodes2Text  # type: ignore[import-untyped]
 
 # transformers' type stubs lag the LightOnOCR classes shipped at runtime (5.9+).
 from transformers import (  # type: ignore[attr-defined]
@@ -90,51 +92,39 @@ _SUPERSCRIPT_MAP = {
     "z": "ᶻ",
 }
 
-# LaTeX symbol commands that carry a Unicode equivalent.  Translated before
-# sub/superscript handling so a command used as a script ("$^\\circ$" → "°")
-# survives instead of being shredded into a lone backslash by the single-char
-# superscript rule.  ``°`` maps to itself so a degree sign already in script
-# position isn't wrapped again in <sup>.
-_LATEX_COMMAND_MAP = {
-    r"\circ": "°",
-    r"\degree": "°",
-    r"\pm": "±",
-    r"\mp": "∓",
-    r"\times": "×",
-    r"\cdot": "·",
-    r"\div": "÷",
-    r"\leq": "≤",
-    r"\geq": "≥",
-    r"\neq": "≠",
-    r"\approx": "≈",
-    r"\sim": "~",
-    r"\to": "→",
-    r"\rightarrow": "→",
-    r"\alpha": "α",
-    r"\beta": "β",
-    r"\gamma": "γ",
-    r"\delta": "δ",
-    r"\epsilon": "ε",
-    r"\kappa": "κ",
-    r"\lambda": "λ",
-    r"\mu": "µ",
-    r"\nu": "ν",
-    r"\pi": "π",
-    r"\rho": "ρ",
-    r"\sigma": "σ",
-    r"\tau": "τ",
-    r"\phi": "φ",
-    r"\chi": "χ",
-    r"\omega": "ω",
-    r"\Delta": "Δ",
-    r"\Sigma": "Σ",
-    r"\Omega": "Ω",
-}
-# The trailing boundary stops a mapped command from eating the head of a longer
-# unmapped one ("\to" must not match inside "\top", "\sim" inside "\simeq").
-_LATEX_COMMAND_RE = re.compile(
-    "(?:" + "|".join(re.escape(cmd) for cmd in _LATEX_COMMAND_MAP) + r")(?![a-zA-Z])"
-)
+# Symbol-command translation is delegated to pylatexenc's maintained macro
+# table rather than a hand-curated map.  A command is matched as a maximal
+# ``\name`` token and looked up whole, so a command can never eat the head of a
+# longer one ("\to" vs "\top", "\sim" vs "\simeq").
+_LATEX_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
+_L2T = LatexNodes2Text()
+
+# The degree idiom is the one place we override pylatexenc: "^\circ" means
+# *degrees* ("°"), but \circ on its own is the ring operator ("∘"), which is
+# what pylatexenc (correctly, for general LaTeX) returns.  \degree is unknown to
+# pylatexenc, so it is handled here too.  This runs before script handling so the
+# ``^`` is consumed and the result isn't wrapped in <sup>.
+_LATEX_DEGREE_RE = re.compile(r"\^\s*\{?\s*\\circ\s*\}?|\\degree(?![a-zA-Z])")
+
+
+@functools.cache
+def _latex_command_to_unicode(command: str) -> str:
+    """Translate a single no-arg ``\\name`` symbol command to its Unicode glyph.
+
+    Only symbol macros are in scope.  Each command is matched and looked up in
+    isolation, but pylatexenc parses full LaTeX *with* arguments — fed a bare
+    arg-taking macro it either raises (``\\sqrt`` → KeyError) or returns its
+    substitution template (``\\frac`` → ``"%s/%s"``).  Treat any such case, and
+    an unknown macro (empty result), as untranslatable and keep the command
+    literal so real math survives intact for a later MathJax pass rather than
+    crashing the page or leaking ``%s`` garbage."""
+    try:
+        text = str(_L2T.latex_to_text(command)).strip()
+    except Exception:
+        return command
+    if not text or "%" in text:
+        return command
+    return text
 
 
 _WRAPPER_CSS = """
@@ -443,8 +433,9 @@ _LATEX_SPAN_RE = re.compile(r"(?<!\\)\$([^\n$]+)(?<!\\)\$")
 # untouched rather than stripped.
 _LATEX_MATH_RE = re.compile(r"[_^\\]")
 # Sub/superscript inside a math span: ^{multi} / ^cmd / ^x and the _ forms.
-# A bare script target may be a backslash-command (``^\circ``); capture the
-# whole command, not just the leading backslash, so it isn't split mid-token.
+# A bare script target may be a command pylatexenc left literal (``^\dagger``);
+# capture the whole command, not just the leading backslash, so a stray "\<"
+# can't reach markdown and get mangled into a broken tag.
 _LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}|\^(\\[a-zA-Z]+|\S)")
 _LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}|_(\\[a-zA-Z]+|\S)")
 # Font/style wrappers (\text{…}, \mathrm{…}) carry no semantics here — unwrap to
@@ -458,7 +449,10 @@ def _latex_span_to_html(content: str) -> str:
     """Convert the inside of a ``$…$`` span: sub/superscripts to HTML, then drop
     residual TeX syntax.  Full math is out of scope (a later MathJax option)."""
     content = _LATEX_WRAP_RE.sub(r"\1", content)
-    content = _LATEX_COMMAND_RE.sub(lambda m: _LATEX_COMMAND_MAP[m.group(0)], content)
+    content = _LATEX_DEGREE_RE.sub("°", content)
+    content = _LATEX_COMMAND_RE.sub(
+        lambda m: _latex_command_to_unicode(m.group(0)), content
+    )
     content = _LATEX_SUP_RE.sub(
         lambda m: _to_superscript(m.group(1) if m.group(1) is not None else m.group(2)),
         content,
