@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pypdfium2 as pdfium
 import torch
 from markdown_it import MarkdownIt
@@ -168,7 +169,12 @@ def _ocr_page(
         for k, v in inputs.items()
     }
     with torch.inference_mode():
-        output_ids = ocr.model.generate(**inputs, max_new_tokens=max_new_tokens)
+        # Greedy decoding: OCR wants the most-likely transcription, and a
+        # deterministic decode avoids run-to-run drift (e.g. a figure box
+        # occasionally over-segmenting into two stacked crops).
+        output_ids = ocr.model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False
+        )
     generated = output_ids[0, inputs["input_ids"].shape[1] :]
     text: str = ocr.processor.decode(generated, skip_special_tokens=True)
     del inputs, output_ids, generated
@@ -354,8 +360,13 @@ def _inline_md_to_html(text: str) -> str:
 # the structure; LaTeX sub/superscripts are converted to HTML beforehand.
 _MD = MarkdownIt("commonmark", {"html": True}).enable("table")
 
-# An inline math span: $…$ not preceded by a backslash, shortest match.
-_LATEX_SPAN_RE = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$", re.DOTALL)
+# An inline math span: $…$ not preceded by a backslash, shortest match, on a
+# single line (no DOTALL — a stray '$' must not swallow across paragraphs).
+_LATEX_SPAN_RE = re.compile(r"(?<!\\)\$([^\n$]+)(?<!\\)\$")
+# Only spans that actually contain TeX (a sub/superscript or a command) are
+# converted; a paired '$' around plain text (e.g. currency "$5 … $10") is left
+# untouched rather than stripped.
+_LATEX_MATH_RE = re.compile(r"[_^\\]")
 # Sub/superscript inside a math span: ^{multi} / ^x and _{multi} / _x.
 _LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}|\^(\S)")
 _LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}|_(\S)")
@@ -382,12 +393,20 @@ def _latex_span_to_html(content: str) -> str:
 
 
 def _latex_to_html(text: str) -> str:
-    """Replace every inline ``$…$`` math span with deterministic HTML.
+    """Replace each inline ``$…$`` *math* span with deterministic HTML.
 
     Runs on the markdown *before* parsing so the emitted ``<sub>``/``<sup>`` pass
     through as raw HTML and the ``_`` inside ``V_{max}`` isn't read as emphasis.
+    Spans without any TeX markup are left verbatim.
     """
-    return _LATEX_SPAN_RE.sub(lambda m: _latex_span_to_html(m.group(1)), text)
+
+    def replace(m: re.Match[str]) -> str:
+        content = m.group(1)
+        if not _LATEX_MATH_RE.search(content):
+            return m.group(0)
+        return _latex_span_to_html(content)
+
+    return _LATEX_SPAN_RE.sub(replace, text)
 
 
 def _md_to_html_blocks(md_text: str) -> list[str]:
@@ -422,6 +441,18 @@ def _md_to_html_blocks(md_text: str) -> list[str]:
 
 
 _MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
+# The model's box often clips the bottom of a figure.  Rather than pad blindly
+# (which grabs the caption when the box was already correct), grow the bottom
+# edge over figure content and stop at the whitespace gap before the caption.
+# A row is *blank* when fewer than this fraction of its pixels are ink — kept
+# low (≈empty) so a sparse figure row (a thin axis, or content narrower than the
+# box) still counts as content rather than ending growth early.  A vertical run
+# of blank rows this tall is the gap that ends growth; growth is capped at this
+# fraction of the page.
+_FIGURE_BLANK_ROW_FRAC = 0.005
+_FIGURE_INK_LEVEL = 250  # pixel value below which a grayscale pixel is "ink"
+_FIGURE_GAP_FRAC = 0.012
+_FIGURE_MAX_GROW_FRAC = 0.10
 
 
 def _figure_html(crop: Image.Image, caption_text: str | None) -> str:
@@ -500,11 +531,42 @@ def _denormalize_bbox(
     )
 
 
+def _extend_bottom_to_content(image: Image.Image, x0: int, x1: int, y1: int) -> int:
+    """Grow ``y1`` downward to recover a figure bottom the box clipped.
+
+    Only grows when the ink below ``y1`` ends in a clear whitespace gap (the
+    space before the caption): then ``y1`` moves to that figure bottom.  If the
+    ink runs to the search cap with no gap — ambiguous, and usually caption/body
+    text below a correct box — the box is left unchanged so no text is pulled in.
+    """
+    h = image.size[1]
+    limit = min(h, y1 + round(_FIGURE_MAX_GROW_FRAC * h))
+    if y1 >= limit:
+        return y1
+    # Convert only the strip below the box (not the whole page) to grayscale.
+    strip = np.asarray(image.crop((x0, y1, x1, limit)).convert("L"))
+    ink_per_row = (strip < _FIGURE_INK_LEVEL).mean(axis=1)
+    gap = max(1, round(_FIGURE_GAP_FRAC * h))
+    last_ink = 0  # rows past y1, exclusive
+    blank_run = 0
+    found_gap = False
+    for offset, fraction in enumerate(ink_per_row, start=1):
+        if fraction < _FIGURE_BLANK_ROW_FRAC:
+            blank_run += 1
+            if blank_run >= gap:
+                found_gap = True
+                break
+        else:
+            blank_run = 0
+            last_ink = offset
+    return y1 + last_ink if found_gap else y1
+
+
 def _safe_crop(
     image: Image.Image, bbox: tuple[int, int, int, int]
 ) -> Image.Image | None:
-    """Crop a pixel-space ``bbox`` from ``image``, clamped to bounds; ``None`` if
-    degenerate."""
+    """Crop a pixel-space ``bbox`` from ``image``, clamped to bounds and grown
+    down to the figure's true bottom edge; ``None`` if degenerate."""
     w, h = image.size
     x0 = max(0, min(bbox[0], w))
     y0 = max(0, min(bbox[1], h))
@@ -512,32 +574,74 @@ def _safe_crop(
     y1 = max(0, min(bbox[3], h))
     if x1 - x0 < _MIN_FIGURE_HEIGHT or y1 - y0 < _MIN_FIGURE_HEIGHT:
         return None
+    y1 = _extend_bottom_to_content(image, x0, x1, y1)
     return image.crop((x0, y0, x1, y1))
+
+
+# The model sometimes over-segments one figure into stacked boxes (a tall figure
+# split into a main box + a thin strip).  Two boxes are the same figure when they
+# share a column (substantial horizontal overlap) and are vertically adjacent.
+_FIGURE_MERGE_GAP_FRAC = 0.03  # of page height
+
+
+def _union_box(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def _figures_same(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int], gap: float
+) -> bool:
+    x_overlap = min(a[2], b[2]) - max(a[0], b[0])
+    if x_overlap < 0.5 * min(a[2] - a[0], b[2] - b[0]):
+        return False
+    y_gap = max(a[1], b[1]) - min(a[3], b[3])  # ≤ 0 when the boxes overlap
+    return y_gap <= gap
+
+
+def _cluster_figure_boxes(
+    boxes: list[tuple[int, int, int, int]], gap: float
+) -> list[list[int]]:
+    """Group indices of boxes that belong to the same figure (transitive)."""
+    parent = list(range(len(boxes)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if _figures_same(boxes[i], boxes[j], gap):
+                parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(boxes)):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
 
 
 def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
     """Convert one page's markdown to block HTML, replacing each ``![image]``
     placeholder with a cropped <figure> (caption from the placeholder's own
-    trailing text, else the following caption-like block)."""
-    parts: list[str] = []
-    pending: list[str] = []
-
-    def flush() -> None:
-        if pending:
-            parts.extend(_md_to_html_blocks("\n\n".join(pending)))
-            pending.clear()
-
-    raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
+    trailing text, else the following caption-like block).  Figure boxes the
+    model split across stacked crops are unioned into a single figure."""
+    # Parse into ordered items: ("md", text) or ("fig", box_px | None, caption).
+    items: list[tuple[Any, ...]] = []
     k = 0
+    raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
     while k < len(raw_blocks):
         block = raw_blocks[k].strip()
         lines = block.splitlines()
         fig = _parse_figure_placeholder(lines[0]) if lines else None
         if fig is None:
-            pending.append(block)
+            items.append(("md", block))
             k += 1
             continue
-        flush()
         rest = "\n".join(lines[1:]).strip()
         caption: str | None = rest or None
         if (
@@ -547,12 +651,47 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
         ):
             k += 1
             caption = raw_blocks[k].strip()
-        caption_html = _latex_to_html(caption) if caption else None
-        crop = (
-            _safe_crop(image, _denormalize_bbox(fig, image))
-            if isinstance(fig, tuple)
-            else None
+        box = _denormalize_bbox(fig, image) if isinstance(fig, tuple) else None
+        items.append(("fig", box, caption))
+        k += 1
+
+    # Cluster the page's figure boxes; emit each cluster once, at its earliest
+    # member, with the first caption found among the cluster's members.
+    positions = [
+        i for i, it in enumerate(items) if it[0] == "fig" and it[1] is not None
+    ]
+    boxes = [items[i][1] for i in positions]
+    gap = _FIGURE_MERGE_GAP_FRAC * image.size[1]
+    union_at: dict[int, tuple[int, int, int, int]] = {}
+    caption_at: dict[int, str | None] = {}
+    drop: set[int] = set()
+    for group in _cluster_figure_boxes(boxes, gap):
+        members = sorted(positions[g] for g in group)
+        union_at[members[0]] = _union_box([boxes[g] for g in group])
+        caption_at[members[0]] = next(
+            (items[m][2] for m in members if items[m][2]), None
         )
+        drop.update(members[1:])
+
+    parts: list[str] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            parts.extend(_md_to_html_blocks("\n\n".join(pending)))
+            pending.clear()
+
+    for i, it in enumerate(items):
+        if it[0] == "md":
+            pending.append(it[1])
+            continue
+        flush()
+        if i in drop:
+            continue
+        box = union_at.get(i, it[1])
+        caption = caption_at.get(i, it[2])
+        caption_html = _latex_to_html(caption) if caption else None
+        crop = _safe_crop(image, box) if box is not None else None
         if crop is not None:
             parts.append(_figure_html(crop, caption_html))
         elif caption_html is not None:
@@ -560,7 +699,6 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
                 f"<figure><figcaption>{_inline_md_to_html(caption_html)}"
                 "</figcaption></figure>"
             )
-        k += 1
     flush()
     return parts
 

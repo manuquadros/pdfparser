@@ -219,6 +219,119 @@ class TestDenormalizeBbox:
             1000,
         )
 
+
+class TestFigureBoxMerge:
+    """A figure the model over-segments into stacked boxes is unioned into one
+    crop; genuinely separate figures stay separate."""
+
+    def test_same_column_adjacent_boxes_merge(self) -> None:
+        from pdfparser.falcon import _figures_same
+
+        assert _figures_same((100, 100, 900, 500), (110, 500, 890, 560), 50.0) is True
+
+    def test_vertically_separated_boxes_do_not_merge(self) -> None:
+        from pdfparser.falcon import _figures_same
+
+        assert _figures_same((100, 100, 900, 300), (100, 800, 900, 950), 50.0) is False
+
+    def test_side_by_side_boxes_do_not_merge(self) -> None:
+        from pdfparser.falcon import _figures_same
+
+        assert _figures_same((0, 0, 100, 500), (200, 0, 300, 500), 50.0) is False
+
+    def test_union_box(self) -> None:
+        from pdfparser.falcon import _union_box
+
+        assert _union_box([(100, 100, 900, 500), (120, 480, 880, 560)]) == (
+            100,
+            100,
+            900,
+            560,
+        )
+
+    def test_split_figure_emits_single_crop(self) -> None:
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](a.png)100,100,900,500\n\n"
+            "![image](b.png)100,500,900,560\n\n"
+            "FIG. 1 One caption."
+        )
+        sizes = _figure_sizes(_run_lighton([md], image=img))
+        assert len(sizes) == 1
+        # The union spans both boxes (down to y≈862 px), not just the first.
+        assert sizes[0][1] > 700
+
+    def test_two_separated_figures_stay_separate(self) -> None:
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](a.png)100,100,900,300\n\n"
+            "Some intervening prose between the two figures.\n\n"
+            "![image](b.png)100,800,900,950"
+        )
+        assert len(_figure_sizes(_run_lighton([md], image=img))) == 2
+
+
+class TestFigureBottomGrowth:
+    """The crop grows down over contiguous ink to the figure's true bottom and
+    stops at the whitespace before the caption; a box already ending in
+    whitespace grows nothing, so caption text is never pulled in."""
+
+    @staticmethod
+    def _image() -> Image.Image:
+        # White page: figure block y[100,300), caption block y[360,380),
+        # separated by a 60 px whitespace gap.
+        img = Image.new("RGB", (400, 800), "white")
+        img.paste(Image.new("RGB", (300, 200), "black"), (50, 100))
+        img.paste(Image.new("RGB", (300, 20), "black"), (50, 360))
+        return img
+
+    def test_tight_box_grows_to_figure_bottom(self) -> None:
+        from pdfparser.falcon import _extend_bottom_to_content
+
+        assert _extend_bottom_to_content(self._image(), 50, 350, 250) == 300
+
+    def test_box_at_bottom_does_not_grow(self) -> None:
+        from pdfparser.falcon import _extend_bottom_to_content
+
+        assert _extend_bottom_to_content(self._image(), 50, 350, 300) == 300
+
+    def test_no_growth_when_ink_runs_without_gap(self) -> None:
+        # Ink continues past the search window with no whitespace gap (caption /
+        # body text below a correct box) → ambiguous → leave the box unchanged.
+        from pdfparser.falcon import _extend_bottom_to_content
+
+        img = Image.new("RGB", (400, 800), "white")
+        img.paste(Image.new("RGB", (300, 300), "black"), (50, 100))
+        assert _extend_bottom_to_content(img, 50, 350, 250) == 250
+
+    def test_narrow_content_below_box_is_not_read_as_gap(self) -> None:
+        # A figure tail narrower than the box (here 3 px of a 300 px-wide box,
+        # ~1% ink) must count as content, not be mistaken for the whitespace gap
+        # — otherwise the clipped bottom is dropped.
+        from pdfparser.falcon import _extend_bottom_to_content
+
+        img = Image.new("RGB", (400, 800), "white")
+        img.paste(Image.new("RGB", (300, 150), "black"), (50, 100))  # y[100,250)
+        img.paste(Image.new("RGB", (3, 40), "black"), (198, 250))  # narrow tail
+        assert _extend_bottom_to_content(img, 50, 350, 270) == 290
+
+    def test_growth_stops_before_caption(self) -> None:
+        from pdfparser.falcon import _extend_bottom_to_content
+
+        assert _extend_bottom_to_content(self._image(), 50, 350, 250) < 360
+
+    def test_safe_crop_excludes_caption(self) -> None:
+        from pdfparser.falcon import _safe_crop
+
+        crop = _safe_crop(self._image(), (50, 100, 350, 250))
+        assert crop is not None and crop.size == (300, 200)
+
+
+class TestCrossPageMerge:
+    """A paragraph split across a page break is rejoined."""
+
     def test_cross_page_paragraph_merge(self) -> None:
         page1 = "# T\n\n## Abstract\n\nA.\n\n## Body\n\nThis suggests that TRI and"
         page2 = "TRII compete for the same substrate tropinone."
@@ -261,6 +374,12 @@ class TestLatexToHtml:
         from pdfparser.falcon import _latex_to_html
 
         assert _latex_to_html("no math here") == "no math here"
+
+    def test_currency_dollars_left_alone(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # No TeX markup between the '$' → not math; must not be stripped/merged.
+        assert _latex_to_html("costs $5 and $10 total") == "costs $5 and $10 total"
 
 
 class TestMdToHtmlBlocks:
