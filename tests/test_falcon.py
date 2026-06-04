@@ -51,6 +51,13 @@ def _body(html: str) -> str:
     raise AssertionError("unclosed body div")
 
 
+def _metadata(html: str) -> str:
+    """Content of the collapsible <details class='metadata'> panel."""
+    start = html.find("<details class='metadata'>")
+    assert start >= 0, "metadata panel not found"
+    return html[start : html.find("</details>", start)]
+
+
 class TestArticlePageDetection:
     """Cover ads / mastheads carry no Abstract or Introduction heading, so the
     article start is the first page that does."""
@@ -138,14 +145,18 @@ class TestByline:
 
         assert _is_byline("Jane Doe") is False
 
-    def test_metadata_after_title_stays_in_body(self) -> None:
-        # The failure scenario: a date line under the title must not be moved
-        # into the header (and lost from the body).
-        md = "# T\n\nReceived 26 March 2019\n\n## Abstract\n\nThe abstract."
+    def test_metadata_after_title_goes_to_metadata_panel(self) -> None:
+        # A date line under the title is metadata: it must not be promoted into
+        # the header (and must not be lost) — it belongs in the Metadata panel.
+        md = (
+            "# T\n\nReceived 26 March 2019\n\n## Abstract\n\nThe abstract.\n\n"
+            "## Methods\n\nMethod text."
+        )
         html = _run_lighton([md])
         header = html[html.find("<header>") : html.find("</header>")]
-        assert "Received 26 March 2019" in _body(html)
+        assert "Received 26 March 2019" in _metadata(html)
         assert "Received 26 March 2019" not in header
+        assert "Received 26 March 2019" not in _body(html)
 
     def test_marked_authors_after_title_are_promoted(self) -> None:
         md = "# T\n\nNianyang Wu¹, Xiaoqiang Liu¹*\n\n## Abstract\n\nA."
@@ -220,6 +231,112 @@ class TestLightonAssembly:
         ref = html.find("[1] A reference")
         assert 0 < fn < ref
         assert 'class="footnote"' in html
+
+    def test_frontmatter_moved_to_metadata_panel_after_abstract(self) -> None:
+        # Affiliations, keywords and abbreviations are OCR'd between the abstract
+        # and the body's first section; they are pulled into the collapsible
+        # Metadata panel (after the abstract) so the body opens with prose.
+        md = (
+            "# A Study\n\nJane Doe¹\n\n"
+            "¹Department of Examples, Example University\n\n"
+            "## Abstract\n\nThe abstract.\n\n"
+            "**Keywords:** alpha, beta, gamma\n\n"
+            "## Abbreviations\n\nTRI, tropine reductase.\n\n"
+            "## 1. Introduction\n\nThe study begins here.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        # The front matter is in the Metadata panel, not the body.
+        assert "<summary>Metadata</summary>" in meta
+        for fragment in (
+            "Department of Examples",
+            "Keywords:",
+            "TRI, tropine reductase.",
+        ):
+            assert fragment in meta
+            assert fragment not in body
+        # The panel sits after the abstract and before the body.
+        assert (
+            html.find("</section>")
+            < html.find("<details class='metadata'>")
+            < html.find('<div class="body">')
+        )
+        # The body opens with prose (the Introduction), not metadata.
+        assert "<h2>1. Introduction</h2>" in body
+
+    def test_frontmatter_boundary_is_name_agnostic(self) -> None:
+        # The boundary is the first non-metadata heading, not a literal
+        # "Introduction" — a body opening with "Background" works the same.
+        md = (
+            "# A Study\n\n"
+            "**Keywords:** alpha, beta\n\n"
+            "## Background\n\nThe study begins here.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        assert "Keywords:" in _metadata(html)
+        assert "Keywords:" not in _body(html)
+        assert "<h2>Background</h2>" in _body(html)
+
+    def test_frontmatter_unchanged_when_body_opens_with_section(self) -> None:
+        # First block is already a body section heading → nothing precedes it →
+        # order left intact.
+        md = "# T\n\n## Abstract\n\nA.\n\n## Methods\n\nFirst.\n\nSecond."
+        body = _body(_run_lighton([md]))
+        assert body.find("First.") < body.find("Second.")
+
+    def test_unlabeled_body_prose_not_relocated(self) -> None:
+        # An article whose body opens with unlabelled prose (no "Introduction"
+        # heading, first heading is "Methods") must not have that prose moved to
+        # the end: only positively-recognised metadata is relocated.
+        md = (
+            "# T\n\nUnlabeled opening prose paragraph here.\n\n"
+            "More opening prose follows.\n\n"
+            "## Methods\n\nMethod text.\n\n## References\n\n[1] A reference."
+        )
+        body = _body(_run_lighton([md]))
+        assert body.find("Unlabeled opening prose paragraph here.") < body.find(
+            "<h2>Methods</h2>"
+        )
+
+    def test_prose_starting_with_metadata_keyword_not_hidden(self) -> None:
+        # A leading body paragraph that merely begins with a metadata keyword
+        # ("Published…") is a sentence, not a front-matter label — it must stay
+        # visible in the body, not be hidden in the Metadata panel.  (A keywords
+        # label closes the abstract so the prose is the next, leading body block.)
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract.\n\n**Keywords:** alpha, beta\n\n"
+            "Published studies have shown that the enzyme is active.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        html = _run_lighton([md])
+        assert "Published studies have shown" in _body(html)
+        assert "Published studies have shown" not in _metadata(html)
+
+    def test_unheaded_prose_after_metadata_heading_not_hidden(self) -> None:
+        # Sticky metadata-section capture must stop at a real prose paragraph, so
+        # an unheaded opening section after "## Keywords" is not swallowed.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Keywords\n\nalpha, beta, gamma.\n\n"
+            "The introduction begins here without its own heading and reads as"
+            " ordinary prose.\n\n## Methods\n\nMethod text."
+        )
+        html = _run_lighton([md])
+        assert "The introduction begins here" in _body(html)
+        assert "The introduction begins here" not in _metadata(html)
+        assert "alpha, beta, gamma." in _metadata(html)  # short keywords stay metadata
+
+    def test_all_frontmatter_body_kept_visible(self) -> None:
+        # If every body block looks like front matter, that signals misdetection,
+        # not a metadata-only doc: keep it visible rather than emptying the body.
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract.\n\n**Keywords:** alpha, beta\n\n"
+            "¹Affiliation One, City\n\nReceived 26 March 2019"
+        )
+        html = _run_lighton([md])
+        assert "Affiliation One" in _body(html)
+        assert "<details class='metadata'>" not in html
 
     def test_figure_placeholder_becomes_cropped_figure(self) -> None:
         md = (

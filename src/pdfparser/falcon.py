@@ -109,6 +109,12 @@ h3 { font-size: 1rem; margin: 1.2em 0 .3em; }
 p  { margin: .6em 0; }
 section.abstract { background: #f7f7f7; padding: 1em 1.2em; border-radius: 4px;
     margin: 1.5em 0; }
+details.metadata { margin: 1.5em 0; border: 1px solid #e0e0e0; border-radius: 4px;
+    padding: .3em 1em; background: #fafafa; font-size: .9rem; color: #555; }
+details.metadata > summary { cursor: pointer; font-weight: bold; color: #333;
+    list-style: disclosure-closed; }
+details.metadata[open] > summary { list-style: disclosure-open;
+    margin-bottom: .4em; }
 figure { margin: 1.5em 0; }
 figcaption { font-size: .875em; color: #555; }
 p.footnote { font-size: .8rem; color: #666; border-top: 1px solid #eee;
@@ -277,6 +283,28 @@ _REF_SECTION_RE = re.compile(
 _ARTICLE_HEADING_RE = re.compile(
     r"^\s*(?:\d+[.)]?\s+)?(?:abstract|introduction)\b", re.IGNORECASE
 )
+# Headings that may legitimately sit *inside* the front matter (between the
+# abstract and the article body).  Everything up to the first heading that is
+# neither one of these nor a document-type label is treated as front matter,
+# so the boundary doesn't depend on the body's opening section being literally
+# named "Introduction" (it may be "Background", numbered, non-English, etc.).
+_FRONTMATTER_HEADING_LABELS = frozenset(
+    {"abbreviations", "keywords", "key words", "nomenclature"}
+)
+_SECTION_NUMBER_RE = re.compile(r"^\d+(?:[.)]\d*)*[.)]?\s+")
+# A plain <p> is positively front matter when it carries a metadata label
+# ("Keywords:", reuses _BOLD_LABEL_RE), opens with an affiliation/footnote
+# superscript marker, or is a submission/correspondence/copyright line.
+_LEADING_SUP_RE = re.compile(r"^[¹²³⁰-ⁿ*†‡§]")
+_FRONTMATTER_TEXT_RE = re.compile(
+    r"^(?:received|accepted|published|revised|doi|https?://|©|copyright|e-?mail|"
+    r"(?:address\s+for\s+)?correspond(?:ence|ing\s+author))\b",
+    re.IGNORECASE,
+)
+# Front matter is hidden in a collapsed panel, so misclassifying body prose as
+# front matter makes it invisible.  A real prose paragraph under a metadata
+# section is recognised by length + a sentence ending, and breaks the run.
+_METADATA_PROSE_MIN_LEN = 80
 
 
 def _plain_p_text(s: str) -> str | None:
@@ -873,6 +901,90 @@ def _classify_parts(parts: list[str]) -> _Meta:
     return _Meta(title_html, byline_html, abstract, body, footnotes)
 
 
+def _is_metadata_heading(part: str) -> bool:
+    """A heading that is itself front matter ("Abbreviations", "Keywords") or a
+    document-type label, as opposed to the heading that opens the body proper."""
+    heading = _heading_inner(part)
+    if heading is None:
+        return False
+    title = _SECTION_NUMBER_RE.sub(
+        "", _STRIP_TAGS_RE.sub("", heading[1]).strip().lower()
+    )
+    return title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
+
+
+def _is_frontmatter_text(part: str) -> bool:
+    inner = _plain_p_text(part)
+    if inner is None:
+        return False
+    if _BOLD_LABEL_RE.match(inner):
+        return True
+    plain = _STRIP_TAGS_RE.sub("", inner).lstrip()
+    if _LEADING_SUP_RE.match(plain):
+        return True
+    # Keyword-led lines (Received / DOI / Correspondence …) are front matter
+    # only as short label lines — not a prose sentence that merely opens with one
+    # of those words ("Published studies have shown …"), which ends like a
+    # sentence.  Metadata lines (dates, DOIs, addresses) do not.
+    return bool(_FRONTMATTER_TEXT_RE.match(plain)) and not _SENTENCE_END_RE.search(
+        plain
+    )
+
+
+def _looks_like_body_prose(part: str) -> bool:
+    """A substantial plain-paragraph sentence — used to end a metadata section's
+    sticky run so unheaded body prose isn't swallowed into the hidden panel."""
+    inner = _plain_p_text(part)
+    if inner is None or _is_frontmatter_text(part):
+        return False
+    text = _STRIP_TAGS_RE.sub("", inner)
+    return len(text) > _METADATA_PROSE_MIN_LEN and bool(_SENTENCE_END_RE.search(text))
+
+
+def _front_matter_len(body: list[str]) -> int:
+    """Length of the leading run of recognised front-matter blocks.
+
+    Only positively-identified metadata is counted — affiliation/superscript
+    paragraphs, labelled lines (keywords, correspondence, dates) and metadata
+    headings with the content they introduce.  The run stops at the first block
+    that is none of these, so a body opening with unlabelled prose (or one whose
+    first section heading lacks a name we recognise) is never mistaken for front
+    matter and relocated."""
+    n = 0
+    in_metadata_section = False
+    for i, part in enumerate(body):
+        if _heading_inner(part) is not None:
+            if not _is_metadata_heading(part):
+                break
+            in_metadata_section = True
+        elif in_metadata_section:
+            # Sticky over a metadata section's own short content, but a real
+            # prose paragraph (e.g. an unheaded opening section) ends the run.
+            if _looks_like_body_prose(part):
+                break
+        elif not _is_frontmatter_text(part):
+            break
+        n = i + 1
+    return n
+
+
+def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
+    """Split the leading run of front-matter blocks off the body.
+
+    Affiliations, keywords, abbreviations, the corresponding-author block and
+    submission dates are OCR'd between the abstract and the body's first section,
+    so the body opens with metadata rather than prose.  The leading run of
+    recognised front-matter blocks is pulled out (the caller surfaces it in a
+    collapsible "Metadata" panel after the abstract) so the body opens with
+    prose.  Returns ``(front_matter, rest)``."""
+    n = _front_matter_len(body)
+    # Never hide the entire body: an all-front-matter classification signals a
+    # detection failure, not a metadata-only document.
+    if n >= len(body):
+        return [], body
+    return body[:n], body[n:]
+
+
 def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     start = _leading_pages_to_skip_md(pages_md)
     pages_md = pages_md[start:]
@@ -904,6 +1016,16 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
             (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
         )
         body[ref_idx:ref_idx] = meta.footnotes
+    metadata, body = _extract_front_matter(body)
+    # Front matter is kept right after the abstract, collapsed by default in a
+    # toggleable <details> panel, so the body opens with prose.
+    metadata_html = (
+        "<details class='metadata'>\n<summary>Metadata</summary>\n"
+        + "\n".join(metadata)
+        + "\n</details>"
+        if metadata
+        else ""
+    )
     body_html = "\n".join(body)
 
     return f"""<!DOCTYPE html>
@@ -919,6 +1041,7 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
   <p>{byline_safe}</p>
 </header>
 {abstract_html}
+{metadata_html}
 <div class="body">
 {body_html}
 </div>
