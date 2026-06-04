@@ -62,6 +62,7 @@ _SUPERSCRIPT_MAP = {
     "=": "⁼",
     "(": "⁽",
     ")": "⁾",
+    "°": "°",
     "a": "ᵃ",
     "b": "ᵇ",
     "c": "ᶜ",
@@ -88,6 +89,52 @@ _SUPERSCRIPT_MAP = {
     "y": "ʸ",
     "z": "ᶻ",
 }
+
+# LaTeX symbol commands that carry a Unicode equivalent.  Translated before
+# sub/superscript handling so a command used as a script ("$^\\circ$" → "°")
+# survives instead of being shredded into a lone backslash by the single-char
+# superscript rule.  ``°`` maps to itself so a degree sign already in script
+# position isn't wrapped again in <sup>.
+_LATEX_COMMAND_MAP = {
+    r"\circ": "°",
+    r"\degree": "°",
+    r"\pm": "±",
+    r"\mp": "∓",
+    r"\times": "×",
+    r"\cdot": "·",
+    r"\div": "÷",
+    r"\leq": "≤",
+    r"\geq": "≥",
+    r"\neq": "≠",
+    r"\approx": "≈",
+    r"\sim": "~",
+    r"\to": "→",
+    r"\rightarrow": "→",
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\epsilon": "ε",
+    r"\kappa": "κ",
+    r"\lambda": "λ",
+    r"\mu": "µ",
+    r"\nu": "ν",
+    r"\pi": "π",
+    r"\rho": "ρ",
+    r"\sigma": "σ",
+    r"\tau": "τ",
+    r"\phi": "φ",
+    r"\chi": "χ",
+    r"\omega": "ω",
+    r"\Delta": "Δ",
+    r"\Sigma": "Σ",
+    r"\Omega": "Ω",
+}
+# The trailing boundary stops a mapped command from eating the head of a longer
+# unmapped one ("\to" must not match inside "\top", "\sim" inside "\simeq").
+_LATEX_COMMAND_RE = re.compile(
+    "(?:" + "|".join(re.escape(cmd) for cmd in _LATEX_COMMAND_MAP) + r")(?![a-zA-Z])"
+)
 
 
 _WRAPPER_CSS = """
@@ -395,9 +442,11 @@ _LATEX_SPAN_RE = re.compile(r"(?<!\\)\$([^\n$]+)(?<!\\)\$")
 # converted; a paired '$' around plain text (e.g. currency "$5 … $10") is left
 # untouched rather than stripped.
 _LATEX_MATH_RE = re.compile(r"[_^\\]")
-# Sub/superscript inside a math span: ^{multi} / ^x and _{multi} / _x.
-_LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}|\^(\S)")
-_LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}|_(\S)")
+# Sub/superscript inside a math span: ^{multi} / ^cmd / ^x and the _ forms.
+# A bare script target may be a backslash-command (``^\circ``); capture the
+# whole command, not just the leading backslash, so it isn't split mid-token.
+_LATEX_SUP_RE = re.compile(r"\^\{([^{}]*)\}|\^(\\[a-zA-Z]+|\S)")
+_LATEX_SUB_RE = re.compile(r"_\{([^{}]*)\}|_(\\[a-zA-Z]+|\S)")
 # Font/style wrappers (\text{…}, \mathrm{…}) carry no semantics here — unwrap to
 # their content so the inner sub/superscript handling sees plain text.
 _LATEX_WRAP_RE = re.compile(
@@ -409,6 +458,7 @@ def _latex_span_to_html(content: str) -> str:
     """Convert the inside of a ``$…$`` span: sub/superscripts to HTML, then drop
     residual TeX syntax.  Full math is out of scope (a later MathJax option)."""
     content = _LATEX_WRAP_RE.sub(r"\1", content)
+    content = _LATEX_COMMAND_RE.sub(lambda m: _LATEX_COMMAND_MAP[m.group(0)], content)
     content = _LATEX_SUP_RE.sub(
         lambda m: _to_superscript(m.group(1) if m.group(1) is not None else m.group(2)),
         content,

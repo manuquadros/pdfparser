@@ -532,6 +532,42 @@ class TestLatexToHtml:
 
         assert _latex_to_html("$k_{cat}/K_m$") == "k<sub>cat</sub>/K<sub>m</sub>"
 
+    def test_degree_command_superscript(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # ``$^\circ$`` is the LaTeX degree idiom; the single-char superscript
+        # rule used to capture only the backslash, leaving a lone ``\`` inside
+        # <sup> that markdown then mangled into "<sup></sup>circ".
+        assert _latex_to_html(r"grown at 25 $\pm$ 1$^\circ$C") == "grown at 25 ± 1°C"
+
+    def test_braced_degree_command(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        assert _latex_to_html(r"$^{\circ}$C") == "°C"
+
+    def test_symbol_command_translated(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        assert _latex_to_html(r"$5 \times 10^{3}$ cells") == "5 × 10³ cells"
+
+    def test_greek_command_as_subscript(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        assert _latex_to_html(r"$T_\alpha$") == "T<sub>α</sub>"
+
+    def test_command_prefix_does_not_eat_longer_command(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        # "\to"/"\sim" are mapped but must not match inside the unmapped
+        # "\top"/"\simeq"; without a trailing boundary they yielded "→p"/"~eq".
+        assert _latex_to_html(r"$\top$") == r"\top"
+        assert _latex_to_html(r"$A \simeq B$") == r"A \simeq B"
+
+    def test_command_still_terminated_by_digit(self) -> None:
+        from pdfparser.falcon import _latex_to_html
+
+        assert _latex_to_html(r"$\alpha2$") == "α2"
+
     def test_plain_text_untouched(self) -> None:
         from pdfparser.falcon import _latex_to_html
 
@@ -573,6 +609,17 @@ class TestMdToHtmlBlocks:
 
         (block,) = _md_to_html_blocks("NAD<sup>+</sup> dependent.")
         assert block == "<p>NAD<sup>+</sup> dependent.</p>"
+
+    def test_degree_does_not_bleed_into_superscript(self) -> None:
+        from pdfparser.falcon import _md_to_html_blocks
+
+        # Regression: "$^\circ$" once produced "<sup>\</sup>", whose lone "\<"
+        # markdown escaped into "&lt;/sup&gt;", swallowing the rest of the
+        # sentence into a superscript.  No <sup> must survive here.
+        (block,) = _md_to_html_blocks(
+            r"grown at 25 $\pm$ 1$^\circ$C under 16 H of light."
+        )
+        assert block == "<p>grown at 25 ± 1°C under 16 H of light.</p>"
 
     def test_thematic_break_dropped(self) -> None:
         from pdfparser.falcon import _md_to_html_blocks
