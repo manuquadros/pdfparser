@@ -327,6 +327,76 @@ class TestLightonAssembly:
         assert "The introduction begins here" not in _metadata(html)
         assert "alpha, beta, gamma." in _metadata(html)  # short keywords stay metadata
 
+    def test_long_abbreviation_list_stays_in_panel(self) -> None:
+        # A semicolon-separated abbreviation list ending in a period reads like a
+        # sentence, but as the block directly under "## Abbreviations" it is the
+        # heading's own content and belongs in the panel, not the body.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Abbreviations\n\n"
+            "TAs, tropane alkaloids; TRI, tropine-forming reductase; "
+            "GC-MS, gas chromatography-mass spectrometer.\n\n"
+            "## 1. Introduction\n\nThe study begins here without abbreviation.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        assert "TAs, tropane alkaloids" in _metadata(html)
+        assert "TAs, tropane alkaloids" not in _body(html)
+        assert "<h2>1. Introduction</h2>" in _body(html)
+
+    def test_multi_block_abbreviation_list_fully_in_panel(self) -> None:
+        # A long abbreviation list OCR-split across two paragraphs: both halves
+        # are ";"-separated lists, so the heading owns the whole run and neither
+        # half leaks into the body (the second block is not heading-adjacent).
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Abbreviations\n\n"
+            "TAs, tropane alkaloids; TRI, tropine-forming reductase; "
+            "TRII, pseudotropine-forming reductase; qPCR, quantitative PCR.\n\n"
+            "PGK, protein kinase; SDRs, short-chain dehydrogenases; "
+            "GC-MS, gas chromatography-mass spectrometer; HPLC, chromatography.\n\n"
+            "## 1. Introduction\n\nThe study begins here without abbreviation."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in ("TAs, tropane alkaloids", "PGK, protein kinase"):
+            assert fragment in meta
+            assert fragment not in body
+        assert "<h2>1. Introduction</h2>" in body
+
+    def test_keyword_led_metadata_after_section_pulled_into_panel(self) -> None:
+        # Correspondence / received / DOI lines OCR'd after the abbreviation list
+        # are keyword-led metadata; inside the headed front-matter region they are
+        # pulled into the panel even though each ends like a sentence.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Abbreviations\n\n"
+            "TAs, tropane alkaloids; GC-MS, gas chromatography-mass spectrometer.\n\n"
+            "Address for correspondence: Jane Doe, Example University, City. "
+            "Tel. 123; e-mail: jane@example.edu.\n\n"
+            "Received 26 March 2019; accepted 29 April 2019 DOI: 10.1002/bab.1760.\n\n"
+            "## 1. Introduction\n\nThe study begins here without abbreviation."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in ("Address for correspondence", "Received 26 March 2019"):
+            assert fragment in meta
+            assert fragment not in body
+        assert "<h2>1. Introduction</h2>" in body
+
+    def test_keyword_led_body_prose_in_section_not_hidden(self) -> None:
+        # A body paragraph that merely opens with a front-matter keyword
+        # ("Published …"), appearing inside a headed metadata section, must stay
+        # in the body — it carries no metadata token (e-mail/DOI/date), unlike a
+        # genuine "Received … DOI: …" line, so it is not hidden in the panel.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Abbreviations\n\n"
+            "TAs, tropane alkaloids; GC-MS, gas chromatography-mass spectrometer.\n\n"
+            "Published reports indicate that the enzyme is active across many "
+            "plant species and remains the focus of ongoing research.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        html = _run_lighton([md])
+        assert "Published reports indicate" in _body(html)
+        assert "Published reports indicate" not in _metadata(html)
+
     def test_all_frontmatter_body_kept_visible(self) -> None:
         # If every body block looks like front matter, that signals misdetection,
         # not a metadata-only doc: keep it visible rather than emptying the body.

@@ -338,10 +338,32 @@ _FRONTMATTER_TEXT_RE = re.compile(
     r"(?:address\s+for\s+)?correspond(?:ence|ing\s+author))\b",
     re.IGNORECASE,
 )
+# A token only metadata carries: an e-mail, a DOI/URL, a submission date, or a
+# phone/fax label.  Its presence separates a genuine multi-clause metadata line
+# ("Received … DOI: …", "Address for correspondence: … e-mail: …") from a body
+# sentence that merely opens with a front-matter keyword ("Published reports
+# indicate …"), which has none of these.
+_METADATA_TOKEN_RE = re.compile(
+    r"""
+      \S+@\S+\.\S                                # e-mail address
+    | doi:\s*10\.\d{4,}                          # DOI
+    | https?://                                  # URL
+    | \b\d{1,2}\s+
+      (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+
+      \d{4}\b                                    # a "26 March 2019" date
+    | \b(?:tel|fax|phone)\b                      # phone / fax label
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
 # section is recognised by length + a sentence ending, and breaks the run.
 _METADATA_PROSE_MIN_LEN = 80
+# A metadata list (abbreviations, multi-affiliation / correspondence lines) packs
+# several ";"-separated entries; body prose rarely uses more than one semicolon.
+# This keeps such a list owned by its heading even when it is long enough to read
+# like a sentence, and even when OCR splits the list across paragraphs.
+_LIST_LIKE_MIN_SEMICOLONS = 2
 
 
 def _plain_p_text(s: str) -> str | None:
@@ -1072,7 +1094,7 @@ def _is_metadata_heading(part: str) -> bool:
     return title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
 
 
-def _is_frontmatter_text(part: str) -> bool:
+def _is_frontmatter_text(part: str, *, strict: bool = True) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
         return False
@@ -1081,23 +1103,40 @@ def _is_frontmatter_text(part: str) -> bool:
     plain = _STRIP_TAGS_RE.sub("", inner).lstrip()
     if _LEADING_SUP_RE.match(plain):
         return True
-    # Keyword-led lines (Received / DOI / Correspondence …) are front matter
-    # only as short label lines — not a prose sentence that merely opens with one
-    # of those words ("Published studies have shown …"), which ends like a
-    # sentence.  Metadata lines (dates, DOIs, addresses) do not.
-    return bool(_FRONTMATTER_TEXT_RE.match(plain)) and not _SENTENCE_END_RE.search(
-        plain
-    )
+    if not _FRONTMATTER_TEXT_RE.match(plain):
+        return False
+    if not _SENTENCE_END_RE.search(plain):
+        return True
+    # The line runs on like a sentence: either a body paragraph that merely opens
+    # with the keyword ("Published reports indicate ….") or a genuine multi-clause
+    # metadata line ("Received … DOI: …", "Address for correspondence: … e-mail:
+    # …").  At the top level (strict) refuse it; inside an explicitly-headed
+    # metadata section (strict=False) trust it only when it carries a metadata
+    # token, which a body sentence does not.
+    return not strict and bool(_METADATA_TOKEN_RE.search(plain))
 
 
 def _looks_like_body_prose(part: str) -> bool:
     """A substantial plain-paragraph sentence — used to end a metadata section's
-    sticky run so unheaded body prose isn't swallowed into the hidden panel."""
+    sticky run so unheaded body prose isn't swallowed into the hidden panel.
+
+    Front-matter exclusion is the caller's job: the one call site already gates
+    this on ``not _is_frontmatter_text(part, strict=False)``, so re-testing it
+    here would just strip tags and re-run the regexes a second time."""
     inner = _plain_p_text(part)
-    if inner is None or _is_frontmatter_text(part):
+    if inner is None:
         return False
     text = _STRIP_TAGS_RE.sub("", inner)
     return len(text) > _METADATA_PROSE_MIN_LEN and bool(_SENTENCE_END_RE.search(text))
+
+
+def _is_list_like(part: str) -> bool:
+    """A plain ``<p>`` of several ``;``-separated entries — an abbreviation list
+    or a multi-affiliation line — as opposed to a body sentence."""
+    inner = _plain_p_text(part)
+    if inner is None:
+        return False
+    return _STRIP_TAGS_RE.sub("", inner).count(";") >= _LIST_LIKE_MIN_SEMICOLONS
 
 
 def _front_matter_len(body: list[str]) -> int:
@@ -1117,9 +1156,16 @@ def _front_matter_len(body: list[str]) -> int:
                 break
             in_metadata_section = True
         elif in_metadata_section:
-            # Sticky over a metadata section's own short content, but a real
-            # prose paragraph (e.g. an unheaded opening section) ends the run.
-            if _looks_like_body_prose(part):
+            # A metadata heading owns its content up to the next heading: a
+            # keyword-led metadata line (correspondence, dates) or a ";"-separated
+            # list (an abbreviation list, even one long enough to read like a
+            # sentence or split across paragraphs).  Only a genuine unheaded body
+            # paragraph — which is neither — ends the run.
+            if (
+                _looks_like_body_prose(part)
+                and not _is_frontmatter_text(part, strict=False)
+                and not _is_list_like(part)
+            ):
                 break
         elif not _is_frontmatter_text(part):
             break
