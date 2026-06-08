@@ -439,7 +439,9 @@ def _inject_table_caption(table_html: str, caption_part: str) -> str:
     inner = _plain_p_text(caption_part)
     if inner is None:
         return table_html
-    return _TABLE_OPEN_RE.sub(
+    # Insert after the *whole* opening tag so attributes ("<table class=…>")
+    # aren't split, which would orphan them and break the table.
+    return _TABLE_OPEN_TAG_RE.sub(
         lambda m: f"{m.group(0)}<caption>{inner}</caption>", table_html, count=1
     )
 
@@ -474,13 +476,17 @@ def _colocate_table_captions(parts: list[str]) -> list[str]:
             return None
         return None
 
-    for t in range(n):
-        if not needs_caption[t]:
-            continue
+    tables = [t for t in range(n) if needs_caption[t]]
+    # Backward first for every table, so each secures its own leading caption
+    # before a neighbouring table can forward-grab it: a caption between two
+    # tables belongs to the one it precedes, not the one it follows.
+    for t in tables:
         c = claim(t, -1)
-        if c is None:
-            c = claim(t, 1)
         if c is not None:
+            used[c] = True
+            attached[t] = c
+    for t in tables:
+        if t not in attached and (c := claim(t, 1)) is not None:
             used[c] = True
             attached[t] = c
 
@@ -646,11 +652,21 @@ _CAPTION_RE = re.compile(
 # figure-caption test deliberately excludes the table label.
 _FIGURE_CAPTION_RE = re.compile(r"^\*{0,2}(?:fig(?:ure|\.|\b)|scheme)", re.IGNORECASE)
 # A table caption ("Table 1 …", "Supplementary Table 2 …").  Matched against a
-# block's *visible* text so it's recognised through a <strong> wrapper.
+# block's *visible* text so it's recognised through a <strong> wrapper.  After
+# the "Table <id>" label a true caption is followed by punctuation, a
+# capitalised title word, or nothing — *not* a lowercase word, which marks a
+# running reference sentence ("Table 1 summarizes …") that must stay in the body.
+# Only "table"/"supplementary" are case-folded (OCR casing is unreliable); the
+# capitalised-title test stays case-sensitive, as that is the whole signal.
 _TABLE_CAPTION_RE = re.compile(
-    r"^\*{0,2}(?:supp(?:l(?:ementary)?)?\.?\s+)?table\b", re.IGNORECASE
+    r"^\*{0,2}\s*"
+    r"(?i:supp(?:l(?:ementary)?)?\.?\s+)?"
+    r"(?i:table)\b\s*"
+    r"\w+"
+    r"(?:\s*[.:)–—-]|\s+[A-Z(]|\s*\*{0,2}\s*$)"
 )
 _TABLE_OPEN_RE = re.compile(r"^<table[\s>]", re.IGNORECASE)
+_TABLE_OPEN_TAG_RE = re.compile(r"^<table\b[^>]*>", re.IGNORECASE)
 _FIGURE_OPEN_RE = re.compile(r"^<figure[\s>]", re.IGNORECASE)
 _HEADING_TAG_RE = re.compile(r"^<h([1-6])>(.*)</h\1>$", re.DOTALL)
 _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
@@ -718,7 +734,6 @@ def _extend_bottom_to_content(image: Image.Image, x0: int, x1: int, y1: int) -> 
     limit = min(h, y1 + round(_FIGURE_MAX_GROW_FRAC * h))
     if y1 >= limit:
         return y1
-    # Convert only the strip below the box (not the whole page) to grayscale.
     strip = np.asarray(image.crop((x0, y1, x1, limit)).convert("L"))
     ink_per_row = (strip < _FIGURE_INK_LEVEL).mean(axis=1)
     gap = max(1, round(_FIGURE_GAP_FRAC * h))
@@ -830,8 +845,6 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
         items.append(("fig", box, caption))
         k += 1
 
-    # Cluster the page's figure boxes; emit each cluster once, at its earliest
-    # member, with the first caption found among the cluster's members.
     positions = [
         i for i, it in enumerate(items) if it[0] == "fig" and it[1] is not None
     ]
@@ -1020,7 +1033,6 @@ def _classify_parts(parts: list[str]) -> _Meta:
             if _ABSTRACT_HEADING_RE.match(_STRIP_TAGS_RE.sub("", inner)):
                 in_abstract = True
                 continue
-            # A document-type label heading ("Article") is dropped entirely.
             if _STRIP_TAGS_RE.sub("", inner).strip().lower() in _DOCUMENT_TYPE_LABELS:
                 continue
             in_abstract = False

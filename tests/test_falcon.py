@@ -594,7 +594,10 @@ class TestTableCaptionColocation:
     def test_orphan_caption_left_intact(self) -> None:
         from pdfparser.falcon import _colocate_table_captions
 
-        parts = ["<p>Table 9 with no table near it.</p>", "<p>Prose.</p>"]
+        parts = [
+            "<p>Table 9 Orphan caption with no table near it.</p>",
+            "<p>Prose.</p>",
+        ]
         assert _colocate_table_captions(parts) == parts
 
     def test_two_tables_pair_with_own_captions(self) -> None:
@@ -615,12 +618,53 @@ class TestTableCaptionColocation:
         from pdfparser.falcon import _colocate_table_captions
 
         parts = [
-            "<p>Table 5 dup</p>",
+            "<p>Table 5 Duplicate guard</p>",
             "<table><caption>existing</caption><tr><td>1</td></tr></table>",
         ]
         out = _colocate_table_captions(parts)
         # The table keeps its own caption; the stray block is left, not lost.
         assert out == parts
+
+    def test_table_attributes_preserved(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        # The caption goes after the *whole* opening tag, not inside it.
+        parts = [
+            "<p>Table 1 Kinetics</p>",
+            '<table class="data"><tbody><tr><td>1</td></tr></tbody></table>',
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == [
+            '<table class="data"><caption>Table 1 Kinetics</caption>'
+            "<tbody><tr><td>1</td></tr></tbody></table>"
+        ]
+
+    def test_caption_between_tables_pairs_with_following(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        # A caption sat between two tables precedes the second, so it belongs to
+        # it — the first (captionless) table must not forward-steal it.
+        parts = [
+            "<table><tr><td>1</td></tr></table>",
+            "<p>Table 2 Results</p>",
+            "<table><tr><td>2</td></tr></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == [
+            "<table><tr><td>1</td></tr></table>",
+            "<table><caption>Table 2 Results</caption><tr><td>2</td></tr></table>",
+        ]
+
+    def test_reference_sentence_not_folded(self) -> None:
+        from pdfparser.falcon import _colocate_table_captions
+
+        # "Table N <lowercase verb> …" is a running reference, not a caption; it
+        # must stay in the body, not be absorbed into the table.
+        parts = [
+            "<p>Table 1 summarizes the kinetic parameters of both enzymes.</p>",
+            "<table><tr><td>1</td></tr></table>",
+        ]
+        assert _colocate_table_captions(parts) == parts
 
     def test_end_to_end_caption_heads_table(self) -> None:
         # Full assembly: the fragment must not absorb the caption, and the
