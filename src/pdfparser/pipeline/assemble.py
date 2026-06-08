@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import html as _html
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
@@ -35,10 +35,13 @@ from pdfparser.pipeline.figures import (
 )
 from pdfparser.pipeline.latex import _inline_md_to_html, _latex_to_html
 from pdfparser.pipeline.markdown import _md_to_html_blocks
-from pdfparser.pipeline.merge import _colocate_table_captions, _merge_split_paragraphs
+from pdfparser.pipeline.merge import (
+    _colocate_table_captions,
+    _merge_split_paragraphs_stable,
+)
 from pdfparser.pipeline.model import OcrModel, _ocr_page, load_ocr_model
 from pdfparser.pipeline.render import _render_page_images
-from pdfparser.pipeline.text import _STRIP_TAGS_RE, _looks_like_figure_caption
+from pdfparser.pipeline.text import _looks_like_figure_caption, _visible_text
 
 _WRAPPER_CSS = """
 body {
@@ -78,21 +81,40 @@ hr { border: none; border-top: 1px solid #ddd; margin: 2rem 0; }
 """
 
 
-def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
-    """Convert one page's markdown to block HTML, replacing each ``![image]``
-    placeholder with a cropped <figure> (caption from the placeholder's own
-    trailing text, else the following caption-like block).  Figure boxes the
-    model split across stacked crops are unioned into a single figure."""
-    # Parse into ordered items: ("md", text) or ("fig", box_px | None, caption).
-    items: list[tuple[Any, ...]] = []
-    k = 0
+@dataclass
+class _MdBlock:
+    """A run of page markdown destined for ``_md_to_html_blocks``."""
+
+    text: str
+
+
+@dataclass
+class _FigBlock:
+    """A figure placeholder: its ``[0, 1000]``-normalized box (``None`` for the
+    bbox-less base-variant placeholder) and the caption markdown, if any."""
+
+    bbox_norm: tuple[int, int, int, int] | None
+    caption: str | None
+
+
+_Block = _MdBlock | _FigBlock
+
+
+def _parse_page_blocks(md: str) -> list[_Block]:
+    """Split a page's markdown into an ordered stream of prose and figure blocks.
+
+    Pure: no image needed.  A figure's caption is taken from the placeholder's
+    own trailing text, else the following caption-like block (which is then
+    consumed)."""
+    blocks: list[_Block] = []
     raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
+    k = 0
     while k < len(raw_blocks):
         block = raw_blocks[k].strip()
         lines = block.splitlines()
         fig = _parse_figure_placeholder(lines[0]) if lines else None
         if fig is None:
-            items.append(("md", block))
+            blocks.append(_MdBlock(block))
             k += 1
             continue
         rest = "\n".join(lines[1:]).strip()
@@ -104,25 +126,56 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
         ):
             k += 1
             caption = raw_blocks[k].strip()
-        box = _denormalize_bbox(fig, image) if isinstance(fig, tuple) else None
-        items.append(("fig", box, caption))
+        blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
         k += 1
+    return blocks
 
-    positions = [
-        i for i, it in enumerate(items) if it[0] == "fig" and it[1] is not None
+
+def _resolve_figure_clusters(
+    blocks: list[_Block], image: Image.Image
+) -> tuple[dict[int, tuple[int, int, int, int]], dict[int, str | None], set[int]]:
+    """Resolve figure boxes the model over-segmented into stacked crops.
+
+    Pure (reads only ``image.size``, never crops).  Returns, keyed by figure
+    block index: ``box_at`` the pixel crop box (the union for a merged cluster),
+    ``caption_at`` the cluster's caption (its first non-empty member's), both
+    held on the surviving lowest index, and ``drop`` the merged-away members.
+    Figure blocks without a bbox are absent from all three, so the caller leaves
+    them be."""
+    figures = [
+        (i, b.caption, _denormalize_bbox(b.bbox_norm, image))
+        for i, b in enumerate(blocks)
+        if isinstance(b, _FigBlock) and b.bbox_norm is not None
     ]
-    boxes = [items[i][1] for i in positions]
+    boxes = [box for _, _, box in figures]
     gap = _FIGURE_MERGE_GAP_FRAC * image.size[1]
-    union_at: dict[int, tuple[int, int, int, int]] = {}
+
+    box_at: dict[int, tuple[int, int, int, int]] = {}
     caption_at: dict[int, str | None] = {}
     drop: set[int] = set()
     for group in _cluster_figure_boxes(boxes, gap):
-        members = sorted(positions[g] for g in group)
-        union_at[members[0]] = _union_box([boxes[g] for g in group])
-        caption_at[members[0]] = next(
-            (items[m][2] for m in members if items[m][2]), None
+        members = sorted(group, key=lambda g: figures[g][0])
+        survivor = figures[members[0]][0]
+        box_at[survivor] = _union_box([boxes[g] for g in members])
+        caption_at[survivor] = next(
+            (figures[g][1] for g in members if figures[g][1]), None
         )
-        drop.update(members[1:])
+        drop.update(figures[g][0] for g in members[1:])
+    return box_at, caption_at, drop
+
+
+def _figcaption_only(caption_html: str) -> str:
+    return (
+        f"<figure><figcaption>{_inline_md_to_html(caption_html)}</figcaption></figure>"
+    )
+
+
+def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
+    """Convert one page's markdown to block HTML, replacing each ``![image]``
+    placeholder with a cropped ``<figure>`` and stitching consecutive prose into
+    a single markdown render."""
+    blocks = _parse_page_blocks(md)
+    box_at, caption_at, drop = _resolve_figure_clusters(blocks, image)
 
     parts: list[str] = []
     pending: list[str] = []
@@ -132,26 +185,78 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
             parts.extend(_md_to_html_blocks("\n\n".join(pending)))
             pending.clear()
 
-    for i, it in enumerate(items):
-        if it[0] == "md":
-            pending.append(it[1])
+    for i, block in enumerate(blocks):
+        if isinstance(block, _MdBlock):
+            pending.append(block.text)
             continue
         flush()
         if i in drop:
             continue
-        box = union_at.get(i, it[1])
-        caption = caption_at.get(i, it[2])
+        box = box_at.get(i)
+        caption = caption_at.get(i, block.caption)
         caption_html = _latex_to_html(caption) if caption else None
         crop = _safe_crop(image, box) if box is not None else None
         if crop is not None:
             parts.append(_figure_html(crop, caption_html))
         elif caption_html is not None:
-            parts.append(
-                f"<figure><figcaption>{_inline_md_to_html(caption_html)}"
-                "</figcaption></figure>"
-            )
+            parts.append(_figcaption_only(caption_html))
     flush()
     return parts
+
+
+def _abstract_section(abstract: list[str]) -> str:
+    if not abstract:
+        return ""
+    return "<section class='abstract'>\n" + "\n".join(abstract) + "\n</section>"
+
+
+def _metadata_panel(metadata: list[str]) -> str:
+    # Front matter is kept right after the abstract, collapsed by default in a
+    # toggleable <details> panel, so the body opens with prose.
+    if not metadata:
+        return ""
+    return (
+        "<details class='metadata'>\n<summary>Metadata</summary>\n"
+        + "\n".join(metadata)
+        + "\n</details>"
+    )
+
+
+def _insert_footnotes_before_refs(body: list[str], footnotes: list[str]) -> list[str]:
+    """Splice footnote paragraphs in just before the references section (or at the
+    end, if there is none) so they read after the prose but before the bibliography."""
+    if not footnotes:
+        return body
+    ref_idx = next(
+        (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
+    )
+    return body[:ref_idx] + footnotes + body[ref_idx:]
+
+
+def _document_shell(
+    *, title_html: str, byline_html: str, abstract: str, metadata: str, body: str
+) -> str:
+    title_safe = _html.escape(_visible_text(title_html))
+    byline_safe = _html.escape(byline_html)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title_safe}</title>
+<style>{_WRAPPER_CSS}</style>
+</head>
+<body>
+<header>
+  <h1>{title_html}</h1>
+  <p>{byline_safe}</p>
+</header>
+{abstract}
+{metadata}
+<div class="body">
+{body}
+</div>
+</body>
+</html>"""
 
 
 def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
@@ -166,57 +271,18 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
 
     meta = _classify_parts(parts)
 
-    title_html = meta.title_html or "Untitled"
-    title_safe = _html.escape(_STRIP_TAGS_RE.sub("", title_html))
-    byline_safe = _html.escape(meta.byline_html)
-
-    abstract_html = (
-        "<section class='abstract'>\n"
-        + "\n".join(_merge_split_paragraphs(_merge_split_paragraphs(meta.abstract)))
-        + "\n</section>"
-        if meta.abstract
-        else ""
-    )
-
-    body = _merge_split_paragraphs(
-        _merge_split_paragraphs(_strip_running_furniture(meta.body))
-    )
-    if meta.footnotes:
-        ref_idx = next(
-            (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
-        )
-        body[ref_idx:ref_idx] = meta.footnotes
+    abstract = _merge_split_paragraphs_stable(meta.abstract)
+    body = _merge_split_paragraphs_stable(_strip_running_furniture(meta.body))
+    body = _insert_footnotes_before_refs(body, meta.footnotes)
     metadata, body = _extract_front_matter(body)
-    # Front matter is kept right after the abstract, collapsed by default in a
-    # toggleable <details> panel, so the body opens with prose.
-    metadata_html = (
-        "<details class='metadata'>\n<summary>Metadata</summary>\n"
-        + "\n".join(metadata)
-        + "\n</details>"
-        if metadata
-        else ""
-    )
-    body_html = "\n".join(body)
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{title_safe}</title>
-<style>{_WRAPPER_CSS}</style>
-</head>
-<body>
-<header>
-  <h1>{title_html}</h1>
-  <p>{byline_safe}</p>
-</header>
-{abstract_html}
-{metadata_html}
-<div class="body">
-{body_html}
-</div>
-</body>
-</html>"""
+    return _document_shell(
+        title_html=meta.title_html or "Untitled",
+        byline_html=meta.byline_html,
+        abstract=_abstract_section(abstract),
+        metadata=_metadata_panel(metadata),
+        body="\n".join(body),
+    )
 
 
 def lightonocr_pdf_to_html(

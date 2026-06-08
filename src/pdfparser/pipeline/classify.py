@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
-    _STRIP_TAGS_RE,
     _heading_inner,
     _plain_p_text,
+    _visible_text,
+    _visible_text_folded,
 )
 
 # A leading footnote marker is a SHORT superscript ("<sup>a</sup>", "<sup>1</sup>").
@@ -129,7 +130,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _furniture_key(inner: str) -> str:
-    text = _DIGITS_RE.sub("", _STRIP_TAGS_RE.sub("", inner))
+    text = _DIGITS_RE.sub("", _visible_text(inner))
     return _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", text)).strip().lower()
 
 
@@ -137,7 +138,7 @@ def _is_furniture_candidate(part: str) -> str | None:
     inner = _plain_p_text(part)
     if inner is None:
         return None
-    plain = _STRIP_TAGS_RE.sub("", inner)
+    plain = _visible_text(inner)
     if len(plain) > _FURNITURE_MAX_LEN or _SENTENCE_END_RE.search(plain.rstrip()):
         return None
     key = _furniture_key(inner)
@@ -154,7 +155,7 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
 
 
 def _is_degenerate_repetition(text: str) -> bool:
-    tokens = _TOKEN_RE.findall(_STRIP_TAGS_RE.sub("", text))
+    tokens = _TOKEN_RE.findall(_visible_text(text))
     if len(tokens) < _MIN_REPEAT_TOKENS:
         return False
     top = Counter(tokens).most_common(1)[0][1]
@@ -162,7 +163,7 @@ def _is_degenerate_repetition(text: str) -> bool:
 
 
 def _is_title_heading(inner: str) -> bool:
-    plain = _STRIP_TAGS_RE.sub("", inner).strip().lower()
+    plain = _visible_text_folded(inner)
     return plain not in _DOCUMENT_TYPE_LABELS and not _ARTICLE_HEADING_RE.match(plain)
 
 
@@ -174,7 +175,7 @@ def _looks_like_name_list(plain: str) -> bool:
 
 
 def _byline_text(inner: str) -> str:
-    return _STRIP_TAGS_RE.sub("", re.sub(r"<br\s*/?>", "; ", inner)).strip()
+    return _visible_text(re.sub(r"<br\s*/?>", "; ", inner)).strip()
 
 
 def _is_byline(inner: str) -> bool:
@@ -195,7 +196,7 @@ def _is_article_page_md(md: str) -> bool:
     heading (a cover ad / masthead has neither)."""
     for line in md.splitlines():
         m = re.match(r"^#{1,6}\s+(.*)", line.strip())
-        if m and _ARTICLE_HEADING_RE.match(_STRIP_TAGS_RE.sub("", m.group(1)).strip()):
+        if m and _ARTICLE_HEADING_RE.match(_visible_text(m.group(1)).strip()):
             return True
     return False
 
@@ -238,10 +239,10 @@ def _classify_parts(parts: list[str]) -> _Meta:
                 expect_byline = True
                 continue
             expect_byline = False
-            if _ABSTRACT_HEADING_RE.match(_STRIP_TAGS_RE.sub("", inner)):
+            if _ABSTRACT_HEADING_RE.match(_visible_text(inner)):
                 in_abstract = True
                 continue
-            if _STRIP_TAGS_RE.sub("", inner).strip().lower() in _DOCUMENT_TYPE_LABELS:
+            if _visible_text_folded(inner) in _DOCUMENT_TYPE_LABELS:
                 continue
             in_abstract = False
             body.append(part)
@@ -274,9 +275,7 @@ def _is_metadata_heading(part: str) -> bool:
     heading = _heading_inner(part)
     if heading is None:
         return False
-    title = _SECTION_NUMBER_RE.sub(
-        "", _STRIP_TAGS_RE.sub("", heading[1]).strip().lower()
-    )
+    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
     return title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
 
 
@@ -286,7 +285,7 @@ def _is_frontmatter_text(part: str, *, strict: bool = True) -> bool:
         return False
     if _BOLD_LABEL_RE.match(inner):
         return True
-    plain = _STRIP_TAGS_RE.sub("", inner).lstrip()
+    plain = _visible_text(inner).lstrip()
     if _LEADING_SUP_RE.match(plain):
         return True
     if not _FRONTMATTER_TEXT_RE.match(plain):
@@ -312,7 +311,7 @@ def _looks_like_body_prose(part: str) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
         return False
-    text = _STRIP_TAGS_RE.sub("", inner)
+    text = _visible_text(inner)
     return len(text) > _METADATA_PROSE_MIN_LEN and bool(_SENTENCE_END_RE.search(text))
 
 
@@ -322,7 +321,7 @@ def _is_list_like(part: str) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
         return False
-    return _STRIP_TAGS_RE.sub("", inner).count(";") >= _LIST_LIKE_MIN_SEMICOLONS
+    return _visible_text(inner).count(";") >= _LIST_LIKE_MIN_SEMICOLONS
 
 
 def _front_matter_len(body: list[str]) -> int:

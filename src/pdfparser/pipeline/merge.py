@@ -11,10 +11,10 @@ import re
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
-    _STRIP_TAGS_RE,
     _TABLE_CAPTION_RE,
     _opens_with_caption_label,
     _plain_p_text,
+    _visible_text,
 )
 
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
@@ -103,11 +103,26 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     return out
 
 
+def _merge_split_paragraphs_stable(parts: list[str]) -> list[str]:
+    """Run ``_merge_split_paragraphs`` until it reaches a fixpoint.
+
+    A single pass joins each fragment to its immediate continuation, but a
+    paragraph split into three-plus pieces by column/page breaks only collapses
+    fully once the earlier joins expose the next adjacency.  Iterating to a
+    fixpoint stitches the whole chain regardless of how many pieces it was in.
+    """
+    while True:
+        merged = _merge_split_paragraphs(parts)
+        if merged == parts:
+            return merged
+        parts = merged
+
+
 def _is_table_caption(part: str) -> bool:
     """True when a block is a stand-alone ``<p>`` table caption ("Table 1 …")."""
     inner = _plain_p_text(part)
     return inner is not None and bool(
-        _TABLE_CAPTION_RE.match(_STRIP_TAGS_RE.sub("", inner).lstrip())
+        _TABLE_CAPTION_RE.match(_visible_text(inner).lstrip())
     )
 
 

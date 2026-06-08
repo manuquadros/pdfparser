@@ -40,6 +40,20 @@ _TABLE_CAPTION_RE = re.compile(
 )
 
 
+def _visible_text(html: str) -> str:
+    """The text a reader sees: ``html`` with every tag removed."""
+    return _STRIP_TAGS_RE.sub("", html)
+
+
+def _visible_text_folded(html: str) -> str:
+    """``_visible_text`` normalized for label comparison — trimmed and lowercased.
+
+    OCR casing is unreliable, so document-type and metadata-heading labels are
+    matched case-insensitively against this form.
+    """
+    return _visible_text(html).strip().lower()
+
+
 def _plain_p_text(s: str) -> str | None:
     """Return the inner content of a plain ``<p>…</p>`` block, or ``None``.
 
@@ -68,4 +82,4 @@ def _opens_with_caption_label(text: str) -> bool:
     garbles the sentence and strands the caption away from its float, so the
     label must be recognised through the ``<strong>`` the model often wraps it
     in, which a raw match of ``_CAPTION_RE`` against the markdown would miss."""
-    return bool(_CAPTION_RE.match(_STRIP_TAGS_RE.sub("", text).lstrip()))
+    return bool(_CAPTION_RE.match(_visible_text(text).lstrip()))
