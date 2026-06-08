@@ -10,7 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from pdfparser.falcon import lightonocr_pdf_to_html
+from pdfparser.pipeline import lightonocr_pdf_to_html
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,0 +1,31 @@
+"""PDF → HTML pipeline using LightOnOCR-2-1B-bbox.
+
+LightOnOCR (lightonai/LightOnOCR-2-1B-bbox, Apache-2.0) is an end-to-end VLM that
+reconstructs each page as markdown — reading order, emphasis, ``<table>`` HTML,
+LaTeX math, and figure crop boxes appended to ``![image]`` placeholders.  The
+pipeline OCRs every page, converts the markdown to HTML, crops figures from the
+rendered page, and assembles a document shell.
+
+The package is split by concern:
+
+* ``model`` — load LightOnOCR and OCR one page (the only GPU seam).
+* ``render`` — PDF page → PIL image.
+* ``latex`` / ``markdown`` — text → HTML conversion.
+* ``figures`` — bbox geometry, crop recovery, ``<figure>`` emission.
+* ``text`` / ``merge`` / ``classify`` — block-stream helpers and document
+  structure classification.
+* ``assemble`` — the render-free, model-free core plus the public entry point.
+
+Typical use::
+
+    ocr = load_ocr_model()
+    html = lightonocr_pdf_to_html("paper.pdf", ocr=ocr)
+    Path("out.html").write_text(html)
+"""
+
+from __future__ import annotations
+
+from pdfparser.pipeline.assemble import lightonocr_pdf_to_html
+from pdfparser.pipeline.model import OcrModel, load_ocr_model
+
+__all__ = ["OcrModel", "lightonocr_pdf_to_html", "load_ocr_model"]

@@ -1,5 +1,5 @@
-"""Tests for falcon.py.  Unit tests load no model and render no PDF; the
-integration tests (``@pytest.mark.integration``) run the real pipeline."""
+"""Tests for the pdfparser.pipeline package.  Unit tests load no model and render
+no PDF; the integration tests (``@pytest.mark.integration``) run the real pipeline."""
 
 import base64
 import io
@@ -22,7 +22,7 @@ def _figure_sizes(html: str) -> list[tuple[int, int]]:
 
 def _run_lighton(pages_md: list[str], image: Image.Image | None = None) -> str:
     """Assemble HTML from synthetic per-page markdown (no model, no rendering)."""
-    from pdfparser.falcon import _assemble_html
+    from pdfparser.pipeline.assemble import _assemble_html
 
     img = image or _fake_image(1190, 1540)
     return _assemble_html(pages_md, [img for _ in pages_md])
@@ -63,23 +63,23 @@ class TestArticlePageDetection:
     article start is the first page that does."""
 
     def test_ad_page_is_not_article(self) -> None:
-        from pdfparser.falcon import _is_article_page_md
+        from pdfparser.pipeline.classify import _is_article_page_md
 
         ad = "# Virtual Conference\n\n## Data integrity seminar\n\nRegister here."
         assert _is_article_page_md(ad) is False
 
     def test_abstract_page_is_article(self) -> None:
-        from pdfparser.falcon import _is_article_page_md
+        from pdfparser.pipeline.classify import _is_article_page_md
 
         assert _is_article_page_md("# Title\n\n## Abstract\n\nWe did things.") is True
 
     def test_introduction_page_is_article(self) -> None:
-        from pdfparser.falcon import _is_article_page_md
+        from pdfparser.pipeline.classify import _is_article_page_md
 
         assert _is_article_page_md("## 1. Introduction\n\nText.") is True
 
     def test_leading_ad_page_skipped(self) -> None:
-        from pdfparser.falcon import _leading_pages_to_skip_md
+        from pdfparser.pipeline.classify import _leading_pages_to_skip_md
 
         ad = "# Conference\n\nRegister here."
         article = "# Real Title\n\n## Abstract\n\nBody."
@@ -92,7 +92,7 @@ class TestRunningFurniture:
     page numbers — are dropped; real repeated sentences are kept."""
 
     def test_page_numbered_footer_removed(self) -> None:
-        from pdfparser.falcon import _strip_running_furniture
+        from pdfparser.pipeline.classify import _strip_running_furniture
 
         parts = [
             "<p>Biotechnology and Applied Biochemistry 601</p>",
@@ -103,7 +103,7 @@ class TestRunningFurniture:
         assert out == ["<p>Real body sentence one.</p>"]
 
     def test_repeated_real_sentence_kept(self) -> None:
-        from pdfparser.falcon import _strip_running_furniture
+        from pdfparser.pipeline.classify import _strip_running_furniture
 
         parts = ["<p>This is a sentence.</p>", "<p>This is a sentence.</p>"]
         assert _strip_running_furniture(parts) == parts
@@ -111,7 +111,7 @@ class TestRunningFurniture:
     def test_short_enumerated_labels_kept(self) -> None:
         # "Fig 1"/"Fig 2" share a digit-stripped key but must not be removed —
         # only substantial recurring text (a journal footer) is furniture.
-        from pdfparser.falcon import _strip_running_furniture
+        from pdfparser.pipeline.classify import _strip_running_furniture
 
         parts = ["<p>Fig 1</p>", "<p>body</p>", "<p>Fig 2</p>"]
         assert _strip_running_furniture(parts) == parts
@@ -122,18 +122,18 @@ class TestByline:
     positively looks like authors; otherwise it stays in the body."""
 
     def test_marker_line_is_byline(self) -> None:
-        from pdfparser.falcon import _is_byline
+        from pdfparser.pipeline.classify import _is_byline
 
         assert _is_byline("Nianyang Wu¹") is True
         assert _is_byline("Daniel D. Clark <sup>*</sup>") is True
 
     def test_name_list_is_byline(self) -> None:
-        from pdfparser.falcon import _is_byline
+        from pdfparser.pipeline.classify import _is_byline
 
         assert _is_byline("Jane Doe and John Smith") is True
 
     def test_metadata_lines_are_not_byline(self) -> None:
-        from pdfparser.falcon import _is_byline
+        from pdfparser.pipeline.classify import _is_byline
 
         assert _is_byline("Received 26 March 2019") is False
         assert _is_byline("DOI: 10.1002/bab.1760") is False
@@ -141,7 +141,7 @@ class TestByline:
 
     def test_unmarked_single_name_is_not_byline(self) -> None:
         # No marker and not a list → ambiguous → not promoted (stays in body).
-        from pdfparser.falcon import _is_byline
+        from pdfparser.pipeline.classify import _is_byline
 
         assert _is_byline("Jane Doe") is False
 
@@ -171,12 +171,12 @@ class TestDegenerateRepetition:
     such a paragraph is dropped from the body, real prose is kept."""
 
     def test_token_wall_flagged(self) -> None:
-        from pdfparser.falcon import _is_degenerate_repetition
+        from pdfparser.pipeline.classify import _is_degenerate_repetition
 
         assert _is_degenerate_repetition("AaTRI, " * 40) is True
 
     def test_real_prose_not_flagged(self) -> None:
-        from pdfparser.falcon import _is_degenerate_repetition
+        from pdfparser.pipeline.classify import _is_degenerate_repetition
 
         prose = (
             "The enzyme catalyzes the stereospecific oxidation of the substrate"
@@ -432,7 +432,7 @@ class TestDenormalizeBbox:
     """[0,1000]-normalized model boxes scale to the image's pixel size."""
 
     def test_full_box_maps_to_full_image(self) -> None:
-        from pdfparser.falcon import _denormalize_bbox
+        from pdfparser.pipeline.figures import _denormalize_bbox
 
         assert _denormalize_bbox((0, 0, 1000, 1000), _fake_image(1190, 1540)) == (
             0,
@@ -442,7 +442,7 @@ class TestDenormalizeBbox:
         )
 
     def test_half_box(self) -> None:
-        from pdfparser.falcon import _denormalize_bbox
+        from pdfparser.pipeline.figures import _denormalize_bbox
 
         assert _denormalize_bbox((0, 0, 500, 500), _fake_image(1000, 2000)) == (
             0,
@@ -457,22 +457,22 @@ class TestFigureBoxMerge:
     crop; genuinely separate figures stay separate."""
 
     def test_same_column_adjacent_boxes_merge(self) -> None:
-        from pdfparser.falcon import _figures_same
+        from pdfparser.pipeline.figures import _figures_same
 
         assert _figures_same((100, 100, 900, 500), (110, 500, 890, 560), 50.0) is True
 
     def test_vertically_separated_boxes_do_not_merge(self) -> None:
-        from pdfparser.falcon import _figures_same
+        from pdfparser.pipeline.figures import _figures_same
 
         assert _figures_same((100, 100, 900, 300), (100, 800, 900, 950), 50.0) is False
 
     def test_side_by_side_boxes_do_not_merge(self) -> None:
-        from pdfparser.falcon import _figures_same
+        from pdfparser.pipeline.figures import _figures_same
 
         assert _figures_same((0, 0, 100, 500), (200, 0, 300, 500), 50.0) is False
 
     def test_union_box(self) -> None:
-        from pdfparser.falcon import _union_box
+        from pdfparser.pipeline.figures import _union_box
 
         assert _union_box([(100, 100, 900, 500), (120, 480, 880, 560)]) == (
             100,
@@ -520,19 +520,19 @@ class TestFigureBottomGrowth:
         return img
 
     def test_tight_box_grows_to_figure_bottom(self) -> None:
-        from pdfparser.falcon import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_bottom_to_content
 
         assert _extend_bottom_to_content(self._image(), 50, 350, 250) == 300
 
     def test_box_at_bottom_does_not_grow(self) -> None:
-        from pdfparser.falcon import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_bottom_to_content
 
         assert _extend_bottom_to_content(self._image(), 50, 350, 300) == 300
 
     def test_no_growth_when_ink_runs_without_gap(self) -> None:
         # Ink continues past the search window with no whitespace gap (caption /
         # body text below a correct box) → ambiguous → leave the box unchanged.
-        from pdfparser.falcon import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_bottom_to_content
 
         img = Image.new("RGB", (400, 800), "white")
         img.paste(Image.new("RGB", (300, 300), "black"), (50, 100))
@@ -542,7 +542,7 @@ class TestFigureBottomGrowth:
         # A figure tail narrower than the box (here 3 px of a 300 px-wide box,
         # ~1% ink) must count as content, not be mistaken for the whitespace gap
         # — otherwise the clipped bottom is dropped.
-        from pdfparser.falcon import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_bottom_to_content
 
         img = Image.new("RGB", (400, 800), "white")
         img.paste(Image.new("RGB", (300, 150), "black"), (50, 100))  # y[100,250)
@@ -550,12 +550,12 @@ class TestFigureBottomGrowth:
         assert _extend_bottom_to_content(img, 50, 350, 270) == 290
 
     def test_growth_stops_before_caption(self) -> None:
-        from pdfparser.falcon import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_bottom_to_content
 
         assert _extend_bottom_to_content(self._image(), 50, 350, 250) < 360
 
     def test_safe_crop_excludes_caption(self) -> None:
-        from pdfparser.falcon import _safe_crop
+        from pdfparser.pipeline.figures import _safe_crop
 
         crop = _safe_crop(self._image(), (50, 100, 350, 250))
         assert crop is not None and crop.size == (300, 200)
@@ -577,7 +577,7 @@ class TestCaptionMergeBarrier:
     even across intervening floats and even when wrapped in <strong>."""
 
     def test_table_caption_after_floats_not_glued_to_fragment(self) -> None:
-        from pdfparser.falcon import _merge_split_paragraphs
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
 
         parts = [
             "<p>PtTRII catalyzed the reduction of tropinone to form</p>",
@@ -593,7 +593,7 @@ class TestCaptionMergeBarrier:
         assert "to form <strong>TABLE 1</strong>" not in "".join(out)
 
     def test_real_continuation_still_merges(self) -> None:
-        from pdfparser.falcon import _merge_split_paragraphs
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
 
         parts = [
             "<p>This suggests that TRI and</p>",
@@ -610,7 +610,7 @@ class TestTableCaptionColocation:
     <caption> first child so it renders with the table, not adrift."""
 
     def test_caption_before_table_folded(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         parts = [
             "<p><strong>TABLE 1</strong> Enzyme kinetics of PtTRI and PtTRII</p>",
@@ -622,7 +622,7 @@ class TestTableCaptionColocation:
         ]
 
     def test_caption_after_table_folded(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         parts = [
             "<table><tbody><tr><td>1</td></tr></tbody></table>",
@@ -635,7 +635,7 @@ class TestTableCaptionColocation:
         ]
 
     def test_caption_separated_by_figure_folded(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         # The reported bug: a figure floats between the caption and its table.
         parts = [
@@ -651,7 +651,7 @@ class TestTableCaptionColocation:
         ]
 
     def test_caption_not_pulled_across_prose(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         # A real paragraph between caption and table breaks the association.
         parts = [
@@ -662,7 +662,7 @@ class TestTableCaptionColocation:
         assert _colocate_table_captions(parts) == parts
 
     def test_orphan_caption_left_intact(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         parts = [
             "<p>Table 9 Orphan caption with no table near it.</p>",
@@ -671,7 +671,7 @@ class TestTableCaptionColocation:
         assert _colocate_table_captions(parts) == parts
 
     def test_two_tables_pair_with_own_captions(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         parts = [
             "<p>Table 1 A</p>",
@@ -685,7 +685,7 @@ class TestTableCaptionColocation:
         assert len(out) == 2
 
     def test_existing_caption_not_duplicated(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         parts = [
             "<p>Table 5 Duplicate guard</p>",
@@ -696,7 +696,7 @@ class TestTableCaptionColocation:
         assert out == parts
 
     def test_table_attributes_preserved(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         # The caption goes after the *whole* opening tag, not inside it.
         parts = [
@@ -710,7 +710,7 @@ class TestTableCaptionColocation:
         ]
 
     def test_caption_between_tables_pairs_with_following(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         # A caption sat between two tables precedes the second, so it belongs to
         # it — the first (captionless) table must not forward-steal it.
@@ -726,7 +726,7 @@ class TestTableCaptionColocation:
         ]
 
     def test_reference_sentence_not_folded(self) -> None:
-        from pdfparser.falcon import _colocate_table_captions
+        from pdfparser.pipeline.merge import _colocate_table_captions
 
         # "Table N <lowercase verb> …" is a running reference, not a caption; it
         # must stay in the body, not be absorbed into the table.
@@ -758,33 +758,33 @@ class TestLatexToHtml:
     before markdown parsing."""
 
     def test_simple_subscript(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html("$K_m$") == "K<sub>m</sub>"
 
     def test_braced_subscript(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html("$V_{max}$") == "V<sub>max</sub>"
 
     def test_superscript_becomes_unicode(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # All-mappable superscript chars collapse to Unicode (matches "NAD⁺").
         assert _latex_to_html("NAD$^+$") == "NAD⁺"
 
     def test_superscript_letters_fall_back_to_tag(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html("pH$^{S}$") == "pH<sup>S</sup>"
 
     def test_ratio_of_kinetic_constants(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html("$k_{cat}/K_m$") == "k<sub>cat</sub>/K<sub>m</sub>"
 
     def test_degree_command_superscript(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # ``$^\circ$`` is the LaTeX degree idiom; the single-char superscript
         # rule used to capture only the backslash, leaving a lone ``\`` inside
@@ -792,22 +792,22 @@ class TestLatexToHtml:
         assert _latex_to_html(r"grown at 25 $\pm$ 1$^\circ$C") == "grown at 25 ± 1°C"
 
     def test_braced_degree_command(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html(r"$^{\circ}$C") == "°C"
 
     def test_symbol_command_translated(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html(r"$5 \times 10^{3}$ cells") == "5 × 10³ cells"
 
     def test_greek_command_as_subscript(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html(r"$T_\alpha$") == "T<sub>α</sub>"
 
     def test_command_matched_as_whole_token(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # Commands are matched as maximal "\name" tokens and looked up whole, so
         # a short command never eats the head of a longer one ("\to" vs "\top",
@@ -817,25 +817,25 @@ class TestLatexToHtml:
         assert _latex_to_html(r"$A \simeq B$") == "A ≃ B"
 
     def test_command_still_terminated_by_digit(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html(r"$\alpha2$") == "α2"
 
     def test_unknown_command_left_literal(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # pylatexenc returns "" for an unknown macro; we keep the literal rather
         # than silently dropping it.
         assert _latex_to_html(r"$x\notacommand y$") == r"x\notacommand y"
 
     def test_extended_symbol_coverage(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # Coverage we get for free from pylatexenc that the old hand map lacked.
         assert _latex_to_html(r"$T_\beta + \nabla$") == "T<sub>β</sub> + ∇"
 
     def test_arg_macro_that_raises_does_not_crash(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # pylatexenc raises when fed a bare arg-taking macro like \sqrt; the
         # exception must be swallowed and the span left intact, not propagated
@@ -843,7 +843,7 @@ class TestLatexToHtml:
         assert _latex_to_html(r"$\sqrt{x}$") == r"\sqrtx"
 
     def test_arg_macro_template_not_leaked(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # \frac's substitution template ("%s/%s") must not reach the output; the
         # command stays literal so real math survives for a later MathJax pass.
@@ -851,19 +851,19 @@ class TestLatexToHtml:
         assert _latex_to_html(r"$\frac{a}{b}$") == r"\fracab"
 
     def test_extended_symbol_coverage_via_command_helper(self) -> None:
-        from pdfparser.falcon import _latex_command_to_unicode
+        from pdfparser.pipeline.latex import _latex_command_to_unicode
 
         assert _latex_command_to_unicode(r"\sqrt") == r"\sqrt"
         assert _latex_command_to_unicode(r"\frac") == r"\frac"
         assert _latex_command_to_unicode(r"\alpha") == "α"
 
     def test_plain_text_untouched(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         assert _latex_to_html("no math here") == "no math here"
 
     def test_currency_dollars_left_alone(self) -> None:
-        from pdfparser.falcon import _latex_to_html
+        from pdfparser.pipeline.latex import _latex_to_html
 
         # No TeX markup between the '$' → not math; must not be stripped/merged.
         assert _latex_to_html("costs $5 and $10 total") == "costs $5 and $10 total"
@@ -874,13 +874,13 @@ class TestMdToHtmlBlocks:
     HTML (tables, <sup>) passed through and thematic breaks dropped."""
 
     def test_heading_and_paragraph_split(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         blocks = _md_to_html_blocks("## Introduction\n\nSome prose here.")
         assert blocks == ["<h2>Introduction</h2>", "<p>Some prose here.</p>"]
 
     def test_emphasis_rendered(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         (block,) = _md_to_html_blocks("*Przewalskia tangutica* is **rare**.")
         assert (
@@ -888,19 +888,19 @@ class TestMdToHtmlBlocks:
         )
 
     def test_table_passthrough(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         table = "<table><tbody><tr><td>1</td></tr></tbody></table>"
         assert _md_to_html_blocks(table) == [table]
 
     def test_sup_passthrough(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         (block,) = _md_to_html_blocks("NAD<sup>+</sup> dependent.")
         assert block == "<p>NAD<sup>+</sup> dependent.</p>"
 
     def test_degree_does_not_bleed_into_superscript(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         # Regression: "$^\circ$" once produced "<sup>\</sup>", whose lone "\<"
         # markdown escaped into "&lt;/sup&gt;", swallowing the rest of the
@@ -911,12 +911,12 @@ class TestMdToHtmlBlocks:
         assert block == "<p>grown at 25 ± 1°C under 16 H of light.</p>"
 
     def test_thematic_break_dropped(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         assert _md_to_html_blocks("A.\n\n---\n\nB.") == ["<p>A.</p>", "<p>B.</p>"]
 
     def test_list_kept_as_one_block(self) -> None:
-        from pdfparser.falcon import _md_to_html_blocks
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         (block,) = _md_to_html_blocks("- one\n- two")
         assert block.startswith("<ul>")
@@ -929,7 +929,7 @@ class TestParseFigurePlaceholder:
     ordinary prose."""
 
     def test_box_extracted(self) -> None:
-        from pdfparser.falcon import _parse_figure_placeholder
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         assert _parse_figure_placeholder("![image](image_1.png)122,89,877,614") == (
             122,
@@ -939,7 +939,7 @@ class TestParseFigurePlaceholder:
         )
 
     def test_box_with_surrounding_whitespace(self) -> None:
-        from pdfparser.falcon import _parse_figure_placeholder
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         assert _parse_figure_placeholder("  ![image](img.png) 10, 20, 30, 40 ") == (
             10,
@@ -949,17 +949,17 @@ class TestParseFigurePlaceholder:
         )
 
     def test_bboxless_placeholder_returns_true(self) -> None:
-        from pdfparser.falcon import _parse_figure_placeholder
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         assert _parse_figure_placeholder("![image](image_1.png)") is True
 
     def test_caption_line_is_not_a_placeholder(self) -> None:
-        from pdfparser.falcon import _parse_figure_placeholder
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         assert _parse_figure_placeholder("FIG. 2 Protein alignments of TRI.") is None
 
     def test_inline_image_in_prose_is_not_a_placeholder(self) -> None:
-        from pdfparser.falcon import _parse_figure_placeholder
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         line = "Some prose with ![inline](x.png) embedded mid-sentence."
         assert _parse_figure_placeholder(line) is None
@@ -971,10 +971,10 @@ _SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "lighton_full.htm
 
 
 @pytest.fixture(scope="session")
-def falcon_model() -> object:
+def ocr_model() -> object:
     """Load the LightOnOCR model bundle once per session; skip if unavailable."""
     try:
-        from pdfparser.falcon import load_ocr_model
+        from pdfparser.pipeline import load_ocr_model
 
         return load_ocr_model()
     except Exception as e:
@@ -982,7 +982,7 @@ def falcon_model() -> object:
 
 
 @pytest.fixture(scope="session")
-def falcon_html(falcon_model: object) -> str:
+def article_html(ocr_model: object) -> str:
     """Run the full pipeline on the no-ad fixture; skip if the model is absent.
 
     Writes the result back to spike_results/lighton_full.html so the file
@@ -990,10 +990,10 @@ def falcon_html(falcon_model: object) -> str:
     """
     if not _FIXTURE_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_FIXTURE_PDF}")
-    from pdfparser.falcon import OcrModel, lightonocr_pdf_to_html
+    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
 
-    assert isinstance(falcon_model, OcrModel)
-    html = lightonocr_pdf_to_html(_FIXTURE_PDF, ocr=falcon_model)
+    assert isinstance(ocr_model, OcrModel)
+    html = lightonocr_pdf_to_html(_FIXTURE_PDF, ocr=ocr_model)
     _SPIKE_HTML.write_text(html, encoding="utf-8")
     return html
 
@@ -1006,17 +1006,17 @@ def _header_h1(html: str) -> str:
 
 
 @pytest.mark.integration
-class TestFalconPipeline:
+class TestPipeline:
     """Integration tests: run the full LightOnOCR pipeline on the fixture PDF.
 
     Skipped when the model is not available (no GPU, weights not downloaded).
     Each run also refreshes spike_results/lighton_full.html.
     """
 
-    def test_abstract_no_column_break(self, falcon_html: str) -> None:
-        abstract_start = falcon_html.find("<section class='abstract'>")
-        abstract_end = falcon_html.find("</section>", abstract_start)
-        abstract_block = falcon_html[abstract_start:abstract_end]
+    def test_abstract_no_column_break(self, article_html: str) -> None:
+        abstract_start = article_html.find("<section class='abstract'>")
+        abstract_end = article_html.find("</section>", abstract_start)
+        abstract_block = article_html[abstract_start:abstract_end]
         # Both halves must be collected: if either is absent the pipeline
         # dropped a fragment it should have kept.
         assert "classical and contemporary" in abstract_block
@@ -1024,44 +1024,46 @@ class TestFalconPipeline:
         # And they must appear in the same paragraph — no split <p>.
         assert "classical and contemporary</p>" not in abstract_block
 
-    def test_which_is_not_merged_with_as_a_testament(self, falcon_html: str) -> None:
-        assert "which is As a testament to the utility" not in falcon_html
+    def test_which_is_not_merged_with_as_a_testament(self, article_html: str) -> None:
+        assert "which is As a testament to the utility" not in article_html
 
-    def test_ternary_complex_followed_by_clearly_showed(self, falcon_html: str) -> None:
+    def test_ternary_complex_followed_by_clearly_showed(
+        self, article_html: str
+    ) -> None:
         expected = (
             "The 1.8 Å ternary complex (enzyme + 2-KPC + NAD⁺)"
             " clearly showed interaction of the R152"
         )
-        assert expected in falcon_html
+        assert expected in article_html
 
     def test_paper_footnotes_after_body_before_references(
-        self, falcon_html: str
+        self, article_html: str
     ) -> None:
         correspondence = "To whom correspondence should be addressed"
-        assert correspondence in falcon_html
-        fn_pos = falcon_html.find(correspondence)
+        assert correspondence in article_html
+        fn_pos = article_html.find(correspondence)
         # Must follow substantial body content, not appear near the top.
-        body_start = falcon_html.find('<div class="body">')
+        body_start = article_html.find('<div class="body">')
         assert fn_pos - body_start > 2000
         # Must precede the reference list.
-        first_ref_pos = falcon_html.find("<p>[1]")
+        first_ref_pos = article_html.find("<p>[1]")
         if first_ref_pos != -1:
             assert fn_pos < first_ref_pos
 
 
 @pytest.fixture(scope="session")
-def ad_prefix_html(falcon_model: object) -> str:
+def ad_prefix_html(ocr_model: object) -> str:
     """Full pipeline output for the ad-prefixed 31051047.pdf fixture."""
     if not _AD_PREFIX_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
-    from pdfparser.falcon import OcrModel, lightonocr_pdf_to_html
+    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
 
-    assert isinstance(falcon_model, OcrModel)
-    return lightonocr_pdf_to_html(_AD_PREFIX_PDF, ocr=falcon_model)
+    assert isinstance(ocr_model, OcrModel)
+    return lightonocr_pdf_to_html(_AD_PREFIX_PDF, ocr=ocr_model)
 
 
 @pytest.mark.integration
-class TestFalconAdPageExclusion:
+class TestAdPageExclusion:
     """The 31051047.pdf fixture has an advertisement as its first page; the
     pipeline must drop it and start the document at the real article title."""
 
