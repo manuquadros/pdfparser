@@ -102,7 +102,7 @@ _AFFILIATION_TAIL_SEGMENTS = 2
 _METADATA_TOKEN_RE = re.compile(
     r"""
       \S+@\S+\.\S                                # e-mail address
-    | doi:?\s*10\.\d{4,}                         # DOI ("DOI: 10.…" or "DOI 10.…")
+    | doi:\s*10\.\d{4,}                          # DOI
     | https?://                                  # URL
     | \b\d{1,2}\s+
       (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+
@@ -115,14 +115,16 @@ _METADATA_TOKEN_RE = re.compile(
 # unambiguous on their own: a supporting-information note, a "DOI 10.…" line, a
 # "Published online …" line, or a "Volume N, … Pages N" journal citation.  The
 # OCR often splits a journal's page-bottom block into such one-line pieces, so
-# none reaches the two-token bar alone.  Each alternative is anchored or specific
-# enough (a bare DOI/"Published online" only at the block start; "Volume …
-# Pages …" needs both numbered tokens) that body prose does not match.
+# none reaches the two-token bar alone.  The DOI, "Published online" and journal
+# alternatives are anchored at the block *start* (and supporting-info is a fixed
+# phrase), so body prose that merely mentions a volume/DOI/"published online"
+# mid-sentence ("See volume 3, pages 45-67, …") does not match — only a line that
+# opens as the citation/DOI/publication line does.
 _STRAY_METADATA_PHRASE_RE = re.compile(
     r"(?:additional\s+)?supporting information (?:may be found|is available)"
     r"|^\s*doi\b\s*:?\s*10\.\d"
     r"|^\s*published\s+online\b"
-    r"|\bvol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d",
+    r"|^\s*vol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d",
     re.IGNORECASE,
 )
 # A self-contained footer-metadata line (journal citation, correspondence, a

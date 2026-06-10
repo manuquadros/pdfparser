@@ -564,6 +564,18 @@ class TestLightonAssembly:
         assert not _is_stray_metadata(
             "<p>These results were later published online for peer review.</p>"
         )
+        # A body sentence that inline-cites a volume/pages reference is prose, not
+        # a citation block: the journal shape is anchored at the block start, so
+        # "Volume 47 … Pages 124" matches but a mid-sentence citation does not.
+        assert not _is_stray_metadata(
+            "<p>See volume 3, pages 45-67, for the original derivation.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p>In volume 12, pages 8-9 of the proceedings, the method appeared.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p>As shown in Vol. 5 pp. 30 onward, the trend continues.</p>"
+        )
         # A long prose run with two tokens is not a footer line → stays in body.
         assert not _is_stray_metadata(
             "<p>" + "Lorem ipsum dolor sit amet. " * 20 + "Contact a@b.edu or "
@@ -855,6 +867,19 @@ class TestCaptionMergeBarrier:
         assert out == [
             "<p>This suggests that TRI and TRII compete for the substrate.</p>"
         ]
+
+    def test_metadata_line_not_merged_into_following_prose(self) -> None:
+        # A self-contained footer-metadata line that ends without terminal
+        # punctuation (here a ")") must not be treated as an incomplete paragraph
+        # and glued to the body prose the OCR placed after it.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs_stable
+
+        parts = [
+            "<p>Published online 28 December 2018 in Wiley Online Library "
+            "(wileyonlinelibrary.com)</p>",
+            "<p>Herein, I propose that the method generalizes to other enzymes.</p>",
+        ]
+        assert _merge_split_paragraphs_stable(parts) == parts
 
     def test_continuation_after_two_figures_and_a_table_merges(self) -> None:
         from pdfparser.pipeline.merge import _merge_split_paragraphs

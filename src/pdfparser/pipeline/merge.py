@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from pdfparser.pipeline.classify import _is_stray_metadata
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
@@ -75,6 +76,11 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                 not _SENTENCE_END_RE.search(stripped)
                 and not _BOLD_LABEL_RE.match(inner)
                 and not _opens_with_caption_label(inner)
+                # A self-contained metadata footer (DOI / "Published online …" /
+                # correspondence) is complete even when it ends without terminal
+                # punctuation, so it must not be absorbed as a fragment with the
+                # following body prose glued on.  Backstops the page-0 stray sweep.
+                and not _is_stray_metadata(part)
             ):
                 j = i + 1
                 floats: list[str] = []
