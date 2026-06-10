@@ -1312,6 +1312,80 @@ class TestTableFootnoteColocation:
         ]
         assert _colocate_table_footnotes(parts) == parts
 
+    def test_trailing_source_note_after_markers_folded(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The reported case: an attribution note with no superscript marker trails
+        # the marker run, so the marker loop can't anchor it; its lexical shape
+        # ("Data adapted from …") folds it onto the table.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+            "<p>Data adapted from Clark et al. [7].</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>"
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>'
+            '<p class="footnote">Data adapted from Clark et al. [7].</p>'
+        ]
+
+    def test_standalone_source_note_without_markers_folded(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A source note can also be the table's only footnote, with no markers at
+        # all; the lexical cue still folds it onto the table.
+        parts = [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+            "<p>Data adapted from Clark et al. [7].</p>",
+            "<p>The discussion continues in ordinary prose here.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>"
+            '<p class="footnote">Data adapted from Clark et al. [7].</p>',
+            "<p>The discussion continues in ordinary prose here.</p>",
+        ]
+
+    def test_body_line_before_standalone_source_note_not_swallowed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A body line stranded between the table and a markerless source note must
+        # not be dragged into the footnotes just because the source note folds: with
+        # no anchoring markers, the ambiguous arrangement leaves both in the stream.
+        parts = [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+            "<p>This finding is discussed further in the next section.</p>",
+            "<p>Data adapted from Clark et al. [7].</p>",
+            "<p>More body prose follows here.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_generic_verb_without_subject_not_a_source_note(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A body sentence opening with a generic participle ("Obtained from …")
+        # is not an attribution note, so it stays in the body after the table.
+        parts = [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+            "<p>Obtained from a commercial supplier, the reagents were used.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_plain_body_after_markers_not_mistaken_for_source_note(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The body resuming after the markers does not open with a source cue, so
+        # the trailing-note sweep leaves it in the stream.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+            "<p>Data presented here support the proposed mechanism in Fig. 2.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>"
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>',
+            "<p>Data presented here support the proposed mechanism in Fig. 2.</p>",
+        ]
+
     def test_end_to_end_table_footnotes_unblock_merge(self) -> None:
         # Full assembly: the table footnotes (a note sentence + marker lines) fold
         # into the table, so the paragraph split across the table rejoins and the

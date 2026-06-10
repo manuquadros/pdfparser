@@ -267,6 +267,33 @@ def _colocate_table_captions(parts: list[str]) -> list[str]:
 # body paragraph an OCR mis-order may have stranded after a table from being
 # swallowed as a note.
 _MAX_TABLE_NOTE_LINES = 1
+
+# A source/attribution note ("Data adapted from Clark et al. [7].") closes a table
+# legend without any superscript marker, so the marker run can't anchor it the way
+# it anchors a leading note.  It is recognised lexically instead: a short line that
+# opens by attributing the data to a source.  The cue is anchored at the block
+# start and the line is length-bounded so body prose that merely mentions a source
+# mid-sentence can't match; the check also only ever runs on the line right after a
+# table (or its markers).
+_TABLE_SOURCE_NOTE_MAX_LEN = 200
+# Verbs that specifically credit a source: they rarely open a body sentence as a
+# bare participle, so they qualify even without a data subject ("Adapted from …").
+_ATTRIBUTION_VERB = r"(?:adapted|reproduced|reprinted|redrawn|modified)"
+# Verbs generic enough to open ordinary prose ("Obtained from a supplier, …",
+# "Calculated from Eq. 3, …"): they qualify only when introduced by a data subject
+# ("Data obtained from …"), never on their own.
+_GENERIC_SOURCE_VERB = r"(?:taken|obtained|derived|calculated|compiled)"
+_SOURCE_SUBJECT = r"(?:data|values?|results?|means?)"
+_TABLE_SOURCE_NOTE_RE = re.compile(
+    r"^\s*(?:"
+    r"sources?\s*:"
+    rf"|{_SOURCE_SUBJECT}\s+(?:(?:were|are|was|is)\s+)?"
+    rf"(?:{_ATTRIBUTION_VERB}|{_GENERIC_SOURCE_VERB})\s+from\b"
+    rf"|{_ATTRIBUTION_VERB}\s+from\b"
+    rf"|{_SOURCE_SUBJECT}\s+from\b"
+    r")",
+    re.IGNORECASE,
+)
 # A footnote marker: a SHORT superscript ("<sup>a</sup>", "<sup>*</sup>").  Same
 # bound as classify's _SUP_MARKER_RE, but capturing the label so a trailing
 # footnote can be matched to the marker it annotates inside the table.
@@ -304,6 +331,19 @@ def _as_table_footnote(part: str) -> str:
     return f'<p class="footnote">{inner}</p>' if inner is not None else part
 
 
+def _is_table_source_note(part: str) -> bool:
+    """True for a short source/attribution note that closes a table legend
+    ("Data adapted from Clark et al. [7].") — see ``_TABLE_SOURCE_NOTE_RE``."""
+    inner = _plain_p_text(part)
+    if inner is None:
+        return False
+    text = _visible_text(inner).strip()
+    return (
+        len(text) <= _TABLE_SOURCE_NOTE_MAX_LEN
+        and _TABLE_SOURCE_NOTE_RE.match(text) is not None
+    )
+
+
 def _colocate_table_footnotes(parts: list[str]) -> list[str]:
     """Absorb a table's trailing footnote run into its ``<table>`` block.
 
@@ -318,10 +358,12 @@ def _colocate_table_footnotes(parts: list[str]) -> list[str]:
     A marker line is only this table's footnote when its label is one the table
     actually carries (``<sup>a</sup>`` inside a header/cell) — otherwise the
     superscript line is an article footnote that merely follows the table, and is
-    left for the classifier to route to the footnote section.  A plain paragraph
-    is taken as a note only while it sits *before* the first marker; once the
-    markers end, the next paragraph is the body resuming.  A run with no matching
-    marker is not a footnote run and is left untouched.
+    left for the classifier to route to the footnote section.  A plain legend note
+    that sits *before* the markers folds only when those markers anchor it; a
+    source/attribution note ("Data adapted from …") folds by its lexical shape,
+    whether it trails the markers or stands alone directly after the table.  A run
+    with neither a matching marker nor a source note is the body resuming and is
+    left untouched.
     """
     n = len(parts)
     out: list[str] = []
@@ -333,29 +375,45 @@ def _colocate_table_footnotes(parts: list[str]) -> list[str]:
             i += 1
             continue
         labels = _table_sup_labels(part)
-        run: list[str] = []
-        seen_marker = False
-        leading = 0
-        j = i + 1
-        while j < n:
-            inner = _plain_p_text(parts[j])
-            if inner is None:
-                break
-            marker = _leading_sup_label(inner)
-            if marker is not None:
-                if marker not in labels:
-                    break
-                run.append(parts[j])
-                seen_marker = True
-                j += 1
-                continue
-            if seen_marker or leading >= _MAX_TABLE_NOTE_LINES:
-                break
-            run.append(parts[j])
-            leading += 1
+        # A single legend note may precede the markers; it is a table note only
+        # when markers follow to anchor it, so it is tracked apart from the marker
+        # run and never folded on its own — that is what keeps a body line stranded
+        # between the table and a later source note out of the footnotes.
+        leading_start = j = i + 1
+        while (
+            j < n
+            and j - leading_start < _MAX_TABLE_NOTE_LINES
+            and (inner := _plain_p_text(parts[j])) is not None
+            and _leading_sup_label(inner) is None
+            and not _is_table_source_note(parts[j])
+        ):
             j += 1
+        has_leading = j > leading_start
+        marker_start = j
+        while j < n and (inner := _plain_p_text(parts[j])) is not None:
+            marker = _leading_sup_label(inner)
+            if marker is None or marker not in labels:
+                break
+            j += 1
+        seen_marker = j > marker_start
+        # A source note carries no marker, so it trails the marker run or stands
+        # directly after the table; it is absorbed by its lexical shape, never by
+        # position alone, so the body prose that resumes after the footnotes stays.
+        source_start = j
+        while j < n and _is_table_source_note(parts[j]):
+            j += 1
+        has_source = j > source_start
         if seen_marker:
-            out.append(part + "".join(_as_table_footnote(b) for b in run))
+            fold_start: int | None = leading_start
+        elif has_source and not has_leading:
+            fold_start = source_start
+        else:
+            fold_start = None
+        if fold_start is not None:
+            out.append(
+                part
+                + "".join(_as_table_footnote(parts[k]) for k in range(fold_start, j))
+            )
             i = j
         else:
             out.append(part)
