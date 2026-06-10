@@ -898,6 +898,20 @@ class TestLatexToHtml:
         # No TeX markup between the '$' → not math; must not be stripped/merged.
         assert _latex_to_html("costs $5 and $10 total") == "costs $5 and $10 total"
 
+    def test_math_wrapped_bare_number_unwrapped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A lone number in a math span is just a value the model wrapped — drop
+        # the '$' delimiters but keep the number (and the surrounding spaces).
+        assert _latex_to_html("was $42.26$ Sec") == "was 42.26 Sec"
+
+    def test_script_span_reattaches_to_preceding_token(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # The model writes a unit and its exponent with a gap ("Sec $^{-1}$"); a
+        # span opening with a script attaches to the previous token, no space.
+        assert _latex_to_html("Sec $^{-1}$ mM $^{-1}$") == "Sec⁻¹ mM⁻¹"
+
 
 class TestMdToHtmlBlocks:
     """A page's markdown becomes one HTML string per top-level block, with raw

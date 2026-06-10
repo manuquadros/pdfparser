@@ -119,12 +119,20 @@ def _inline_md_to_html(text: str) -> str:
 
 
 # An inline math span: $…$ not preceded by a backslash, shortest match, on a
-# single line (no DOTALL — a stray '$' must not swallow across paragraphs).
-_LATEX_SPAN_RE = re.compile(r"(?<!\\)\$([^\n$]+)(?<!\\)\$")
+# single line (no DOTALL — a stray '$' must not swallow across paragraphs).  A
+# single space *before* the span is captured so a span that opens with a script
+# ("Sec $^{-1}$") can re-attach to the preceding token instead of stranding the
+# superscript after a gap.
+_LATEX_SPAN_RE = re.compile(r"( ?)(?<!\\)\$([^\n$]+)(?<!\\)\$")
 # Only spans that actually contain TeX (a sub/superscript or a command) are
 # converted; a paired '$' around plain text (e.g. currency "$5 … $10") is left
 # untouched rather than stripped.
 _LATEX_MATH_RE = re.compile(r"[_^\\]")
+# A span whose content is a lone number ("$42.26$") is the model wrapping a plain
+# value in math mode, so the delimiters are dropped and the number kept.  Currency
+# is safe: the regex only pairs '$' spuriously across words ("$5 … $10"), whose
+# content is never a lone number.
+_BARE_NUMBER_RE = re.compile(r"[-+±]?\d[\d.,]*%?")
 # Sub/superscript inside a math span: ^{multi} / ^cmd / ^x and the _ forms.
 # A bare script target may be a command pylatexenc left literal (``^\dagger``);
 # capture the whole command, not just the leading backslash, so a stray "\<"
@@ -166,9 +174,14 @@ def _latex_to_html(text: str) -> str:
     """
 
     def replace(m: re.Match[str]) -> str:
-        content = m.group(1)
+        space, content = m.group(1), m.group(2)
         if not _LATEX_MATH_RE.search(content):
+            if _BARE_NUMBER_RE.fullmatch(content.strip()):
+                return space + content.strip()
             return m.group(0)
-        return _latex_span_to_html(content)
+        html = _latex_span_to_html(content)
+        if space and content.lstrip()[:1] in ("^", "_"):
+            return html
+        return space + html
 
     return _LATEX_SPAN_RE.sub(replace, text)
