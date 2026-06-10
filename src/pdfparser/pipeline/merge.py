@@ -39,7 +39,13 @@ _FUNCTION_WORD_END_RE = re.compile(
 # function-word guard — otherwise a clause split across a column/page break
 # ("…TRI and" / "TRII compete…") is wrongly left as two paragraphs.
 _ACRONYM_HEAD_RE = re.compile(r"^[A-Z]{2,}[0-9]*\b")
-_MAX_FLOATS_TO_SKIP = 2
+# A column/page break can strand a paragraph's continuation behind a whole float
+# cluster — observed as two figures plus a table between the two halves — so the
+# skip window must clear such a cluster.  The grammatical guards below (the
+# fragment lacks terminal punctuation, the continuation isn't a new sentence /
+# caption / enumeration) are what keep the merge honest; this bound only limits
+# how far floats are relocated after the joined paragraph.
+_MAX_FLOATS_TO_SKIP = 3
 
 _TABLE_OPEN_RE = re.compile(r"^<table[\s>]", re.IGNORECASE)
 _TABLE_OPEN_TAG_RE = re.compile(r"^<table\b[^>]*>", re.IGNORECASE)

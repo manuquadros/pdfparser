@@ -634,6 +634,27 @@ class TestCaptionMergeBarrier:
             "<p>This suggests that TRI and TRII compete for the substrate.</p>"
         ]
 
+    def test_continuation_after_two_figures_and_a_table_merges(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # A column break stranded the continuation behind a figure+figure+table
+        # cluster (the table's caption already folded in by colocation).
+        parts = [
+            "<p>PtTRII catalyzed the reduction of tropinone to form</p>",
+            "<figure><img src='a' alt=''></figure>",
+            "<figure><img src='b' alt=''></figure>",
+            "<table><caption>TABLE 1</caption><tbody><tr><td>1</td></tr></tbody>"
+            "</table>",
+            "<p>pseudotropine with higher affinity to tropinone.</p>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        assert out[0] == (
+            "<p>PtTRII catalyzed the reduction of tropinone to form "
+            "pseudotropine with higher affinity to tropinone.</p>"
+        )
+        # The floats are relocated after the joined paragraph, order preserved.
+        assert out[1:] == parts[1:4]
+
 
 class TestTableCaptionColocation:
     """A free-standing "Table N …" caption is folded into its <table> as a
