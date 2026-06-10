@@ -116,6 +116,36 @@ class TestRunningFurniture:
         parts = ["<p>Fig 1</p>", "<p>body</p>", "<p>Fig 2</p>"]
         assert _strip_running_furniture(parts) == parts
 
+    def test_heading_form_footer_removed(self) -> None:
+        # OCR transcribes the running journal line as a heading on a sparse page
+        # (last page / after references); it must still count as furniture and be
+        # stripped, not survive as an <h1>.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = [
+            "<p>Biotechnology and Applied Biochemistry 601</p>",
+            "<p>Real body sentence one.</p>",
+            "<h1>Biotechnology and Applied Biochemistry</h1>",
+        ]
+        out = _strip_running_furniture(parts)
+        assert out == ["<p>Real body sentence one.</p>"]
+
+    def test_standalone_page_number_removed(self) -> None:
+        # OCR sometimes isolates the folio into its own block, away from the
+        # journal line, so digit-stripped recurrence can't catch it; a number-only
+        # block is the page number itself and must be dropped.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = ["<p>601</p>", "<p>Real body sentence one.</p>", "<h2>602</h2>"]
+        assert _strip_running_furniture(parts) == ["<p>Real body sentence one.</p>"]
+
+    def test_section_number_kept(self) -> None:
+        # A numbered section heading ("3.4 …") is not a bare folio and stays.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = ["<h2>3.4 Enzymatic activities</h2>", "<p>4</p>"]
+        assert _strip_running_furniture(parts) == ["<h2>3.4 Enzymatic activities</h2>"]
+
 
 class TestByline:
     """The block after the title becomes the header byline only when it

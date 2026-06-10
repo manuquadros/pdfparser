@@ -106,6 +106,9 @@ _DIGITS_RE = re.compile(r"\d+")
 # stripping the digits can't collapse short enumerated labels ("Fig 1" / "Fig 2",
 # "Step 1" / "Step 2") into one key and delete them as furniture.
 _MIN_FURNITURE_KEY_LEN = 12
+# A folio is a block whose entire visible text is a bare number.  Bounded length
+# keeps it to plausible page numbers and away from longer numeric data.
+_PAGE_NUMBER_RE = re.compile(r"\d{1,4}")
 
 # Even though LightOnOCR-bbox usually boxes figures (so they never reach the text
 # stream), a diagram it misses can still be OCRed into one label repeated dozens
@@ -134,8 +137,20 @@ def _furniture_key(inner: str) -> str:
     return _WHITESPACE_RE.sub(" ", _PUNCT_RE.sub("", text)).strip().lower()
 
 
-def _is_furniture_candidate(part: str) -> str | None:
+def _furniture_inner(part: str) -> str | None:
+    """Inner text of a running-furniture candidate — a plain paragraph or a
+    heading.  OCR transcribes the same marginal line as a <p> on dense body pages
+    but promotes it to a heading on sparse pages (last page, after references), so
+    both forms must feed the recurrence count to be stripped consistently."""
     inner = _plain_p_text(part)
+    if inner is not None:
+        return inner
+    heading = _heading_inner(part)
+    return heading[1] if heading is not None else None
+
+
+def _is_furniture_candidate(part: str) -> str | None:
+    inner = _furniture_inner(part)
     if inner is None:
         return None
     plain = _visible_text(inner)
@@ -145,13 +160,32 @@ def _is_furniture_candidate(part: str) -> str | None:
     return key if len(key) >= _MIN_FURNITURE_KEY_LEN else None
 
 
+def _is_standalone_page_number(part: str) -> bool:
+    """A folio printed alone in the margin that OCR emitted as its own block.
+
+    The recurrence pass can't catch it: ``_furniture_key`` strips digits before
+    keying, so a number-only block has an empty key, and each page's number is
+    distinct anyway.  A block whose only content is a bare number is the folio
+    itself, so it is dropped directly."""
+    inner = _furniture_inner(part)
+    return inner is not None and bool(
+        _PAGE_NUMBER_RE.fullmatch(_visible_text(inner).strip())
+    )
+
+
 def _strip_running_furniture(parts: list[str]) -> list[str]:
-    """Drop short, recurring header/footer lines (page-number-insensitive)."""
+    """Drop short, recurring header/footer lines (page-number-insensitive) and
+    standalone page-number blocks."""
     counts: Counter[str] = Counter(
         key for part in parts if (key := _is_furniture_candidate(part)) is not None
     )
     repeated = {key for key, n in counts.items() if n > 1}
-    return [p for p in parts if _is_furniture_candidate(p) not in repeated]
+    return [
+        p
+        for p in parts
+        if _is_furniture_candidate(p) not in repeated
+        and not _is_standalone_page_number(p)
+    ]
 
 
 def _is_degenerate_repetition(text: str) -> bool:
