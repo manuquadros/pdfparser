@@ -481,6 +481,95 @@ class TestLightonAssembly:
         assert "<h2>Nomenclature</h2>" in body
         assert "This section explains the naming conventions" in body
 
+    def test_stray_footer_metadata_pulled_into_panel(self) -> None:
+        # The first page's bottom-of-page footer (journal citation + correspondence,
+        # a supporting-info note, a submission/DOI line) is OCR'd into the body
+        # after the Introduction.  Each self-contained metadata line is relocated to
+        # the panel; the body prose that follows stays visible.
+        md = (
+            "# A Study\n\n## Abstract\n\nThe abstract.\n\n"
+            "## Introduction\n\nIntro paragraph one is reasonably long prose here.\n\n"
+            "Volume 47, Number 2, March/April 2019, Pages 124-132 *To whom "
+            "correspondence should be addressed. Daniel D. Clark, Tel.: "
+            "(530)-898-5251. E-mail: ddclark@csuchico.edu.\n\n"
+            "Additional Supporting Information may be found in the online version "
+            "of this article.\n\n"
+            "Received 19 June 2018; Revised 23 August 2018; Accepted 6 December "
+            "2018 DOI 10.1002/bmb.21202 Published online 28 December 2018 in Wiley "
+            "Online Library (wileyonlinelibrary.com)\n\n"
+            "Herein, I propose that data from the characterization can augment the "
+            "teaching of enzyme kinetics. The case study had five goals in mind.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in (
+            "Volume 47",
+            "Additional Supporting Information",
+            "Received 19 June",
+        ):
+            assert fragment in meta
+            assert fragment not in body
+        # Running before the merge keeps the ")" -terminated footer line from
+        # absorbing the body prose that follows it.
+        assert "Herein, I propose" in body
+        assert "Herein, I propose" not in meta
+
+    def test_body_sentence_with_one_email_not_hidden(self) -> None:
+        # The stray-metadata sweep must not hide a body sentence that merely embeds
+        # a single address: one token is below the threshold.
+        md = (
+            "# A Study\n\n## Abstract\n\nThe abstract.\n\n"
+            "## Introduction\n\n"
+            "Raw data are available on request from the author at "
+            "ddclark@csuchico.edu.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        body = _body(_run_lighton([md]))
+        assert "Raw data are available on request" in body
+
+    def test_stray_metadata_predicate(self) -> None:
+        from pdfparser.pipeline.classify import _is_stray_metadata
+
+        # Two tokens (tel + e-mail) → relocated.
+        assert _is_stray_metadata(
+            "<p>*To whom correspondence should be addressed. Tel.: (530)-898-5251. "
+            "E-mail: ddclark@csuchico.edu.</p>"
+        )
+        # Boilerplate phrase, no token → relocated.
+        assert _is_stray_metadata(
+            "<p>Additional Supporting Information may be found in the online "
+            "version of this article.</p>"
+        )
+        # Single-token publication lines the OCR splits off the page-bottom block,
+        # each unambiguous on its own shape → relocated.
+        assert _is_stray_metadata(
+            "<p>Volume 47, Number 2, March/April 2019, Pages 124-132</p>"
+        )
+        assert _is_stray_metadata("<p>DOI 10.1002/bmb.21202</p>")
+        assert _is_stray_metadata(
+            "<p>Published online 28 December 2018 in Wiley Online Library "
+            "(wileyonlinelibrary.com)</p>"
+        )
+        # A single embedded e-mail is below the two-token bar → stays in body.
+        assert not _is_stray_metadata(
+            "<p>Raw data are available from the author at jane@example.edu.</p>"
+        )
+        # Prose that merely uses the words "volume"/"pages" or "published online"
+        # — not the citation/publication shapes — stays in body.
+        assert not _is_stray_metadata(
+            "<p>The dataset volume reached 47 GB after we processed pages from "
+            "124 to 132 of the log.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p>These results were later published online for peer review.</p>"
+        )
+        # A long prose run with two tokens is not a footer line → stays in body.
+        assert not _is_stray_metadata(
+            "<p>" + "Lorem ipsum dolor sit amet. " * 20 + "Contact a@b.edu or "
+            "c@d.edu.</p>"
+        )
+
     def test_bare_affiliation_line_pulled_into_panel(self) -> None:
         # An author+affiliation line OCR'd between the title and the abstract,
         # without its author's superscript marker ("Name From the Department …,
@@ -1234,19 +1323,28 @@ class TestPipeline:
         )
         assert expected in article_html
 
-    def test_paper_footnotes_after_body_before_references(
-        self, article_html: str
-    ) -> None:
-        correspondence = "To whom correspondence should be addressed"
-        assert correspondence in article_html
-        fn_pos = article_html.find(correspondence)
-        # Must follow substantial body content, not appear near the top.
-        body_start = article_html.find('<div class="body">')
-        assert fn_pos - body_start > 2000
-        # Must precede the reference list.
-        first_ref_pos = article_html.find("<p>[1]")
-        if first_ref_pos != -1:
-            assert fn_pos < first_ref_pos
+    def test_first_page_footer_metadata_in_panel(self, article_html: str) -> None:
+        # The first page's bottom-of-page footer — the journal-citation /
+        # correspondence line and the supporting-information note — is front matter
+        # the OCR drops into the body.  It is relocated to the collapsed Metadata
+        # panel (which renders before the body), not left inline.
+        panel, body = _metadata(article_html), _body(article_html)
+        # The OCR splits the page-bottom block into one-line pieces; every one is
+        # relocated, including the journal-citation / DOI / "Published online" lines
+        # that carry only a single metadata token.
+        for fragment in (
+            "To whom correspondence should be addressed",
+            "Additional Supporting Information",
+            "Received 19 June 2018",
+            "Volume 47",
+            "DOI 10.1002/bmb.21202",
+            "Published online 28 December 2018",
+        ):
+            assert fragment in panel
+            assert fragment not in body
+        # Pulling the orphan lines out before the (cross-page) paragraph-merge stops
+        # them from chaining into the page-2 prose the OCR placed after them.
+        assert "Herein, I propose" in body
 
 
 @pytest.fixture(scope="session")

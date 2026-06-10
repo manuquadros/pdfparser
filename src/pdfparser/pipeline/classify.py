@@ -102,7 +102,7 @@ _AFFILIATION_TAIL_SEGMENTS = 2
 _METADATA_TOKEN_RE = re.compile(
     r"""
       \S+@\S+\.\S                                # e-mail address
-    | doi:\s*10\.\d{4,}                          # DOI
+    | doi:?\s*10\.\d{4,}                         # DOI ("DOI: 10.…" or "DOI 10.…")
     | https?://                                  # URL
     | \b\d{1,2}\s+
       (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+
@@ -111,6 +111,29 @@ _METADATA_TOKEN_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+# Footer-metadata line shapes that carry fewer than two countable tokens yet are
+# unambiguous on their own: a supporting-information note, a "DOI 10.…" line, a
+# "Published online …" line, or a "Volume N, … Pages N" journal citation.  The
+# OCR often splits a journal's page-bottom block into such one-line pieces, so
+# none reaches the two-token bar alone.  Each alternative is anchored or specific
+# enough (a bare DOI/"Published online" only at the block start; "Volume …
+# Pages …" needs both numbered tokens) that body prose does not match.
+_STRAY_METADATA_PHRASE_RE = re.compile(
+    r"(?:additional\s+)?supporting information (?:may be found|is available)"
+    r"|^\s*doi\b\s*:?\s*10\.\d"
+    r"|^\s*published\s+online\b"
+    r"|\bvol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d",
+    re.IGNORECASE,
+)
+# A self-contained footer-metadata line (journal citation, correspondence, a
+# "Received … DOI …" submission line, a supporting-information note) that OCR
+# dropped into the body away from the leading front-matter run.  It is relocated
+# on its own evidence, so the bar is high: a short block matching one of the fixed
+# publication-line shapes above, or carrying two or more metadata tokens.  The
+# token count rejects a body sentence that merely embeds one address/date; the
+# length bound rejects a long prose run that happens to contain two.
+_STRAY_METADATA_MAX_LEN = 400
+_STRAY_METADATA_MIN_TOKENS = 2
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
 # section is recognised by length + a sentence ending, and breaks the run.
@@ -500,4 +523,35 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
                 continue
         rest.append(part)
         i += 1
+    return metadata, rest
+
+
+def _is_stray_metadata(part: str) -> bool:
+    """A self-contained footer-metadata line OCR'd into the body (see
+    ``_STRAY_METADATA_MAX_LEN``).  Unlike ``_is_frontmatter_text`` it is judged
+    position-independently, so it must stand on its own strong evidence: a short
+    block with two or more metadata tokens, or the fixed boilerplate phrase."""
+    inner = _plain_p_text(part)
+    if inner is None:
+        return False
+    plain = _visible_text(inner)
+    if len(plain) > _STRAY_METADATA_MAX_LEN:
+        return False
+    if _STRAY_METADATA_PHRASE_RE.search(plain):
+        return True
+    return len(_METADATA_TOKEN_RE.findall(plain)) >= _STRAY_METADATA_MIN_TOKENS
+
+
+def _extract_stray_metadata(parts: list[str]) -> tuple[list[str], list[str]]:
+    """Split self-contained stray metadata blocks (see ``_is_stray_metadata``) off
+    a page's block stream — returns ``(metadata, rest)``.
+
+    The caller scopes this to the first article page and runs it *before* the
+    paragraph-merge, so a footer line ending in ")" (e.g. "… Published online …
+    (wileyonlinelibrary.com)") is pulled out before the merge can glue the
+    following body prose onto it."""
+    metadata: list[str] = []
+    rest: list[str] = []
+    for part in parts:
+        (metadata if _is_stray_metadata(part) else rest).append(part)
     return metadata, rest

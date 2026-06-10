@@ -22,6 +22,7 @@ from pdfparser.pipeline.classify import (
     _classify_parts,
     _extract_front_matter,
     _extract_named_metadata_sections,
+    _extract_stray_metadata,
     _leading_pages_to_skip_md,
     _strip_running_furniture,
 )
@@ -268,15 +269,19 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     per_page_parts = [
         _page_to_html_parts(md, img) for md, img in zip(pages_md, images, strict=True)
     ]
-    # A glossary-style metadata section (Abbreviations / Nomenclature) is often
-    # OCR'd mid-body on the article's first page, past the reach of the leading-run
-    # front-matter scan.  Pull it here, scoped to that first page so a same-named
-    # back-matter section is left in place.
+    # Front matter the OCR scattered into the article's first page — a glossary
+    # section (Abbreviations / Nomenclature) past the leading-run scan, and
+    # self-contained footer lines (correspondence, submission/DOI, supporting-info
+    # notes) — is pulled here, scoped to that first page.  The stray-line sweep runs
+    # before the paragraph-merge so a footer line ending in ")" is removed before
+    # the merge can glue following body prose onto it.
     named_metadata: list[str] = []
+    stray_metadata: list[str] = []
     if per_page_parts:
         named_metadata, per_page_parts[0] = _extract_named_metadata_sections(
             per_page_parts[0]
         )
+        stray_metadata, per_page_parts[0] = _extract_stray_metadata(per_page_parts[0])
 
     parts = [part for page in per_page_parts for part in page]
     parts = _colocate_table_captions(parts)
@@ -287,7 +292,7 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     body = _merge_split_paragraphs_stable(_strip_running_furniture(meta.body))
     body = _insert_footnotes_before_refs(body, meta.footnotes)
     leading_metadata, body = _extract_front_matter(body)
-    metadata = leading_metadata + named_metadata
+    metadata = leading_metadata + named_metadata + stray_metadata
 
     return _document_shell(
         title_html=meta.title_html or "Untitled",
