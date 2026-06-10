@@ -28,11 +28,17 @@ _ENUM_RE = re.compile(
 # which in normal prose starts lowercase.  If the next region starts with an
 # uppercase letter in this context the real continuation was likely dropped by
 # OCR, so we refuse the merge rather than joining unrelated sentences.
+# A trailing comma arms the guard only after a clause-introducer
+# (that/which/…) — "revealed that, with no additives present, …" — where the
+# comma opens a fronted parenthetical and the real continuation is still
+# lowercase.  After a preposition/conjunction a trailing comma before a capital
+# is more often a genuine (proper-noun) continuation, so it must not arm the
+# guard.
 _FUNCTION_WORD_END_RE = re.compile(
     r"\b(?:a|an|the|is|are|was|were|be|been|being|have|has|had|"
     r"will|would|can|could|should|may|might|must|do|does|did|"
-    r"of|in|on|at|by|for|with|to|from|and|or|but|nor|"
-    r"that|which|who|whom|this|these|those)\s*$",
+    r"of|in|on|at|by|for|with|to|from|and|or|but|nor)\s*$"
+    r"|\b(?:that|which|who|whom|this|these|those)[\s,;]*$",
     re.IGNORECASE,
 )
 # An all-caps acronym ("TRII", "DNA", "NAD") opening the continuation is part
@@ -51,6 +57,48 @@ _MAX_FLOATS_TO_SKIP = 3
 _TABLE_OPEN_RE = re.compile(r"^<table[\s>]", re.IGNORECASE)
 _TABLE_OPEN_TAG_RE = re.compile(r"^<table\b[^>]*>", re.IGNORECASE)
 _FIGURE_OPEN_RE = re.compile(r"^<figure[\s>]", re.IGNORECASE)
+# A *bare* table label: the "Table <id>" caption header with no descriptive text
+# after it ("TABLE I", "Table 1.", "Supplementary Table 2:").  Unlike
+# _TABLE_CAPTION_RE this rejects a label carrying its own title ("Table 4 X"),
+# because only a header with the title stranded in the *next* paragraph needs
+# rejoining.
+_BARE_TABLE_LABEL_RE = re.compile(
+    r"^\*{0,2}\s*"
+    r"(?i:supp(?:l(?:ementary)?)?\.?\s+)?"
+    r"(?i:table)\b\s*"
+    r"\w+"
+    r"\s*[.:]?\s*\*{0,2}\s*$"
+)
+
+
+def _join_split_table_caption_labels(parts: list[str]) -> list[str]:
+    """Rejoin a table caption OCR split into a bare label paragraph and its title.
+
+    A caption rendered as ``<p>TABLE I</p>`` followed by ``<p>Selected
+    substrates…</p>`` leaves the title stranded as its own block: colocation
+    folds a caption into its ``<table>`` only when the caption is one block
+    adjacent to the table, and the cross-table paragraph merge can't see past
+    the stray ``<p>`` either.  A bare label (nothing after the table identifier)
+    is never a body sentence, so the following plain paragraph is its title and
+    the two are one caption.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        inner = _plain_p_text(parts[i])
+        if (
+            inner is not None
+            and _BARE_TABLE_LABEL_RE.match(_visible_text(inner).strip())
+            and i + 1 < len(parts)
+        ):
+            title = _plain_p_text(parts[i + 1])
+            if title is not None and not _opens_with_caption_label(title):
+                out.append(f"<p>{inner.rstrip()} {title.lstrip()}</p>")
+                i += 2
+                continue
+        out.append(parts[i])
+        i += 1
+    return out
 
 
 def _merge_split_paragraphs(parts: list[str]) -> list[str]:
@@ -211,4 +259,105 @@ def _colocate_table_captions(parts: list[str]) -> list[str]:
             if idx in attached
             else part
         )
+    return out
+
+
+# A table note is a single line ("Molecule structures are shown in Fig. 3.") before
+# the superscript-marker lines; bounding the leading non-marker run to one keeps a
+# body paragraph an OCR mis-order may have stranded after a table from being
+# swallowed as a note.
+_MAX_TABLE_NOTE_LINES = 1
+# A footnote marker: a SHORT superscript ("<sup>a</sup>", "<sup>*</sup>").  Same
+# bound as classify's _SUP_MARKER_RE, but capturing the label so a trailing
+# footnote can be matched to the marker it annotates inside the table.
+_SUP_LABEL_RE = re.compile(r"<sup>([^<]{1,3})</sup>")
+_FOOTNOTE_SYMBOLS = frozenset("*†‡§¶#")
+
+
+def _is_footnote_label(label: str) -> bool:
+    """True for a footnote-style superscript label (letter or footnote symbol).
+
+    A purely numeric/sign superscript inside a table is an exponent or charge
+    ("cm²", "10⁻¹"), not a footnote referent, so it must not let a numbered
+    article footnote that follows the table be mistaken for the table's own.
+    """
+    return any(c.isalpha() or c in _FOOTNOTE_SYMBOLS for c in label)
+
+
+def _leading_sup_label(inner: str) -> str | None:
+    """The footnote-marker label a block opens with ("a" for ``<sup>a</sup>…``)."""
+    m = _SUP_LABEL_RE.match(inner)
+    return m.group(1).strip() if m else None
+
+
+def _table_sup_labels(table_html: str) -> set[str]:
+    """The footnote-style superscript labels a table carries (exponents excluded)."""
+    return {
+        label
+        for m in _SUP_LABEL_RE.finditer(table_html)
+        if _is_footnote_label(label := m.group(1).strip())
+    }
+
+
+def _as_table_footnote(part: str) -> str:
+    inner = _plain_p_text(part)
+    return f'<p class="footnote">{inner}</p>' if inner is not None else part
+
+
+def _colocate_table_footnotes(parts: list[str]) -> list[str]:
+    """Absorb a table's trailing footnote run into its ``<table>`` block.
+
+    Right after ``</table>`` the model emits the table's footnotes — superscript
+    marker lines (``<sup>a</sup> …``) and any short note sentence wedged between
+    the table and those markers — as free-standing paragraphs.  Folding them onto
+    the end of the table block keeps them rendering under their table, stops the
+    classifier from sweeping them into the article's footnote section, and lets
+    the cross-table paragraph merge skip the table (now a single float) to rejoin
+    prose split across it.
+
+    A marker line is only this table's footnote when its label is one the table
+    actually carries (``<sup>a</sup>`` inside a header/cell) — otherwise the
+    superscript line is an article footnote that merely follows the table, and is
+    left for the classifier to route to the footnote section.  A plain paragraph
+    is taken as a note only while it sits *before* the first marker; once the
+    markers end, the next paragraph is the body resuming.  A run with no matching
+    marker is not a footnote run and is left untouched.
+    """
+    n = len(parts)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        part = parts[i]
+        if not _TABLE_OPEN_RE.match(part):
+            out.append(part)
+            i += 1
+            continue
+        labels = _table_sup_labels(part)
+        run: list[str] = []
+        seen_marker = False
+        leading = 0
+        j = i + 1
+        while j < n:
+            inner = _plain_p_text(parts[j])
+            if inner is None:
+                break
+            marker = _leading_sup_label(inner)
+            if marker is not None:
+                if marker not in labels:
+                    break
+                run.append(parts[j])
+                seen_marker = True
+                j += 1
+                continue
+            if seen_marker or leading >= _MAX_TABLE_NOTE_LINES:
+                break
+            run.append(parts[j])
+            leading += 1
+            j += 1
+        if seen_marker:
+            out.append(part + "".join(_as_table_footnote(b) for b in run))
+            i = j
+        else:
+            out.append(part)
+            i += 1
     return out

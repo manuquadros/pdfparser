@@ -868,6 +868,50 @@ class TestCaptionMergeBarrier:
             "<p>This suggests that TRI and TRII compete for the substrate.</p>"
         ]
 
+    def test_function_word_with_trailing_comma_blocks_capital_continuation(
+        self,
+    ) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # "revealed that," is grammatically incomplete; a capitalised new
+        # sentence is not its continuation (here an OCR-misplaced figure caption),
+        # so the trailing comma must not disarm the capital-letter guard.
+        parts = [
+            "<p>analyses of 2-butanol production revealed that,</p>",
+            "<p>Molecule structures are shown in Fig. 3.</p>",
+        ]
+        assert _merge_split_paragraphs(parts) == parts
+
+    def test_function_word_with_trailing_comma_still_merges_lowercase(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # The genuine lowercase continuation of the same clause still joins.
+        parts = [
+            "<p>analyses of 2-butanol production revealed that,</p>",
+            "<p>with no additives present, all forms preferred re-face addition.</p>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        assert out == [
+            "<p>analyses of 2-butanol production revealed that, with no additives "
+            "present, all forms preferred re-face addition.</p>"
+        ]
+
+    def test_preposition_comma_does_not_block_proper_noun_continuation(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # The comma allowance is only for clause-introducers; after a preposition
+        # a trailing comma before a capitalised proper noun is a genuine
+        # continuation, so the merge must still join across the break.
+        parts = [
+            "<p>the epoxide-metabolising strains studied here consist of,</p>",
+            "<p>Xanthobacter autotrophicus and related species.</p>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        assert out == [
+            "<p>the epoxide-metabolising strains studied here consist of, "
+            "Xanthobacter autotrophicus and related species.</p>"
+        ]
+
     def test_metadata_line_not_merged_into_following_prose(self) -> None:
         # A self-contained footer-metadata line that ends without terminal
         # punctuation (here a ")") must not be treated as an incomplete paragraph
@@ -1034,6 +1078,64 @@ class TestTableCaptionColocation:
         ]
         assert _colocate_table_captions(parts) == parts
 
+    def test_bare_label_rejoined_then_folded(self) -> None:
+        from pdfparser.pipeline.merge import (
+            _colocate_table_captions,
+            _join_split_table_caption_labels,
+        )
+
+        # The reported bug: OCR split "TABLE I" from its title, stranding the
+        # title between label and table so the caption never folds.
+        parts = [
+            "<p>TABLE I</p>",
+            "<p>Selected substrates and inhibitors used to investigate.</p>",
+            "<table><tbody><tr><td>a</td></tr></tbody></table>",
+        ]
+        out = _colocate_table_captions(_join_split_table_caption_labels(parts))
+        assert out == [
+            "<table><caption>TABLE I Selected substrates and inhibitors "
+            "used to investigate.</caption><tbody><tr><td>a</td></tr></tbody></table>"
+        ]
+
+    def test_labelled_caption_not_rejoined(self) -> None:
+        from pdfparser.pipeline.merge import _join_split_table_caption_labels
+
+        # A label that already carries its title ("Table 4 X") is a complete
+        # caption; the following block is unrelated prose and must stay separate.
+        parts = [
+            "<p>Table 4 X</p>",
+            "<p>Unrelated body sentence.</p>",
+        ]
+        assert _join_split_table_caption_labels(parts) == parts
+
+    def test_bare_label_before_table_not_rejoined_with_table(self) -> None:
+        from pdfparser.pipeline.merge import _join_split_table_caption_labels
+
+        # A bare label sitting directly on its table needs no rejoin (the next
+        # block is the <table>, not a stray title paragraph).
+        parts = [
+            "<p>TABLE I</p>",
+            "<table><tbody><tr><td>a</td></tr></tbody></table>",
+        ]
+        assert _join_split_table_caption_labels(parts) == parts
+
+    def test_split_caption_lets_paragraph_merge_across_table(self) -> None:
+        # End-to-end: a paragraph split across a captioned table rejoins once the
+        # split caption is folded into the <table> (only the float remains between
+        # the two halves).
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Results\n\n"
+            "analyses of 2-butanol production revealed that,\n\n"
+            "TABLE I\n\n"
+            "Selected substrates and inhibitors used to investigate.\n\n"
+            "<table><tbody><tr><td>Km</td></tr></tbody></table>\n\n"
+            "with no additives present, all forms preferred a re-face addition."
+        )
+        body = _body(_run_lighton([md]))
+        assert "revealed that, with no additives present, all forms preferred" in body
+        assert "<caption>TABLE I Selected substrates" in body
+        assert "revealed that,</p>" not in body
+
     def test_end_to_end_caption_heads_table(self) -> None:
         # Full assembly: the fragment must not absorb the caption, and the
         # caption must end up inside its table, not before the figures.
@@ -1049,6 +1151,174 @@ class TestTableCaptionColocation:
         assert "to form <strong>TABLE 1</strong>" not in body
         # The caption no longer appears as a stand-alone paragraph.
         assert "<p><strong>TABLE 1</strong>" not in body
+
+
+class TestTableFootnoteColocation:
+    """A table's trailing footnote run — superscript-marker lines plus a note
+    sentence wedged before them — is folded onto the table block, not left adrift
+    or swept into the article footnote section."""
+
+    def test_marker_footnotes_folded_onto_table(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The table carries the a/b markers its footnotes annotate.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td><td>E<sup>b</sup></td></tr>"
+            "</tbody></table>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+            "<p><sup>b</sup>ND = not determined.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>K<sup>a</sup></td><td>E<sup>b</sup></td></tr>"
+            "</tbody></table>"
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>'
+            '<p class="footnote"><sup>b</sup>ND = not determined.</p>'
+        ]
+
+    def test_note_sentence_before_markers_folded(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The reported case: a note sentence sits between the table and its
+        # superscript footnotes, so it rides along into the table block.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p>Molecule structures are shown in Fig. 3.</p>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>"
+            '<p class="footnote">Molecule structures are shown in Fig. 3.</p>'
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>'
+        ]
+
+    def test_body_after_markers_stays_in_stream(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The body paragraph that resumes after the footnotes is not absorbed.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+            "<p>with no additives present, all forms preferred re-face.</p>",
+        ]
+        out = _colocate_table_footnotes(parts)
+        assert out == [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>"
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>',
+            "<p>with no additives present, all forms preferred re-face.</p>",
+        ]
+
+    def test_article_footnote_marker_not_in_table_not_absorbed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # The hardening: a superscript line whose label the table does NOT carry
+        # is an article footnote that merely follows the table, not a table
+        # footnote, so it is left for the classifier to route before references.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p><sup>*</sup>Corresponding author: a@b.com.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_numeric_marker_matching_table_exponent_not_absorbed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A numbered article footnote whose digit collides with a table exponent
+        # ("cm<sup>2</sup>") must not be folded — exponents are not footnote
+        # referents, so the numeric label does not qualify as a table marker.
+        parts = [
+            "<table><tbody><tr><td>area cm<sup>2</sup></td></tr></tbody></table>",
+            "<p><sup>2</sup>A numbered article footnote.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_letter_marker_folded_despite_table_exponents(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A letter footnote still folds when the table mixes exponents and an
+        # 'a' referent; the exponent does not interfere.
+        parts = [
+            "<table><tbody><tr><td>cm<sup>2</sup></td><td>K<sup>a</sup></td></tr>"
+            "</tbody></table>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == [
+            "<table><tbody><tr><td>cm<sup>2</sup></td><td>K<sup>a</sup></td></tr>"
+            "</tbody></table>"
+            '<p class="footnote"><sup>a</sup>Apparent K values.</p>'
+        ]
+
+    def test_note_before_unmatched_marker_not_absorbed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A leading note rides along only when matching markers follow; an
+        # unmatched marker abandons the run, so the note stays in the stream.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p>A note sentence.</p>",
+            "<p><sup>*</sup>An article footnote.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_note_without_markers_not_absorbed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A plain paragraph after a table with no footnote markers is body, not a
+        # note, and is left untouched.
+        parts = [
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+            "<p>This paragraph continues the discussion.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_runaway_leading_prose_not_swallowed(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # More than a note's worth of prose before any marker is body, so the
+        # run is abandoned and nothing is folded — even though the table carries
+        # the late marker's label.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p>First body paragraph.</p>",
+            "<p>Second body paragraph.</p>",
+            "<p>Third body paragraph.</p>",
+            "<p><sup>a</sup>A late marker.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_second_leading_line_exceeds_note_cap(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_footnotes
+
+        # A table note is a single line; two non-marker lines before the marker
+        # exceed the cap, so the run is abandoned rather than swallowing a second
+        # (possibly body) line.
+        parts = [
+            "<table><tbody><tr><td>K<sup>a</sup></td></tr></tbody></table>",
+            "<p>First note line.</p>",
+            "<p>Second note line.</p>",
+            "<p><sup>a</sup>Apparent K values.</p>",
+        ]
+        assert _colocate_table_footnotes(parts) == parts
+
+    def test_end_to_end_table_footnotes_unblock_merge(self) -> None:
+        # Full assembly: the table footnotes (a note sentence + marker lines) fold
+        # into the table, so the paragraph split across the table rejoins and the
+        # footnotes are not relocated to the article footnote section.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Results\n\n"
+            "analyses of 2-butanol production revealed that,\n\n"
+            "<table><tbody><tr><td>Km<sup>a</sup></td><td>E<sup>b</sup></td></tr>"
+            "</tbody></table>\n\n"
+            "Molecule structures are shown in Fig. 3.\n\n"
+            "<sup>a</sup>Apparent K values.\n\n"
+            "<sup>b</sup>ND = not determined.\n\n"
+            "with no additives present, all forms preferred a re-face addition."
+        )
+        body = _body(_run_lighton([md]))
+        assert "revealed that, with no additives present, all forms preferred" in body
+        # The footnotes ride with the table inside the body, not before references.
+        note = '<p class="footnote">Molecule structures are shown in Fig. 3.</p>'
+        assert note in body
+        assert '<p class="footnote"><sup>a</sup>Apparent K values.</p>' in body
 
 
 class TestLatexToHtml:
@@ -1380,6 +1650,36 @@ class TestPipeline:
         # Pulling the orphan lines out before the (cross-page) paragraph-merge stops
         # them from chaining into the page-2 prose the OCR placed after them.
         assert "Herein, I propose" in body
+
+    def test_figure_caption_not_glued_to_following_paragraph(
+        self, article_html: str
+    ) -> None:
+        # The Fig. 1 caption ends in a period *inside* a closing </em>; the body
+        # paragraph that follows ("Herein, I propose …") must not be absorbed onto
+        # the caption (the sentence-end test runs on visible text, not raw HTML).
+        body = _body(article_html)
+        assert "oxidoreductase/carboxylase.</em> Herein, I propose" not in body
+        assert "carboxylase.</em></p>" in body
+
+    def test_paragraph_rejoined_across_table_i(self, article_html: str) -> None:
+        # The clause "…revealed that," / "with no additives present…" is split by
+        # TABLE I (its caption and footnotes folded in); it must read as one
+        # paragraph, not be left split or glued to the stray Fig. 3 note sentence.
+        body = _body(article_html)
+        assert "revealed that, with no additives present, all forms of rR-HPCDH" in body
+        assert "revealed that,</p>" not in body
+        assert "revealed that, Molecule structures" not in body
+
+    def test_table_footnotes_ride_with_their_table(self, article_html: str) -> None:
+        # TABLE I's footnote run — the "Molecule structures … Fig. 3." note plus
+        # the <sup>-marked footnotes — is folded onto the table block, so it
+        # renders under the table rather than being swept into the article
+        # footnote section before the references.
+        body = _body(article_html)
+        note = '<p class="footnote">Molecule structures are shown in Fig. 3.</p>'
+        assert note in body
+        # The note sits immediately after a </table>, not adrift in the prose.
+        assert '</table><p class="footnote">Molecule structures' in body
 
 
 @pytest.fixture(scope="session")

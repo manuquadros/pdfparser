@@ -39,6 +39,8 @@ from pdfparser.pipeline.latex import _inline_md_to_html, _latex_to_html
 from pdfparser.pipeline.markdown import _md_to_html_blocks
 from pdfparser.pipeline.merge import (
     _colocate_table_captions,
+    _colocate_table_footnotes,
+    _join_split_table_caption_labels,
     _merge_split_paragraphs_stable,
 )
 from pdfparser.pipeline.model import OcrModel, _ocr_page, load_ocr_model
@@ -284,7 +286,12 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
         stray_metadata, per_page_parts[0] = _extract_stray_metadata(per_page_parts[0])
 
     parts = [part for page in per_page_parts for part in page]
+    parts = _join_split_table_caption_labels(parts)
     parts = _colocate_table_captions(parts)
+    # Before classify so a table's footnotes stay with it rather than being swept
+    # into the article footnote section, and before merge so the table is a
+    # single float the cross-table paragraph merge can step over.
+    parts = _colocate_table_footnotes(parts)
 
     meta = _classify_parts(parts)
 
