@@ -153,10 +153,14 @@ _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
 _FURNITURE_MAX_LEN = 120
 _DIGITS_RE = re.compile(r"\d+")
 # A footer/header is identified by its digit-stripped text recurring across
-# pages ("… 601" / "… 602" share a key).  Require that text to be substantial so
-# stripping the digits can't collapse short enumerated labels ("Fig 1" / "Fig 2",
-# "Step 1" / "Step 2") into one key and delete them as furniture.
+# pages ("… 601" / "… 602" share a key).  When the line carries digits, require
+# that text to be substantial so stripping them can't collapse short enumerated
+# labels ("Fig 1" / "Fig 2", "Step 1" / "Step 2") into one key and delete them as
+# furniture.  A digit-free line can't suffer that collision — its key is the
+# verbatim text — so a recurring short one (an author-surname running foot,
+# "Clark") only needs to clear a small floor that rules out a stray initial.
 _MIN_FURNITURE_KEY_LEN = 12
+_MIN_DIGIT_FREE_FURNITURE_KEY_LEN = 3
 # A folio is a block whose entire visible text is a bare number.  Bounded length
 # keeps it to plausible page numbers and away from longer numeric data.
 _PAGE_NUMBER_RE = re.compile(r"\d{1,4}")
@@ -208,7 +212,12 @@ def _is_furniture_candidate(part: str) -> str | None:
     if len(plain) > _FURNITURE_MAX_LEN or _SENTENCE_END_RE.search(plain.rstrip()):
         return None
     key = _furniture_key(inner)
-    return key if len(key) >= _MIN_FURNITURE_KEY_LEN else None
+    min_len = (
+        _MIN_FURNITURE_KEY_LEN
+        if _DIGITS_RE.search(plain)
+        else _MIN_DIGIT_FREE_FURNITURE_KEY_LEN
+    )
+    return key if len(key) >= min_len else None
 
 
 def _is_standalone_page_number(part: str) -> bool:

@@ -116,6 +116,19 @@ class TestRunningFurniture:
         parts = ["<p>Fig 1</p>", "<p>body</p>", "<p>Fig 2</p>"]
         assert _strip_running_furniture(parts) == parts
 
+    def test_short_digit_free_footer_removed(self) -> None:
+        # A bare author-surname running foot ("Clark" on alternating pages) is
+        # short but digit-free, so the digit-strip collision the length floor
+        # guards against can't happen — it must still be recognised as furniture.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = [
+            "<p>Clark</p>",
+            "<p>Real body sentence one.</p>",
+            "<p>Clark</p>",
+        ]
+        assert _strip_running_furniture(parts) == ["<p>Real body sentence one.</p>"]
+
     def test_heading_form_footer_removed(self) -> None:
         # OCR transcribes the running journal line as a heading on a sparse page
         # (last page / after references); it must still count as furniture and be
