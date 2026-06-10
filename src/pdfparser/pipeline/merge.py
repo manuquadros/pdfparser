@@ -72,8 +72,13 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
         inner = _plain_p_text(part)
         if inner is not None:
             stripped = inner.rstrip()
+            # Terminal punctuation can sit *inside* a closing inline tag
+            # ("…carboxylase.</em>"), so the sentence-end test must run on the
+            # visible text — matching the raw HTML would miss the period behind
+            # the tag and wrongly treat a finished caption as a fragment.
+            visible = _visible_text(stripped).rstrip()
             if (
-                not _SENTENCE_END_RE.search(stripped)
+                not _SENTENCE_END_RE.search(visible)
                 and not _BOLD_LABEL_RE.match(inner)
                 and not _opens_with_caption_label(inner)
                 # A self-contained metadata footer (DOI / "Published online …" /
@@ -99,7 +104,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and not _BOLD_LABEL_RE.match(cont)
                         and not _opens_with_caption_label(cont)
                         and not (
-                            _FUNCTION_WORD_END_RE.search(stripped)
+                            _FUNCTION_WORD_END_RE.search(visible)
                             and cont[:1].isupper()
                             and not _ACRONYM_HEAD_RE.match(cont)
                         )
