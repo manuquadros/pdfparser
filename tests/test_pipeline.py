@@ -1279,7 +1279,22 @@ class TestParseFigurePlaceholder:
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
-_SPIKE_HTML = Path(__file__).parent.parent / "spike_results" / "lighton_full.html"
+_OUTPUT_DIR = Path(__file__).parent.parent / "spike_results"
+
+
+def _run_pipeline_to_file(pdf: Path, ocr: object) -> str:
+    """Run the full pipeline on ``pdf`` and save the HTML for visual inspection.
+
+    The output lands at ``spike_results/<pdf-stem>.html`` so every integration
+    run leaves an on-disk copy of each fixture's rendering to open in a browser.
+    """
+    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
+
+    assert isinstance(ocr, OcrModel)
+    html = lightonocr_pdf_to_html(pdf, ocr=ocr)
+    _OUTPUT_DIR.mkdir(exist_ok=True)
+    (_OUTPUT_DIR / f"{pdf.stem}.html").write_text(html, encoding="utf-8")
+    return html
 
 
 @pytest.fixture(scope="session")
@@ -1297,17 +1312,12 @@ def ocr_model() -> object:
 def article_html(ocr_model: object) -> str:
     """Run the full pipeline on the no-ad fixture; skip if the model is absent.
 
-    Writes the result back to spike_results/lighton_full.html so the file
-    stays current after each integration run.
+    Writes the result to spike_results/30592559.html so the file stays current
+    after each integration run.
     """
     if not _FIXTURE_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_FIXTURE_PDF}")
-    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
-
-    assert isinstance(ocr_model, OcrModel)
-    html = lightonocr_pdf_to_html(_FIXTURE_PDF, ocr=ocr_model)
-    _SPIKE_HTML.write_text(html, encoding="utf-8")
-    return html
+    return _run_pipeline_to_file(_FIXTURE_PDF, ocr_model)
 
 
 def _header_h1(html: str) -> str:
@@ -1322,7 +1332,7 @@ class TestPipeline:
     """Integration tests: run the full LightOnOCR pipeline on the fixture PDF.
 
     Skipped when the model is not available (no GPU, weights not downloaded).
-    Each run also refreshes spike_results/lighton_full.html.
+    Each run also refreshes spike_results/30592559.html.
     """
 
     def test_abstract_no_column_break(self, article_html: str) -> None:
@@ -1374,13 +1384,13 @@ class TestPipeline:
 
 @pytest.fixture(scope="session")
 def ad_prefix_html(ocr_model: object) -> str:
-    """Full pipeline output for the ad-prefixed 31051047.pdf fixture."""
+    """Full pipeline output for the ad-prefixed 31051047.pdf fixture.
+
+    Writes the result to spike_results/31051047.html for visual inspection.
+    """
     if not _AD_PREFIX_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
-    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
-
-    assert isinstance(ocr_model, OcrModel)
-    return lightonocr_pdf_to_html(_AD_PREFIX_PDF, ocr=ocr_model)
+    return _run_pipeline_to_file(_AD_PREFIX_PDF, ocr_model)
 
 
 @pytest.mark.integration
