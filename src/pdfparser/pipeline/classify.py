@@ -68,6 +68,32 @@ _FRONTMATTER_TEXT_RE = re.compile(
     r"(?:address\s+for\s+)?correspond(?:ence|ing\s+author))\b",
     re.IGNORECASE,
 )
+# An affiliation names an institution: a department, university, institute,
+# laboratory, college, hospital, faculty, academy or school.  Stems
+# ("universit", "institut", "laborator") cover the common international spellings
+# (University/Université/Universität, Institute/Institut/Instituto).
+_AFFILIATION_RE = re.compile(
+    r"\b(?:department|universit\w*|institut\w*|laborator\w*|college|hospital|"
+    r"faculty|academy|polytechnic|school\s+of)\b",
+    re.IGNORECASE,
+)
+# An affiliation OCR'd without its author's superscript marker (J. Biol. Chem.'s
+# "From the Department of …, City, Region, postcode") is recognised structurally:
+# it names an institution, is laid out as a comma-separated address ending in a
+# postal code, and — being a noun phrase, not a sentence — carries no terminal
+# punctuation.  The postal-code tail is the load-bearing signal: "no terminal
+# punctuation" on its own also matches an OCR-truncated prose clause that happens
+# to name a university ("… with the Department of Biology, the School of Medicine,
+# and several partner hospitals across the region"), but such a clause does not
+# end in a postcode.  The trade is deliberately safe — an address without a
+# postcode is left visible rather than risk hiding prose.
+_AFFILIATION_MIN_COMMAS = 2
+_AFFILIATION_MAX_LEN = 300
+# A postal code closing the address: a 4–6 digit run (US ZIP and most national
+# codes).  Searched only in the trailing comma-segments so a number earlier in a
+# prose clause ("enrolled 250 patients …") cannot stand in for the address tail.
+_POSTAL_TAIL_RE = re.compile(r"\b\d{4,6}\b")
+_AFFILIATION_TAIL_SEGMENTS = 2
 # A token only metadata carries: an e-mail, a DOI/URL, a submission date, or a
 # phone/fax label.  Its presence separates a genuine multi-clause metadata line
 # ("Received … DOI: …", "Address for correspondence: … e-mail: …") from a body
@@ -313,6 +339,36 @@ def _is_metadata_heading(part: str) -> bool:
     return title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
 
 
+def _is_named_metadata_heading(part: str) -> bool:
+    """A heading naming a front-matter section ("Abbreviations", "Nomenclature",
+    "Keywords") — the subset of metadata headings that can be located by name,
+    excluding the document-type labels."""
+    heading = _heading_inner(part)
+    if heading is None:
+        return False
+    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+    return title in _FRONTMATTER_HEADING_LABELS
+
+
+def _is_affiliation_line(plain: str) -> bool:
+    """A bare affiliation address that lost its author's superscript marker.
+
+    Identified structurally (institution name + comma-separated address layout
+    closing on a postal code + no terminal punctuation) so it is recognised
+    without a leading ``¹``/``*``, which ``_LEADING_SUP_RE`` already handles."""
+    if (
+        len(plain) > _AFFILIATION_MAX_LEN
+        or plain.count(",") < _AFFILIATION_MIN_COMMAS
+        or _SENTENCE_END_RE.search(plain)
+        or not _AFFILIATION_RE.search(plain)
+    ):
+        return False
+    tail = ",".join(
+        plain.rsplit(",", _AFFILIATION_TAIL_SEGMENTS)[-_AFFILIATION_TAIL_SEGMENTS:]
+    )
+    return bool(_POSTAL_TAIL_RE.search(tail))
+
+
 def _is_frontmatter_text(part: str, *, strict: bool = True) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
@@ -321,6 +377,8 @@ def _is_frontmatter_text(part: str, *, strict: bool = True) -> bool:
         return True
     plain = _visible_text(inner).lstrip()
     if _LEADING_SUP_RE.match(plain):
+        return True
+    if _is_affiliation_line(plain):
         return True
     if not _FRONTMATTER_TEXT_RE.match(plain):
         return False
@@ -407,3 +465,39 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
     if n >= len(body):
         return [], body
     return body[:n], body[n:]
+
+
+def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[str]]:
+    """Pull glossary-style metadata sections out of a single page's block stream,
+    wherever they sit — returns ``(metadata, rest)``.
+
+    OCR often places an "Abbreviations"/"Nomenclature" section *after* the
+    article's opening prose rather than in the leading front matter, so
+    ``_extract_front_matter`` (which only scans the leading run) never reaches it.
+    The caller scopes this to the article's first page, so a same-named section
+    deeper in the document (e.g. a back-matter "Nomenclature") stays in place.
+
+    A matched heading owns only the contiguous run of positively-recognised
+    metadata blocks that follow it — a ";"-separated list or a labelled metadata
+    line — stopping at the first heading, figure, list, table or body paragraph,
+    so real content the OCR misfiled under the heading is not hidden.  A heading
+    with no such content is left in the body, as it is probably a real section
+    title rather than a glossary."""
+    metadata: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if _is_named_metadata_heading(part):
+            j = i + 1
+            while j < len(parts) and (
+                _is_frontmatter_text(parts[j], strict=False) or _is_list_like(parts[j])
+            ):
+                j += 1
+            if j > i + 1:
+                metadata.extend(parts[i:j])
+                i = j
+                continue
+        rest.append(part)
+        i += 1
+    return metadata, rest

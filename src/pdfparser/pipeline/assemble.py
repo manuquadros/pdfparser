@@ -21,6 +21,7 @@ from pdfparser.pipeline.classify import (
     _REF_SECTION_RE,
     _classify_parts,
     _extract_front_matter,
+    _extract_named_metadata_sections,
     _leading_pages_to_skip_md,
     _strip_running_furniture,
 )
@@ -264,9 +265,20 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     pages_md = pages_md[start:]
     images = images[start:]
 
-    parts: list[str] = []
-    for md, img in zip(pages_md, images, strict=True):
-        parts.extend(_page_to_html_parts(md, img))
+    per_page_parts = [
+        _page_to_html_parts(md, img) for md, img in zip(pages_md, images, strict=True)
+    ]
+    # A glossary-style metadata section (Abbreviations / Nomenclature) is often
+    # OCR'd mid-body on the article's first page, past the reach of the leading-run
+    # front-matter scan.  Pull it here, scoped to that first page so a same-named
+    # back-matter section is left in place.
+    named_metadata: list[str] = []
+    if per_page_parts:
+        named_metadata, per_page_parts[0] = _extract_named_metadata_sections(
+            per_page_parts[0]
+        )
+
+    parts = [part for page in per_page_parts for part in page]
     parts = _colocate_table_captions(parts)
 
     meta = _classify_parts(parts)
@@ -274,7 +286,8 @@ def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
     abstract = _merge_split_paragraphs_stable(meta.abstract)
     body = _merge_split_paragraphs_stable(_strip_running_furniture(meta.body))
     body = _insert_footnotes_before_refs(body, meta.footnotes)
-    metadata, body = _extract_front_matter(body)
+    leading_metadata, body = _extract_front_matter(body)
+    metadata = leading_metadata + named_metadata
 
     return _document_shell(
         title_html=meta.title_html or "Untitled",

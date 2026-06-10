@@ -427,6 +427,139 @@ class TestLightonAssembly:
         assert "Published reports indicate" in _body(html)
         assert "Published reports indicate" not in _metadata(html)
 
+    def test_midbody_abbreviations_section_pulled_into_panel(self) -> None:
+        # OCR places the Abbreviations section *after* the Introduction prose on
+        # the first page, out of the leading front-matter run.  Its heading and
+        # ";"-separated glossary are pulled into the panel; the misfiled body
+        # content that follows (a learning-objectives list, the next section) is
+        # left visible.
+        md = (
+            "# A Study\n\n## Abstract\n\nThe abstract.\n\n"
+            "## Introduction\n\nThe study begins here with ordinary prose.\n\n"
+            "## Abbreviations\n\n"
+            "2-HEC, 2-(2-hydroxyethylthio)ethanesulfonate; CoM, coenzyme M; "
+            "EE, enantiomeric excess; HPC, hydroxypropyl thioether.\n\n"
+            "1. Students improve their appreciation for kinetic data.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        assert "<h2>Abbreviations</h2>" in meta
+        assert "2-HEC, 2-(2-hydroxyethylthio)ethanesulfonate" in meta
+        assert "2-HEC, 2-(2-hydroxyethylthio)ethanesulfonate" not in body
+        # The Introduction prose and the misfiled learning-objective stay visible.
+        assert "The study begins here" in body
+        assert "Students improve their appreciation" in body
+        assert "<h2>Methods</h2>" in body
+
+    def test_midbody_named_metadata_scoped_to_first_page(self) -> None:
+        # A same-named section deeper in the document (here on a later page, e.g. a
+        # back-matter glossary) is left in the body — only the first article page
+        # is scanned for misplaced metadata sections.
+        page1 = "# A Study\n\n## Abstract\n\nThe abstract.\n\n## Introduction\n\nProse."
+        page2 = (
+            "## Nomenclature\n\n"
+            "F, force in newtons; m, mass in kilograms; a, acceleration.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        body = _body(_run_lighton([page1, page2]))
+        assert "<h2>Nomenclature</h2>" in body
+        assert "F, force in newtons" in body
+
+    def test_midbody_bare_named_heading_stays_in_body(self) -> None:
+        # A "Nomenclature" heading that opens a real prose section (no glossary
+        # content under it) is a section title, not front matter: leave it visible.
+        md = (
+            "# A Study\n\n## Abstract\n\nThe abstract.\n\n"
+            "## Introduction\n\nProse opening the article body.\n\n"
+            "## Nomenclature\n\n"
+            "This section explains the naming conventions used throughout the "
+            "paper in ordinary prose that reads as a real section.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        body = _body(_run_lighton([md]))
+        assert "<h2>Nomenclature</h2>" in body
+        assert "This section explains the naming conventions" in body
+
+    def test_bare_affiliation_line_pulled_into_panel(self) -> None:
+        # An author+affiliation line OCR'd between the title and the abstract,
+        # without its author's superscript marker ("Name From the Department …,
+        # City, Region, postcode"), is recognised structurally and pulled into the
+        # panel, so it no longer breaks the leading run and strands the keywords.
+        md = (
+            "# A Study\n\n"
+            "Daniel D. Clark From the Department of Chemistry and Biochemistry, "
+            "California State University-Chico, Chico, California, 95929\n\n"
+            "## Abstract\n\nThe abstract.\n\n"
+            "**Keywords:** enzymology; enzyme kinetics; dehydrogenase\n\n"
+            "## Introduction\n\nThe study begins here with ordinary prose.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in ("From the Department of Chemistry", "Keywords:"):
+            assert fragment in meta
+            assert fragment not in body
+        assert "The study begins here" in body
+        assert "<h2>Introduction</h2>" in body
+
+    def test_body_sentence_mentioning_university_not_hidden(self) -> None:
+        # The affiliation detector must not hide a body sentence that merely names
+        # an institution: a terminal period marks it as prose, not an address.
+        md = (
+            "# A Study\n\n"
+            "The work was carried out with the University of Example, the "
+            "Department of Chemistry, and several partners.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        body = _body(_run_lighton([md]))
+        assert "The work was carried out with the University of Example" in body
+
+    def test_truncated_body_fragment_with_institution_not_hidden(self) -> None:
+        # An OCR-truncated prose clause that names institutions and lacks terminal
+        # punctuation must stay visible: without a postal-code tail it is not an
+        # address.  (Guards against the false positive the no-punctuation rule
+        # alone allowed.)
+        md = (
+            "# A Study\n\n"
+            "In this work, conducted jointly with the Department of Biology, the "
+            "School of Medicine, and several partner hospitals across the region\n\n"
+            "## Methods\n\nMethod text."
+        )
+        body = _body(_run_lighton([md]))
+        assert "In this work, conducted jointly" in body
+
+    def test_affiliation_line_predicate(self) -> None:
+        from pdfparser.pipeline.classify import _is_affiliation_line
+
+        assert _is_affiliation_line(
+            "Daniel D. Clark From the Department of Chemistry and Biochemistry, "
+            "California State University-Chico, Chico, California, 95929"
+        )
+        # A terminal period marks prose, not an address.
+        assert not _is_affiliation_line(
+            "The work was done at the University of Example, City, Region."
+        )
+        # No institution keyword.
+        assert not _is_affiliation_line("Jane Doe, John Smith, and Mary Major")
+        # Too few comma-separated segments to be an address layout.
+        assert not _is_affiliation_line("Department of Chemistry")
+        # An institution-naming prose clause with no postal-code tail is not an
+        # address, even without terminal punctuation.
+        assert not _is_affiliation_line(
+            "In this work, conducted jointly with the Department of Biology, the "
+            "School of Medicine, and several partner hospitals across the region"
+        )
+        # A number earlier in the line cannot stand in for the address tail.
+        assert not _is_affiliation_line(
+            "enrolled 250 patients from the Department of Cardiology, the ICU, "
+            "and two partner clinics"
+        )
+        # The deliberate trade: an address with no postal code is left visible.
+        assert not _is_affiliation_line(
+            "Department of Chemistry, University of Oxford, Oxford, United Kingdom"
+        )
+
     def test_all_frontmatter_body_kept_visible(self) -> None:
         # If every body block looks like front matter, that signals misdetection,
         # not a metadata-only doc: keep it visible rather than emptying the body.
