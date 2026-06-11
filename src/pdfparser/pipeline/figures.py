@@ -3,6 +3,16 @@ crop from the rendered page, merge over-segmented boxes, and emit ``<figure>``.
 
 Pure image-processing, no GPU.  All boxes are LightOnOCR's ``[0, 1000]``-normalized
 ``x0,y0,x1,y1`` until ``_denormalize_bbox`` scales them to page pixels.
+
+Design bias: a clipped figure loses image the reader never recovers, while a crop
+that runs into surrounding margin is merely cosmetic, so when the model's box and
+the real figure disagree this module leans toward **including too much rather than
+too little** — it grows a clipped box down to the figure's true bottom
+(``_extend_bottom_to_content``) and unions over-segmented stacked boxes back into
+one (``_cluster_figure_boxes``).  The one check on that bias is ambiguity: growth
+stops (rather than guessing) when the figure's end isn't marked by a clear
+whitespace gap, so a correct box is never extended blindly into caption or body
+text.  See the "Figures" section of the design notes.
 """
 
 from __future__ import annotations
