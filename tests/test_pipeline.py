@@ -737,9 +737,11 @@ class TestLightonAssembly:
             "enrolled 250 patients from the Department of Cardiology, the ICU, "
             "and two partner clinics"
         )
-        # An address that *opens* with the institution name is an affiliation even
-        # with no postal code — international addresses often close on a country,
-        # not a code (the head-anchored cue distinguishes it from the prose above).
+        # An address that *opens* with the institution name and *closes* on a place
+        # name is an affiliation even with no postal code — international addresses
+        # often end on a country, not a code.  Both ends are load-bearing: the prose
+        # clauses above open with the keyword too but run on into lowercase words
+        # instead of closing on a city/country, so they stay in the body.
         assert _is_affiliation_line(
             "Department of Chemistry, University of Oxford, Oxford, United Kingdom"
         )
@@ -747,6 +749,44 @@ class TestLightonAssembly:
             "Department of Biomedical Science and Center for Bio-Nanomaterials, "
             "Daegu University, Gyeongsan, South Korea"
         )
+        # International laboratory spellings (laboratoire/laboratorio) share the
+        # stem, so the head cue fires for them as well.
+        assert _is_affiliation_line(
+            "Laboratoire de Biologie Moléculaire, Université de Paris, Paris, France"
+        )
+        assert _is_affiliation_line(
+            "Laboratorio de Química, Universidad de Madrid, Madrid, Spain"
+        )
+        # A lowercase connector inside the closing place name ("Republic of Korea")
+        # is allowed; the tail must only *open* on a capital.
+        assert _is_affiliation_line(
+            "Institute of Microbiology, Korea University, Seoul, Republic of Korea"
+        )
+        # Opening with the keyword is not enough when the line runs on into a
+        # lowercase clause instead of closing on a place — kept visible in the body.
+        assert not _is_affiliation_line(
+            "University researchers, clinicians, and administrators worked across "
+            "the region and beyond"
+        )
+        # The country/region tail is the language-independent signal: it fires even
+        # when the institution word is in a language no stem covers (German "Labor"/
+        # "Fakultät", Czech "Ústav"/"Katedra"), so these are recognised too.
+        assert _is_affiliation_line(
+            "Labor für Mikrobiologie, Klinikum der Universität, Berlin, Germany"
+        )
+        assert _is_affiliation_line("Fakultät für Chemie, Wien, Österreich")
+        assert _is_affiliation_line(
+            "Ústav organické chemie, Univerzita Karlova, Praha, Czech Republic"
+        )
+        assert _is_affiliation_line("Katedra biologie, Praha, Česko")
+        # An uppercase country tail ("…, SWEDEN") still matches (OCR casing varies).
+        assert _is_affiliation_line(
+            "Department of Chemistry, Luleå University of Technology, SWEDEN"
+        )
+        # A prose clause that merely *mentions* countries but does not *close* on a
+        # bare country name (the final segment is "and Spain", not "Spain") stays
+        # in the body.
+        assert not _is_affiliation_line("We ran trials in France, Germany, and Spain")
 
     def test_all_frontmatter_body_kept_visible(self) -> None:
         # If every body block looks like front matter, that signals misdetection,

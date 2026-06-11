@@ -70,25 +70,188 @@ _FRONTMATTER_TEXT_RE = re.compile(
 )
 # An affiliation names an institution: a department, university, institute,
 # laboratory, college, hospital, faculty, academy or school.  Stems
-# ("universit", "institut", "laborator") cover the common international spellings
-# (University/Université/Universität, Institute/Institut/Instituto).
+# ("universit", "institut", "laborato") cover the common international spellings
+# (University/Université/Universität, Institute/Institut/Instituto,
+# Laboratory/Laboratoire/Laboratorio).
 _AFFILIATION_RE = re.compile(
-    r"\b(?:department|universit\w*|institut\w*|laborator\w*|college|hospital|"
+    r"\b(?:department|universit\w*|institut\w*|laborato\w*|college|hospital|"
     r"faculty|academy|polytechnic|school\s+of)\b",
     re.IGNORECASE,
 )
-# The same institution stems anchored at the line *start*: an address that opens
-# with the institution name ("Department of …, City, Country") is an affiliation
-# even without a postal-code tail — international addresses often close on a
-# country name, not a code.  Opening with the keyword (not merely containing it)
-# is what separates this from an OCR-truncated prose clause that names a
-# university mid-sentence, which the postal-code tail otherwise guards against.
+# The same institution stems (mirroring _AFFILIATION_RE) anchored at the line
+# *start*, so a no-postcode international address ("Department of …, City,
+# Country") is still recognised.  Anchored, and paired with a place-like tail
+# (see _has_place_like_tail): each relaxation alone would also match an
+# OCR-truncated prose clause that merely names an institution.
 _AFFILIATION_HEAD_RE = re.compile(
     r"^(?:the\s+)?(?:department|centers?\s+for|centres?\s+for|universit\w*|"
-    r"institut\w*|laborator(?:y|ies)|college|faculty|academy|polytechnic|"
+    r"institut\w*|laborato\w*|college|hospital|faculty|academy|polytechnic|"
     r"school\s+of|division\s+of)\b",
     re.IGNORECASE,
 )
+# A place tail must *open* on a capital (a lowercase connector like "of" may
+# follow): that is what rejects a list/clause continuation ("… and two partner
+# clinics") while accepting "South Korea" / "Republic of Korea".
+_PLACE_TAIL_MAX_WORDS = 4
+_PLACE_TAIL_CONNECTORS = frozenset({"of"})
+# An address almost always closes on a country/region — so a country tail
+# recognises the affiliation regardless of the *institution* word's language
+# (German "Labor", Czech "Ústav", …), which no stem lexicon covers.  This
+# language-independent path backstops the stem-based ones below; either signal
+# alone marks the line an affiliation.  Bare "us"/"uk" are omitted as too
+# ambiguous a closing token.
+_AFFILIATION_COUNTRIES = frozenset(
+    {
+        "afghanistan",
+        "albania",
+        "algeria",
+        "argentina",
+        "armenia",
+        "australia",
+        "austria",
+        "österreich",
+        "azerbaijan",
+        "bahrain",
+        "bangladesh",
+        "belarus",
+        "belgium",
+        "belgië",
+        "belgique",
+        "bolivia",
+        "bosnia and herzegovina",
+        "brazil",
+        "brasil",
+        "bulgaria",
+        "cambodia",
+        "cameroon",
+        "canada",
+        "chile",
+        "china",
+        "pr china",
+        "p.r. china",
+        "people's republic of china",
+        "colombia",
+        "costa rica",
+        "croatia",
+        "hrvatska",
+        "cuba",
+        "cyprus",
+        "czech republic",
+        "czechia",
+        "česká republika",
+        "česko",
+        "denmark",
+        "danmark",
+        "ecuador",
+        "egypt",
+        "estonia",
+        "ethiopia",
+        "finland",
+        "suomi",
+        "france",
+        "georgia",
+        "germany",
+        "deutschland",
+        "ghana",
+        "greece",
+        "hungary",
+        "magyarország",
+        "iceland",
+        "india",
+        "indonesia",
+        "iran",
+        "iraq",
+        "ireland",
+        "israel",
+        "italy",
+        "italia",
+        "japan",
+        "jordan",
+        "kazakhstan",
+        "kenya",
+        "korea",
+        "south korea",
+        "north korea",
+        "republic of korea",
+        "kuwait",
+        "latvia",
+        "lebanon",
+        "lithuania",
+        "luxembourg",
+        "malaysia",
+        "malta",
+        "mexico",
+        "méxico",
+        "moldova",
+        "mongolia",
+        "montenegro",
+        "morocco",
+        "myanmar",
+        "nepal",
+        "netherlands",
+        "the netherlands",
+        "nederland",
+        "new zealand",
+        "nigeria",
+        "norway",
+        "norge",
+        "oman",
+        "pakistan",
+        "palestine",
+        "panama",
+        "peru",
+        "philippines",
+        "poland",
+        "polska",
+        "portugal",
+        "qatar",
+        "romania",
+        "russia",
+        "russian federation",
+        "saudi arabia",
+        "serbia",
+        "singapore",
+        "slovakia",
+        "slovensko",
+        "slovenia",
+        "south africa",
+        "spain",
+        "españa",
+        "sri lanka",
+        "sudan",
+        "sweden",
+        "sverige",
+        "switzerland",
+        "schweiz",
+        "suisse",
+        "svizzera",
+        "syria",
+        "taiwan",
+        "tanzania",
+        "thailand",
+        "tunisia",
+        "turkey",
+        "türkiye",
+        "uganda",
+        "ukraine",
+        "united arab emirates",
+        "uae",
+        "united kingdom",
+        "u.k.",
+        "united states",
+        "united states of america",
+        "usa",
+        "u.s.a.",
+        "uruguay",
+        "uzbekistan",
+        "venezuela",
+        "vietnam",
+        "viet nam",
+        "yemen",
+        "zimbabwe",
+    }
+)
+_POSTAL_DIGITS_RE = re.compile(r"\b\d[\d-]*\b")
 # An affiliation OCR'd without its author's superscript marker (J. Biol. Chem.'s
 # "From the Department of …, City, Region, postcode") is recognised structurally:
 # it names an institution, is laid out as a comma-separated address ending in a
@@ -425,20 +588,43 @@ def _is_named_metadata_heading(part: str) -> bool:
     return title in _FRONTMATTER_HEADING_LABELS
 
 
+def _has_place_like_tail(plain: str) -> bool:
+    """True when the last comma-segment looks like a place name — a short run of
+    capitalised words, opening on a capital (see ``_PLACE_TAIL_MAX_WORDS``)."""
+    words = plain.rsplit(",", 1)[-1].split()
+    if not 1 <= len(words) <= _PLACE_TAIL_MAX_WORDS or not words[0][:1].isupper():
+        return False
+    return all(w[:1].isupper() or w.lower() in _PLACE_TAIL_CONNECTORS for w in words)
+
+
+def _ends_with_country(plain: str) -> bool:
+    """True when the final comma-segment is a recognised country/region — the
+    language-independent affiliation cue (see ``_AFFILIATION_COUNTRIES``).  Any
+    postal digits sharing the segment ("South Korea 08826") are stripped first."""
+    tail = _POSTAL_DIGITS_RE.sub("", plain.rsplit(",", 1)[-1]).strip()
+    return tail.lower() in _AFFILIATION_COUNTRIES
+
+
 def _is_affiliation_line(plain: str) -> bool:
     """A bare affiliation address that lost its author's superscript marker.
 
-    Identified structurally (institution name + comma-separated address layout
-    closing on a postal code + no terminal punctuation) so it is recognised
-    without a leading ``¹``/``*``, which ``_LEADING_SUP_RE`` already handles."""
+    Identified structurally (a comma-separated address layout with no terminal
+    punctuation) so it is recognised without a leading ``¹``/``*``, which
+    ``_LEADING_SUP_RE`` already handles.  Any one of the closing signals marks it:
+    a country/region tail (language-independent), or — needing an institution
+    name, so limited to the stem spellings — a place-name tail behind a
+    keyword-headed line, or a postal-code tail."""
     if (
         len(plain) > _AFFILIATION_MAX_LEN
         or plain.count(",") < _AFFILIATION_MIN_COMMAS
         or _SENTENCE_END_RE.search(plain)
-        or not _AFFILIATION_RE.search(plain)
     ):
         return False
-    if _AFFILIATION_HEAD_RE.match(plain):
+    if _ends_with_country(plain):
+        return True
+    if not _AFFILIATION_RE.search(plain):
+        return False
+    if _AFFILIATION_HEAD_RE.match(plain) and _has_place_like_tail(plain):
         return True
     tail = ",".join(
         plain.rsplit(",", _AFFILIATION_TAIL_SEGMENTS)[-_AFFILIATION_TAIL_SEGMENTS:]
