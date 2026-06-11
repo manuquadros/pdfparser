@@ -143,6 +143,28 @@ class TestRunningFurniture:
         out = _strip_running_furniture(parts)
         assert out == ["<p>Real body sentence one.</p>"]
 
+    def test_abbreviation_terminated_running_head_removed(self) -> None:
+        # A running head ending in an abbreviation ("… Sphingomonas sp.") only
+        # looks like a finished sentence; recurring on 3+ pages, it is furniture
+        # and must be stripped — otherwise it interleaves between a paragraph's
+        # halves and blocks their cross-page merge.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        head = "<p>A ribitol dehydrogenase from <em>Sphingomonas</em> sp.</p>"
+        parts = [head, "<p>Body one.</p>", head, "<p>Body two.</p>", head]
+        body = ["<p>Body one.</p>", "<p>Body two.</p>"]
+        assert _strip_running_furniture(parts) == body
+
+    def test_twice_repeated_sentence_like_line_kept(self) -> None:
+        # The same abbreviation-terminated line appearing only twice stays: two
+        # occurrences are too few to outweigh its sentence-like shape, matching
+        # the repeated-real-sentence guard.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        head = "<p>A ribitol dehydrogenase from <em>Sphingomonas</em> sp.</p>"
+        parts = [head, "<p>Body one.</p>", head]
+        assert _strip_running_furniture(parts) == parts
+
     def test_heading_repeated_only_as_heading_kept(self) -> None:
         # A section heading the article legitimately repeats ("Purification of
         # SpRDH" under both Methods and Results) recurs but never appears as a
@@ -2065,3 +2087,26 @@ class TestPlosSidebarMetadata:
         body = _body(plos_html)
         assert "Lichens have traditionally been considered" in body
         assert "Polyols have a role in carbohydrate storage" in body
+
+    def test_running_head_not_in_body(self, plos_html: str) -> None:
+        # The running head ends in "Sphingomonas sp." — an abbreviation that only
+        # looks like a sentence end — so it must still be stripped as furniture,
+        # not leak onto every page of the body.
+        body = _body(plos_html)
+        assert "lichen-associated <em>Sphingomonas</em> sp.</p>" not in body
+
+    def test_growth_paragraph_merged_across_interleaved_figure(
+        self, plos_html: str
+    ) -> None:
+        # The Results paragraph breaks across a page, with Fig 1 (and the stripped
+        # running head) interleaved between its halves; once the running head is
+        # gone the merge bridges the figure, joining the two fragments into one.
+        body = _body(plos_html)
+        assert "or D-mannitol) at 15°C and its growth measured for 16 days." in body
+
+    def test_repeated_section_heading_kept(self, plos_html: str) -> None:
+        # "Purification of SpRDH" titles both a Methods subsection and a Results
+        # section; recurring as a heading is not running furniture, so both stay.
+        body = _body(plos_html)
+        assert "<h3>Purification of SpRDH</h3>" in body
+        assert "<h2>Purification of SpRDH</h2>" in body

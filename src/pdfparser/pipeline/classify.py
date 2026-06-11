@@ -365,6 +365,12 @@ _DIGITS_RE = re.compile(r"\d+")
 # "Clark") only needs to clear a small floor that rules out a stray initial.
 _MIN_FURNITURE_KEY_LEN = 12
 _MIN_DIGIT_FREE_FURNITURE_KEY_LEN = 3
+# A recurring line that reads like a finished sentence (ends in terminal
+# punctuation) is normally real prose, not furniture — but a running head ending
+# in an abbreviation ("… lichen-associated Sphingomonas sp.") only *looks* like
+# one.  Genuine prose virtually never repeats verbatim across this many pages, so
+# a sentence-terminated line recurring at least this often is a running head.
+_SENTENCE_LIKE_FURNITURE_MIN_REPEAT = 3
 # A folio is a block whose entire visible text is a bare number.  Bounded length
 # keeps it to plausible page numbers and away from longer numeric data.
 _PAGE_NUMBER_RE = re.compile(r"\d{1,4}")
@@ -413,7 +419,7 @@ def _is_furniture_candidate(part: str) -> str | None:
     if inner is None:
         return None
     plain = _visible_text(inner)
-    if len(plain) > _FURNITURE_MAX_LEN or _SENTENCE_END_RE.search(plain.rstrip()):
+    if len(plain) > _FURNITURE_MAX_LEN:
         return None
     key = _furniture_key(inner)
     min_len = (
@@ -422,6 +428,13 @@ def _is_furniture_candidate(part: str) -> str | None:
         else _MIN_DIGIT_FREE_FURNITURE_KEY_LEN
     )
     return key if len(key) >= min_len else None
+
+
+def _ends_like_sentence(part: str) -> bool:
+    inner = _furniture_inner(part)
+    if inner is None:
+        return False
+    return bool(_SENTENCE_END_RE.search(_visible_text(inner).rstrip()))
 
 
 def _is_standalone_page_number(part: str) -> bool:
@@ -446,9 +459,14 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
     promotes to a heading on sparse pages, so it shows up in both forms.  A line
     that recurs *only* as a heading is a genuine section heading that the article
     legitimately repeats (e.g. "Purification of X" under both Methods and
-    Results), not furniture, and must be kept."""
+    Results), not furniture, and must be kept.
+
+    A sentence-terminated line is treated as real prose unless it recurs often
+    enough (``_SENTENCE_LIKE_FURNITURE_MIN_REPEAT``) to be a running head whose
+    trailing abbreviation only mimics a sentence end ("… Sphingomonas sp.")."""
     counts: Counter[str] = Counter()
     as_paragraph: set[str] = set()
+    not_sentence_like: set[str] = set()
     for part in parts:
         key = _is_furniture_candidate(part)
         if key is None:
@@ -456,7 +474,15 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
         counts[key] += 1
         if _plain_p_text(part) is not None:
             as_paragraph.add(key)
-    repeated = {key for key, n in counts.items() if n > 1 and key in as_paragraph}
+        if not _ends_like_sentence(part):
+            not_sentence_like.add(key)
+    repeated = {
+        key
+        for key, n in counts.items()
+        if n > 1
+        and key in as_paragraph
+        and (key in not_sentence_like or n >= _SENTENCE_LIKE_FURNITURE_MIN_REPEAT)
+    }
     return [
         p
         for p in parts
