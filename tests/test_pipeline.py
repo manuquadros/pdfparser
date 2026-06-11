@@ -528,6 +528,50 @@ class TestLightonAssembly:
         assert "Herein, I propose" in body
         assert "Herein, I propose" not in meta
 
+    def test_interleaved_publication_sidebar_pulled_into_panel(self) -> None:
+        # 32639976 (PLOS ONE) page 0: the left-column metadata sidebar — a
+        # postal-code-less affiliation plus a run of bold label-colon lines
+        # (Citation/Editor/.../Competing interests) — is OCR'd into the body, the
+        # affiliation as the body's first block and the labelled run stranded after
+        # the Introduction heading and a column-break rule.  Every piece belongs in
+        # the panel; the Introduction prose stays in the body.
+        md = (
+            "# Purification of a novel ribitol dehydrogenase\n\n"
+            "**Kiet N. Tran, Nhung Pham, Sei-Heon Jang\\*, ChangWoo Lee\\***\n\n"
+            "*Department of Biomedical Science and Center for Bio-Nanomaterials, "
+            "Daegu University, Gyeongsan, South Korea*\n\n"
+            "## Abstract\n\nThe abstract sentence is here.\n\n"
+            "## Introduction\n\n"
+            "Lichens have traditionally been considered a symbiotic association.\n\n"
+            "---\n\n"
+            "**Citation:** Tran KN, Lee C (2020) Purification. PLoS ONE 15(7): "
+            "e0235718. https://doi.org/10.1371/journal.pone.0235718\n\n"
+            "**Editor:** Leonidas Matsakas, Luleå University of Technology, SWEDEN\n\n"
+            "**Received:** April 23, 2020\n\n"
+            "**Copyright:** © 2020 Tran et al. This is an open access article.\n\n"
+            "**Funding:** This work was supported by the NRF.\n\n"
+            "**Competing interests:** The authors have declared that no competing "
+            "interests exist.\n\n"
+            "Polyols have a role in carbohydrate storage and stress protection."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in (
+            "Department of Biomedical Science",
+            "<strong>Citation:</strong>",
+            "<strong>Editor:</strong>",
+            "<strong>Received:</strong>",
+            "<strong>Copyright:</strong>",
+            "<strong>Funding:</strong>",
+            "<strong>Competing interests:</strong>",
+        ):
+            assert fragment in meta, fragment
+            assert fragment not in body, fragment
+        # The body keeps its prose and the section heading, with no stray rule.
+        assert "Lichens have traditionally been considered" in body
+        assert "Polyols have a role" in body
+        assert "<hr" not in body
+
     def test_body_sentence_with_one_email_not_hidden(self) -> None:
         # The stray-metadata sweep must not hide a body sentence that merely embeds
         # a single address: one token is below the threshold.
@@ -563,6 +607,29 @@ class TestLightonAssembly:
         assert _is_stray_metadata(
             "<p>Published online 28 December 2018 in Wiley Online Library "
             "(wileyonlinelibrary.com)</p>"
+        )
+        # A recognised journal-metadata bold label is relocated on the label alone,
+        # even with no metadata token and even when the value runs long.
+        assert _is_stray_metadata(
+            "<p><strong>Competing interests:</strong> The authors have declared "
+            "that no competing interests exist.</p>"
+        )
+        assert _is_stray_metadata(
+            "<p><strong>Editor:</strong> Leonidas Matsakas, Luleå University of "
+            "Technology, SWEDEN</p>"
+        )
+        assert _is_stray_metadata(
+            "<p><strong>Funding:</strong> "
+            + "This work was generously supported by many sources. " * 12
+            + "</p>"
+        )
+        # A bold label-colon that is *not* a publishing-process label is ordinary
+        # body emphasis, not metadata, and must not be relocated on the shape alone.
+        assert not _is_stray_metadata(
+            "<p><strong>Note:</strong> the reaction was repeated three times.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p><strong>Results:</strong> the enzyme retained full activity.</p>"
         )
         # A single embedded e-mail is below the two-token bar → stays in body.
         assert not _is_stray_metadata(
@@ -659,7 +726,8 @@ class TestLightonAssembly:
         # Too few comma-separated segments to be an address layout.
         assert not _is_affiliation_line("Department of Chemistry")
         # An institution-naming prose clause with no postal-code tail is not an
-        # address, even without terminal punctuation.
+        # address, even without terminal punctuation — it does not *open* with the
+        # institution name, so the head-anchored affiliation cue does not fire.
         assert not _is_affiliation_line(
             "In this work, conducted jointly with the Department of Biology, the "
             "School of Medicine, and several partner hospitals across the region"
@@ -669,9 +737,15 @@ class TestLightonAssembly:
             "enrolled 250 patients from the Department of Cardiology, the ICU, "
             "and two partner clinics"
         )
-        # The deliberate trade: an address with no postal code is left visible.
-        assert not _is_affiliation_line(
+        # An address that *opens* with the institution name is an affiliation even
+        # with no postal code — international addresses often close on a country,
+        # not a code (the head-anchored cue distinguishes it from the prose above).
+        assert _is_affiliation_line(
             "Department of Chemistry, University of Oxford, Oxford, United Kingdom"
+        )
+        assert _is_affiliation_line(
+            "Department of Biomedical Science and Center for Bio-Nanomaterials, "
+            "Daegu University, Gyeongsan, South Korea"
         )
 
     def test_all_frontmatter_body_kept_visible(self) -> None:
@@ -1681,6 +1755,7 @@ class TestParseFigurePlaceholder:
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
+_PLOS_PDF = Path(__file__).parent / "fixtures" / "32639976.pdf"
 _OUTPUT_DIR = Path(__file__).parent.parent / "spike_results"
 
 
@@ -1892,3 +1967,47 @@ class TestAdPageExclusion:
             in ad_prefix_html
         )
         assert "This suggests that TRI and</p>" not in ad_prefix_html
+
+
+@pytest.fixture(scope="session")
+def plos_html(ocr_model: object) -> str:
+    """Full pipeline output for the PLOS ONE 32639976.pdf fixture.
+
+    Writes the result to spike_results/32639976.html for visual inspection.
+    """
+    if not _PLOS_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_PLOS_PDF}")
+    return _run_pipeline_to_file(_PLOS_PDF, ocr_model)
+
+
+@pytest.mark.integration
+class TestPlosSidebarMetadata:
+    """32639976.pdf (PLOS ONE) prints a left-column metadata sidebar beside the
+    abstract; the OCR interleaves it into the body.  Every piece — the affiliation
+    and the bold-labelled Citation/Editor/dates/Copyright/Data-Availability/Funding/
+    Competing-interests run — must land in the collapsed Metadata panel, not the
+    body."""
+
+    def test_sidebar_metadata_in_panel_not_body(self, plos_html: str) -> None:
+        panel, body = _metadata(plos_html), _body(plos_html)
+        for fragment in (
+            "Department of Biomedical Science and Center for Bio-Nanomaterials",
+            "<strong>Citation:</strong>",
+            "<strong>Editor:</strong>",
+            "<strong>Received:</strong>",
+            "<strong>Accepted:</strong>",
+            "<strong>Published:</strong>",
+            "<strong>Copyright:</strong>",
+            "<strong>Data Availability Statement:</strong>",
+            "<strong>Funding:</strong>",
+            "<strong>Competing interests:</strong>",
+        ):
+            assert fragment in panel, f"{fragment!r} missing from metadata panel"
+            assert fragment not in body, f"{fragment!r} leaked into body"
+
+    def test_body_opens_with_introduction_prose(self, plos_html: str) -> None:
+        # With the sidebar relocated, the body proper opens at the Introduction —
+        # its prose must remain visible, not be swept into the panel.
+        body = _body(plos_html)
+        assert "Lichens have traditionally been considered" in body
+        assert "Polyols have a role in carbohydrate storage" in body

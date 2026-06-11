@@ -77,6 +77,18 @@ _AFFILIATION_RE = re.compile(
     r"faculty|academy|polytechnic|school\s+of)\b",
     re.IGNORECASE,
 )
+# The same institution stems anchored at the line *start*: an address that opens
+# with the institution name ("Department of …, City, Country") is an affiliation
+# even without a postal-code tail — international addresses often close on a
+# country name, not a code.  Opening with the keyword (not merely containing it)
+# is what separates this from an OCR-truncated prose clause that names a
+# university mid-sentence, which the postal-code tail otherwise guards against.
+_AFFILIATION_HEAD_RE = re.compile(
+    r"^(?:the\s+)?(?:department|centers?\s+for|centres?\s+for|universit\w*|"
+    r"institut\w*|laborator(?:y|ies)|college|faculty|academy|polytechnic|"
+    r"school\s+of|division\s+of)\b",
+    re.IGNORECASE,
+)
 # An affiliation OCR'd without its author's superscript marker (J. Biol. Chem.'s
 # "From the Department of …, City, Region, postcode") is recognised structurally:
 # it names an institution, is laid out as a comma-separated address ending in a
@@ -136,6 +148,35 @@ _STRAY_METADATA_PHRASE_RE = re.compile(
 # length bound rejects a long prose run that happens to contain two.
 _STRAY_METADATA_MAX_LEN = 400
 _STRAY_METADATA_MIN_TOKENS = 2
+# A first-page metadata sidebar — the "Citation / Editor / Received / … / Competing
+# interests" block PLOS and many open-access journals print beside the abstract —
+# is OCR'd into the body away from the leading front-matter run, each entry a bold
+# label-colon paragraph ("**Funding:** …").  A lone "**Word:**" line is too weak to
+# relocate position-independently (a body paragraph may open "**Note:** …"), so
+# these are recognised by a fixed vocabulary of publishing-process labels rather
+# than by the bold-label shape alone.  The label is decisive evidence, so a matched
+# line is relocated regardless of length (a Copyright/Funding statement runs long).
+_PUBLICATION_METADATA_LABELS = frozenset(
+    {
+        "citation",
+        "editor",
+        "academic editor",
+        "handling editor",
+        "received",
+        "accepted",
+        "revised",
+        "published",
+        "copyright",
+        "data availability",
+        "data availability statement",
+        "funding",
+        "competing interests",
+        "conflict of interest",
+        "conflicts of interest",
+        "provenance and peer review",
+    }
+)
+_BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
 # section is recognised by length + a sentence ending, and breaks the run.
@@ -397,6 +438,8 @@ def _is_affiliation_line(plain: str) -> bool:
         or not _AFFILIATION_RE.search(plain)
     ):
         return False
+    if _AFFILIATION_HEAD_RE.match(plain):
+        return True
     tail = ",".join(
         plain.rsplit(",", _AFFILIATION_TAIL_SEGMENTS)[-_AFFILIATION_TAIL_SEGMENTS:]
     )
@@ -537,14 +580,25 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
     return metadata, rest
 
 
+def _is_publication_metadata_label(inner: str) -> bool:
+    """True when a ``<p>`` opens with a recognised journal-metadata bold label
+    ("**Citation:**", "**Competing interests:**" …) — see
+    ``_PUBLICATION_METADATA_LABELS``."""
+    m = _BOLD_LABEL_CAPTURE_RE.match(inner)
+    return m is not None and m.group(1).strip().lower() in _PUBLICATION_METADATA_LABELS
+
+
 def _is_stray_metadata(part: str) -> bool:
     """A self-contained footer-metadata line OCR'd into the body (see
     ``_STRAY_METADATA_MAX_LEN``).  Unlike ``_is_frontmatter_text`` it is judged
-    position-independently, so it must stand on its own strong evidence: a short
-    block with two or more metadata tokens, or the fixed boilerplate phrase."""
+    position-independently, so it must stand on its own strong evidence: a
+    recognised publishing-process label, a short block with two or more metadata
+    tokens, or the fixed boilerplate phrase."""
     inner = _plain_p_text(part)
     if inner is None:
         return False
+    if _is_publication_metadata_label(inner):
+        return True
     plain = _visible_text(inner)
     if len(plain) > _STRAY_METADATA_MAX_LEN:
         return False
