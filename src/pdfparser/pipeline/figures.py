@@ -7,19 +7,22 @@ Pure image-processing, no GPU.  All boxes are LightOnOCR's ``[0, 1000]``-normali
 Design bias: a clipped figure loses image the reader never recovers, while a crop
 that runs into surrounding margin is merely cosmetic, so when the model's box and
 the real figure disagree this module leans toward **including too much rather than
-too little** — it grows a clipped box down to the figure's true bottom
-(``_extend_bottom_to_content``) and unions over-segmented stacked boxes back into
-one (``_cluster_figure_boxes``).  The one check on that bias is ambiguity: growth
-stops (rather than guessing) when the figure's end isn't marked by a clear
-whitespace gap, so a correct box is never extended blindly into caption or body
-text.  See the "Figures" section of the design notes.
+too little** — it grows a clipped box out to the figure's true bottom and right
+edges (``_extend_bottom_to_content``, ``_extend_right_to_content``) and unions
+over-segmented stacked boxes back into one (``_cluster_figure_boxes``).  The one
+check on that bias is ambiguity: growth stops (rather than guessing) when the
+figure's end isn't marked by a clear whitespace gap, so a correct box is never
+extended blindly into caption, body text, or a neighbouring column.  See the
+"Figures" section of the design notes.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import re
+from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 
 import numpy as np
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
@@ -37,18 +40,65 @@ _FIGURE_PLACEHOLDER_RE = re.compile(
 )
 
 _MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
-# The model's box often clips the bottom of a figure.  Rather than pad blindly
-# (which grabs the caption when the box was already correct), grow the bottom
-# edge over figure content and stop at the whitespace gap before the caption.
-# A row is *blank* when fewer than this fraction of its pixels are ink — kept
-# low (≈empty) so a sparse figure row (a thin axis, or content narrower than the
-# box) still counts as content rather than ending growth early.  A vertical run
-# of blank rows this tall is the gap that ends growth; growth is capped at this
-# fraction of the page.
-_FIGURE_BLANK_ROW_FRAC = 0.005
+# The model's box often clips a figure's bottom or right edge.  Rather than pad
+# blindly (which grabs the caption, or a neighbouring column, when the box was
+# already correct), grow the clipped edge over figure content and stop at the
+# whitespace gap beyond it — the gap before the caption below, or the page margin
+# / inter-column gutter to the right.  A line (row or column) is *blank* when
+# fewer than this fraction of its pixels are ink — kept low (≈empty) so a sparse
+# figure line (a thin axis, or content narrower than the box) still counts as
+# content rather than ending growth early.  A run of blank lines this deep is the
+# gap that ends growth; growth is capped at this fraction of the page dimension.
+_FIGURE_BLANK_LINE_FRAC = 0.005
 _FIGURE_INK_LEVEL = 250  # pixel value below which a grayscale pixel is "ink"
 _FIGURE_GAP_FRAC = 0.012
 _FIGURE_MAX_GROW_FRAC = 0.10
+# Growth recovers only figure content *contiguous* with the box: a leading run of
+# this many blank lines before any ink means the box already ends at the figure
+# boundary, and what follows — a caption below, a neighbouring column to the right
+# — is separated from it by whitespace, so growth is declined rather than reaching
+# across the gap to pull it in.  Kept well below the trailing-gap threshold so a
+# tight figure-to-caption margin still reads as a boundary (the clip that motivated
+# this leaves no leading gap at all — the box cuts straight through figure ink).
+_FIGURE_LEAD_GAP_FRAC = 0.004
+# When the OCR emitted a caption block for a figure, a recovered bottom band that
+# is actually that caption (the model boxed the figure correctly but growth ran
+# into the prose below) is trimmed back.  The band is judged as a whole by its mean
+# horizontal ink-run length normalized to the band width: caption prose is short
+# letter runs, while figure content growth legitimately recovers here (shaded
+# panels, gel lanes, sequence alignments) is long continuous runs.  This threshold
+# sits at the midpoint of the observed gap — caption bands measured ≤ 0.046, figure
+# bands ≥ 0.10.  Sparse line-art (thin axes, tick labels) shares prose's short runs,
+# so a clipped sparse tail sitting just above its caption can be trimmed with it —
+# an accepted minor loss: the caption is always re-emitted as <figcaption>, and the
+# alternative (baking a whole caption into the image) is worse.
+_FIGURE_PROSE_RUN_FRAC = 0.07
+# When a figure is itself text — a sequence alignment, a data table — its caption
+# is pixel-identical to it, so the run-length test above can't find a caption the
+# model baked *inside* the box.  The tie-breaker is the document, not the pixels:
+# the OCR already emitted that caption as its own text block, so a trailing band is
+# the caption when re-OCRing it reproduces caption words.  ``_trim_baked_caption``
+# only runs on text-like (not dense-figure) trailing bands and only in the bottom
+# of the crop, so the extra OCR is bounded to genuinely doubtful cases.  A band is
+# the caption when at least this fraction of its words appear in the caption text.
+# Kept high: a caption line re-OCRs to ~all caption words, whereas a figure row that
+# the caption happens to label (a sequence alignment names its own rows — BsSDH,
+# HmSDH …) is one matching label among non-caption data, well under this bar.
+_FIGURE_CAPTION_WORD_FRAC = 0.7
+_FIGURE_CAPTION_MIN_WORDS = 3  # ignore one/two-word figure labels that match by luck
+# A figure the model can't read (a sequence alignment) can OCR into a repeated-token
+# wall — e.g. "BMSDH BMSDH BMSDH …" — which scores ~1.0 against a caption that names
+# that row.  Reject it by requiring this many *distinct* caption words in the band:
+# real caption prose carries several distinct caption words, a wall (of any length)
+# collapses to one or two types, and a short repeat ("panel panel panel") likewise.
+_FIGURE_CAPTION_MIN_DISTINCT = 3
+# only hunt a baked caption in the bottom half of a crop
+_FIGURE_CAPTION_SCAN_FRAC = 0.5
+_FIGURE_CAPTION_NOTE_BANDS = 2  # trailing note lines (a DOI) tolerated below a caption
+_FIGURE_BLOCK_GAP_FRAC = 0.008  # blank run separating caption / figure / note blocks
+_FIGURE_OCR_MIN_BAND_PX = 48  # pad thinner bands so the vision model can patch them
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_FIGURE_NOTE_RE = re.compile(r"doi\.org|https?://", re.IGNORECASE)
 # The model sometimes over-segments one figure into stacked boxes (a tall figure
 # split into a main box + a thin strip).  Two boxes are the same figure when they
 # share a column (substantial horizontal overlap) and are vertically adjacent.
@@ -97,41 +147,231 @@ def _denormalize_bbox(
     )
 
 
+def _ink_run_end(ink_per_line: np.ndarray, gap: int, lead_gap: int) -> int | None:
+    """Offset (1-based, past the edge) of the last inked line before the first
+    whitespace gap of ``gap`` blank lines in a 1-D ink profile, or ``None`` to
+    leave the edge unchanged.
+
+    ``None`` is returned both when the ink reaches the search cap with no trailing
+    gap (ambiguous) and when a *leading* gap of ``lead_gap`` blank lines precedes
+    any ink: content the box is already separated from by whitespace is the
+    caption / neighbouring column, not a clipped continuation of the figure, so it
+    is not pulled in.
+    """
+    last_ink = 0
+    blank_run = 0
+    seen_ink = False
+    for offset, fraction in enumerate(ink_per_line, start=1):
+        if fraction < _FIGURE_BLANK_LINE_FRAC:
+            blank_run += 1
+            if not seen_ink and blank_run >= lead_gap:
+                return None
+            if blank_run >= gap:
+                return last_ink
+        else:
+            seen_ink = True
+            blank_run = 0
+            last_ink = offset
+    return None
+
+
+def _grow_edge(ink_profile: np.ndarray, dim: int) -> int:
+    """Offset to extend an edge along ``ink_profile`` (the ink profile of the strip
+    past the edge), or 0 to leave it; the gap thresholds scale to page ``dim``."""
+    run = _ink_run_end(
+        ink_profile,
+        max(1, round(_FIGURE_GAP_FRAC * dim)),
+        max(1, round(_FIGURE_LEAD_GAP_FRAC * dim)),
+    )
+    return run if run is not None else 0
+
+
 def _extend_bottom_to_content(image: Image.Image, x0: int, x1: int, y1: int) -> int:
     """Grow ``y1`` downward to recover a figure bottom the box clipped.
 
-    Only grows when the ink below ``y1`` ends in a clear whitespace gap (the
-    space before the caption): then ``y1`` moves to that figure bottom.  If the
-    ink runs to the search cap with no gap — ambiguous, and usually caption/body
-    text below a correct box — the box is left unchanged so no text is pulled in.
+    Grows over figure ink directly below ``y1`` and stops at the whitespace gap
+    that follows it (the space before the caption).  Leaves the box unchanged when
+    the ink runs to the search cap with no gap (ambiguous), or when a leading gap
+    separates the box from what is below (the box already ends at the figure
+    bottom and a caption — not clipped figure — follows), so no text is pulled in.
     """
     h = image.size[1]
     limit = min(h, y1 + round(_FIGURE_MAX_GROW_FRAC * h))
     if y1 >= limit:
         return y1
     strip = np.asarray(image.crop((x0, y1, x1, limit)).convert("L"))
-    ink_per_row = (strip < _FIGURE_INK_LEVEL).mean(axis=1)
-    gap = max(1, round(_FIGURE_GAP_FRAC * h))
-    last_ink = 0  # rows past y1, exclusive
-    blank_run = 0
-    found_gap = False
-    for offset, fraction in enumerate(ink_per_row, start=1):
-        if fraction < _FIGURE_BLANK_ROW_FRAC:
-            blank_run += 1
-            if blank_run >= gap:
-                found_gap = True
+    return y1 + _grow_edge((strip < _FIGURE_INK_LEVEL).mean(axis=1), h)
+
+
+def _extend_right_to_content(image: Image.Image, y0: int, y1: int, x1: int) -> int:
+    """Grow ``x1`` rightward to recover a figure right edge the box clipped.
+
+    The horizontal mirror of :func:`_extend_bottom_to_content`: only grows when
+    the ink right of ``x1`` ends in a clear whitespace gap.  In a multi-column
+    layout that gap is the inter-column gutter, so growth of a left-column figure
+    stops at the gutter and never reaches the next column's text; if the ink runs
+    to the cap with no gap the box is left unchanged.
+    """
+    w = image.size[0]
+    limit = min(w, x1 + round(_FIGURE_MAX_GROW_FRAC * w))
+    if x1 >= limit:
+        return x1
+    strip = np.asarray(image.crop((x1, y0, limit, y1)).convert("L"))
+    return x1 + _grow_edge((strip < _FIGURE_INK_LEVEL).mean(axis=0), w)
+
+
+def _mean_norm_run_length(mask: np.ndarray) -> float:
+    """Mean length of horizontal ink runs over a boolean ink ``mask``'s inked
+    rows, normalized by mask width; 0 when no row carries ink.  Short runs mark
+    prose (letterforms); long runs mark shaded / continuous figure content."""
+    width = mask.shape[1]
+    if width == 0:
+        return 0.0
+    means: list[float] = []
+    for row in mask:
+        if row.mean() <= _FIGURE_BLANK_LINE_FRAC:
+            continue
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row.astype(np.int8), [0]))))
+        runs = edges[1::2] - edges[::2]
+        if runs.size:
+            means.append(float(runs.mean()))
+    return float(np.mean(means) / width) if means else 0.0
+
+
+def _trim_swallowed_caption(
+    image: Image.Image, x0: int, x1: int, box_bottom: int, grown_y1: int
+) -> int:
+    """Trim a recovered bottom band back to ``box_bottom`` when it reads as a
+    swallowed caption rather than recovered figure content.
+
+    Called only when the OCR emitted a caption block for the figure, so prose is
+    known to sit below it.  The band (``box_bottom``..``grown_y1``) is judged as a
+    whole by :func:`_mean_norm_run_length`: a prose-reading band is dropped, a
+    figure-reading one is kept whole — so a band mixing a clipped figure tail with
+    a little caption is kept rather than risk clipping the figure.
+    """
+    if grown_y1 <= box_bottom:
+        return grown_y1
+    mask = np.asarray(image.crop((x0, box_bottom, x1, grown_y1)).convert("L"))
+    if _mean_norm_run_length(mask < _FIGURE_INK_LEVEL) < _FIGURE_PROSE_RUN_FRAC:
+        return box_bottom
+    return grown_y1
+
+
+def _ink_bands(mask: np.ndarray, gap: int) -> list[tuple[int, int]]:
+    """Contiguous inked-row bands ``(top, bottom)`` separated by runs of at least
+    ``gap`` blank rows, top to bottom."""
+    row_ink = mask.mean(axis=1) > _FIGURE_BLANK_LINE_FRAC
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    blank = 0
+    for i, ink in enumerate(row_ink):
+        if ink:
+            if start is None:
+                start = i
+            blank = 0
+        elif start is not None:
+            blank += 1
+            if blank >= gap:
+                bands.append((start, i - blank + 1))
+                start = None
+    if start is not None:
+        bands.append((start, len(row_ink)))
+    return bands
+
+
+def _ocr_band(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    ocr_region: Callable[[Image.Image], str],
+) -> str:
+    """OCR a band crop, padding it with white to ``_FIGURE_OCR_MIN_BAND_PX`` tall
+    first — the vision model needs at least two patch rows and raises on a band
+    only one patch tall (a thin separator or a single text line)."""
+    crop = image.crop(box).convert("RGB")
+    if crop.height < _FIGURE_OCR_MIN_BAND_PX:
+        canvas = Image.new(
+            "RGB", (crop.width, _FIGURE_OCR_MIN_BAND_PX), (255, 255, 255)
+        )
+        canvas.paste(crop, (0, (_FIGURE_OCR_MIN_BAND_PX - crop.height) // 2))
+        crop = canvas
+    return ocr_region(crop)
+
+
+def _band_is_caption(text: str, caption_words: set[str]) -> bool:
+    """True when ``text`` re-OCRs to (part of) the figure caption: at least
+    ``_FIGURE_CAPTION_WORD_FRAC`` of its words appear in ``caption_words`` and it
+    carries at least ``_FIGURE_CAPTION_MIN_DISTINCT`` distinct caption words — the
+    latter rejecting a degenerate repeated-token wall that the caption merely names."""
+    words = _WORD_RE.findall(text.lower())
+    if len(words) < _FIGURE_CAPTION_MIN_WORDS:
+        return False
+    matched = [w for w in words if w in caption_words]
+    if len(set(matched)) < _FIGURE_CAPTION_MIN_DISTINCT:
+        return False
+    return len(matched) / len(words) >= _FIGURE_CAPTION_WORD_FRAC
+
+
+def _trim_baked_caption(
+    image: Image.Image,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+    caption_text: str,
+    ocr_region: Callable[[Image.Image], str],
+) -> int:
+    """Trim a caption the model baked into the *interior* of the figure box.
+
+    When the figure is itself text (a sequence alignment, a table) the caption is
+    pixel-identical to it, so :func:`_trim_swallowed_caption` can't see it.  Here
+    the trailing text bands are re-OCRed and dropped when they reproduce the
+    figure's own ``caption_text`` (which the page OCR already emitted as a block).
+    Dense (non-text) bands are never OCRed and end the scan.  The hunt for the
+    caption's first band is confined to the bottom ``_FIGURE_CAPTION_SCAN_FRAC`` of
+    the crop (so the extra OCR stays on genuinely ambiguous text-bodied figures),
+    but once found the caption is followed up past that floor so a tall caption is
+    trimmed whole.
+    """
+    mask = np.asarray(image.crop((x0, y0, x1, y1)).convert("L")) < _FIGURE_INK_LEVEL
+    floor = round((1 - _FIGURE_CAPTION_SCAN_FRAC) * (y1 - y0))
+    bands = _ink_bands(mask, max(1, round(_FIGURE_BLOCK_GAP_FRAC * image.size[1])))
+    caption_words = set(_WORD_RE.findall(caption_text.lower()))
+    caption_top: int | None = None
+    notes = 0
+    for top, bot in reversed(bands):
+        if caption_top is None and bot <= floor:
+            break  # hunted down past the bottom slab with no caption — give up
+        if _mean_norm_run_length(mask[top:bot]) >= _FIGURE_PROSE_RUN_FRAC:
+            break  # dense figure content — stop without OCR
+        text = _ocr_band(image, (x0, y0 + top, x1, y0 + bot), ocr_region)
+        if _band_is_caption(text, caption_words):
+            caption_top = y0 + top
+        elif caption_top is not None:
+            break  # text above the caption that isn't caption → figure text
+        elif _FIGURE_NOTE_RE.search(text):
+            notes += 1
+            if notes > _FIGURE_CAPTION_NOTE_BANDS:
                 break
         else:
-            blank_run = 0
-            last_ink = offset
-    return y1 + last_ink if found_gap else y1
+            break  # a non-caption, non-note text tail → no baked caption here
+    return caption_top if caption_top is not None else y1
 
 
 def _safe_crop(
-    image: Image.Image, bbox: tuple[int, int, int, int]
+    image: Image.Image,
+    bbox: tuple[int, int, int, int],
+    *,
+    caption_text: str | None = None,
+    ocr_region: Callable[[Image.Image], str] | None = None,
 ) -> Image.Image | None:
     """Crop a pixel-space ``bbox`` from ``image``, clamped to bounds and grown
-    down to the figure's true bottom edge; ``None`` if degenerate."""
+    out to the figure's true right and bottom edges; ``None`` if degenerate.
+
+    ``caption_text`` (the caption block the OCR emitted for this figure) enables
+    trimming the caption back out of the crop: cheaply when it was a band growth
+    pulled in from *below* the box, and — when ``ocr_region`` is supplied — by
+    re-OCRing trailing text bands the model baked *inside* the box."""
     w, h = image.size
     x0 = max(0, min(bbox[0], w))
     y0 = max(0, min(bbox[1], h))
@@ -139,8 +379,21 @@ def _safe_crop(
     y1 = max(0, min(bbox[3], h))
     if x1 - x0 < _MIN_FIGURE_HEIGHT or y1 - y0 < _MIN_FIGURE_HEIGHT:
         return None
-    y1 = _extend_bottom_to_content(image, x0, x1, y1)
-    return image.crop((x0, y0, x1, y1))
+    x1 = _extend_right_to_content(image, y0, y1, x1)
+    grown_y1 = _extend_bottom_to_content(image, x0, x1, y1)
+    if caption_text is not None:
+        grown_y1 = _trim_swallowed_caption(image, x0, x1, y1, grown_y1)
+        if ocr_region is not None:
+            # A band re-OCR can fail on a transient OOM (the GPU is shared) or a
+            # degenerate strip; the trim is cosmetic, so keep the crop as-is rather
+            # than abort the whole document.
+            with contextlib.suppress(Exception):
+                grown_y1 = _trim_baked_caption(
+                    image, x0, x1, y0, grown_y1, caption_text, ocr_region
+                )
+    if grown_y1 - y0 < _MIN_FIGURE_HEIGHT:  # a trim left too little to be a figure
+        return None
+    return image.crop((x0, y0, x1, grown_y1))
 
 
 def _union_box(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:

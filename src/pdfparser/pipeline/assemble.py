@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html as _html
 import re
+from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -174,10 +175,15 @@ def _figcaption_only(caption_html: str) -> str:
     )
 
 
-def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
+def _page_to_html_parts(
+    md: str,
+    image: Image.Image,
+    ocr_region: Callable[[Image.Image], str] | None = None,
+) -> list[str]:
     """Convert one page's markdown to block HTML, replacing each ``![image]``
     placeholder with a cropped ``<figure>`` and stitching consecutive prose into
-    a single markdown render."""
+    a single markdown render.  ``ocr_region`` (re-OCR a sub-image), when supplied,
+    lets the crop trim a caption the model baked into a text-bodied figure box."""
     blocks = _parse_page_blocks(md)
     box_at, caption_at, drop = _resolve_figure_clusters(blocks, image)
 
@@ -199,7 +205,11 @@ def _page_to_html_parts(md: str, image: Image.Image) -> list[str]:
         box = box_at.get(i)
         caption = caption_at.get(i, block.caption)
         caption_html = _latex_to_html(caption) if caption else None
-        crop = _safe_crop(image, box) if box is not None else None
+        crop = (
+            _safe_crop(image, box, caption_text=caption, ocr_region=ocr_region)
+            if box is not None
+            else None
+        )
         if crop is not None:
             parts.append(_figure_html(crop, caption_html))
         elif caption_html is not None:
@@ -263,13 +273,18 @@ def _document_shell(
 </html>"""
 
 
-def _assemble_html(pages_md: list[str], images: list[Image.Image]) -> str:
+def _assemble_html(
+    pages_md: list[str],
+    images: list[Image.Image],
+    ocr_region: Callable[[Image.Image], str] | None = None,
+) -> str:
     start = _leading_pages_to_skip_md(pages_md)
     pages_md = pages_md[start:]
     images = images[start:]
 
     per_page_parts = [
-        _page_to_html_parts(md, img) for md, img in zip(pages_md, images, strict=True)
+        _page_to_html_parts(md, img, ocr_region)
+        for md, img in zip(pages_md, images, strict=True)
     ]
     # Front matter the OCR scattered into the article's first page — a glossary
     # section (Abbreviations / Nomenclature) past the leading-run scan, and
@@ -327,4 +342,4 @@ def lightonocr_pdf_to_html(
         ocr = load_ocr_model(device)
     images = _render_page_images(Path(pdf_path))
     pages_md = [_ocr_page(img, ocr) for img in images]
-    return _assemble_html(pages_md, images)
+    return _assemble_html(pages_md, images, lambda region: _ocr_page(region, ocr))

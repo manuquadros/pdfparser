@@ -6,6 +6,7 @@ import io
 import re
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -18,6 +19,17 @@ def _figure_sizes(html: str) -> list[tuple[int, int]]:
     """Decode every embedded ``data:image/png`` figure and return its (w, h)."""
     uris = re.findall(r"data:image/png;base64,([A-Za-z0-9+/=]+)", html)
     return [Image.open(io.BytesIO(base64.b64decode(u))).size for u in uris]
+
+
+def _figure_size_by_caption(html: str, needle: str) -> tuple[int, int] | None:
+    """Decode the embedded figure whose ``<figcaption>`` contains ``needle`` and
+    return its ``(w, h)``; ``None`` if no such figure is present."""
+    for fig in re.findall(r"<figure>.*?</figure>", html, re.DOTALL):
+        cap = re.search(r"<figcaption>(.*?)</figcaption>", fig, re.DOTALL)
+        uri = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)", fig)
+        if cap and uri and needle in cap.group(1):
+            return Image.open(io.BytesIO(base64.b64decode(uri.group(1)))).size
+    return None
 
 
 def _run_lighton(pages_md: list[str], image: Image.Image | None = None) -> str:
@@ -986,6 +998,219 @@ class TestFigureBottomGrowth:
 
         crop = _safe_crop(self._image(), (50, 100, 350, 250))
         assert crop is not None and crop.size == (300, 200)
+
+
+class TestFigureRightGrowth:
+    """The crop grows right over contiguous ink to the figure's true right edge
+    and stops at the whitespace before the page margin or inter-column gutter; a
+    box already ending in whitespace grows nothing, so a neighbouring column is
+    never pulled in."""
+
+    @staticmethod
+    def _image() -> Image.Image:
+        # White page: figure block x[100,300), a strip at x[360,380) (page-margin
+        # neighbour), separated by a 60 px whitespace gap.
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (200, 300), "black"), (100, 50))
+        img.paste(Image.new("RGB", (20, 300), "black"), (360, 50))
+        return img
+
+    def test_tight_box_grows_to_figure_right(self) -> None:
+        from pdfparser.pipeline.figures import _extend_right_to_content
+
+        assert _extend_right_to_content(self._image(), 50, 350, 250) == 300
+
+    def test_box_at_right_does_not_grow(self) -> None:
+        from pdfparser.pipeline.figures import _extend_right_to_content
+
+        assert _extend_right_to_content(self._image(), 50, 350, 300) == 300
+
+    def test_no_growth_when_ink_runs_without_gap(self) -> None:
+        # Ink continues past the search window with no whitespace gap (a column
+        # abutting a correct box) → ambiguous → leave the box unchanged.
+        from pdfparser.pipeline.figures import _extend_right_to_content
+
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (300, 300), "black"), (100, 50))
+        assert _extend_right_to_content(img, 50, 350, 250) == 250
+
+    def test_narrow_content_right_of_box_is_not_read_as_gap(self) -> None:
+        # A figure tail narrower than the box (here 3 px of a 300 px-tall box,
+        # ~1% ink) must count as content, not be mistaken for the whitespace gap.
+        from pdfparser.pipeline.figures import _extend_right_to_content
+
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (150, 300), "black"), (100, 50))  # x[100,250)
+        img.paste(Image.new("RGB", (40, 3), "black"), (250, 198))  # narrow tail
+        assert _extend_right_to_content(img, 50, 350, 270) == 290
+
+    def test_gutter_stops_growth_before_next_column(self) -> None:
+        # Left-column figure, a whitespace gutter, then right-column text: growth
+        # recovers the clipped figure edge but stops at the gutter, never reaching
+        # the next column.
+        from pdfparser.pipeline.figures import _extend_right_to_content
+
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (200, 300), "black"), (50, 50))  # x[50,250)
+        img.paste(Image.new("RGB", (200, 300), "black"), (310, 50))  # right column
+        assert _extend_right_to_content(img, 50, 350, 200) == 250
+
+    def test_safe_crop_excludes_neighbour_column(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        crop = _safe_crop(self._image(), (100, 50, 250, 350))
+        assert crop is not None and crop.size == (200, 300)
+
+
+class TestSwallowedCaptionTrim:
+    """A bottom band that growth recovers is trimmed when it reads as the figure's
+    caption (short prose ink-runs) but kept when it is figure content (long shaded
+    runs); trimming happens only when a caption is known to follow the figure."""
+
+    @staticmethod
+    def _image(ink_run: int, gap_run: int) -> Image.Image:
+        # 800x400 white; a solid figure body at y[50,200) and, contiguous below it,
+        # a 30 px band at y[200,230) whose horizontal ink-run length is set by
+        # (ink_run, gap_run) — short runs read as prose, long runs as figure.
+        a = np.full((400, 800), 255, np.uint8)
+        a[50:200, 50:750] = 0
+        row = np.full(700, 255, np.uint8)
+        for x in range(0, 700, ink_run + gap_run):
+            row[x : x + ink_run] = 0
+        a[200:230, 50:750] = np.tile(row, (30, 1))
+        return Image.fromarray(a, "L").convert("RGB")
+
+    def test_prose_band_trimmed_when_caption_present(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        crop = _safe_crop(self._image(3, 6), (50, 50, 750, 200), caption_text="cap")
+        assert crop is not None and crop.size == (700, 150)  # band dropped
+
+    def test_prose_band_kept_without_caption(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        crop = _safe_crop(self._image(3, 6), (50, 50, 750, 200), caption_text=None)
+        assert crop is not None and crop.size == (700, 180)  # band recovered
+
+    def test_figure_band_kept_even_with_caption(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        crop = _safe_crop(self._image(600, 10), (50, 50, 750, 200), caption_text="cap")
+        assert crop is not None and crop.size == (700, 180)  # dense band kept
+
+    def test_prose_scores_below_figure_run_length(self) -> None:
+        from pdfparser.pipeline.figures import _mean_norm_run_length
+
+        width = 700
+        prose = np.zeros((10, width), bool)
+        prose[:, ::9] = True  # 1-px runs, 8-px gaps → letterform-like
+        figure = np.zeros((10, width), bool)
+        figure[:, :600] = True  # one long shaded run
+        assert _mean_norm_run_length(prose) < 0.07 <= _mean_norm_run_length(figure)
+
+
+class TestBakedCaptionTrim:
+    """When the figure is itself text (an alignment), its caption is pixel-identical
+    to it and the model can box it *inside* the figure.  The trailing text bands are
+    re-OCRed and dropped when they reproduce the caption — guarded against a figure
+    row the caption merely names, and against a repeated-token OCR wall."""
+
+    _CAPTION = (
+        "Fig 9. Multiple sequence alignments of widget and gadget proteins. "
+        "Catalytic residues are marked in cyan and the binding site in orange."
+    )
+
+    def test_band_is_caption_matches_caption_words(self) -> None:
+        from pdfparser.pipeline.figures import _WORD_RE, _band_is_caption
+
+        words = set(_WORD_RE.findall(self._CAPTION.lower()))
+        assert _band_is_caption(self._CAPTION, words)
+
+    def test_band_is_caption_rejects_low_overlap(self) -> None:
+        from pdfparser.pipeline.figures import _WORD_RE, _band_is_caption
+
+        words = set(_WORD_RE.findall(self._CAPTION.lower()))
+        # a figure row mentioning a few caption words amid mostly non-caption data:
+        # enough distinct caption words to clear the wall guard, but the matched
+        # fraction stays under the bar
+        assert not _band_is_caption(
+            "catalytic residues marked QWERTY ZXCVB ASDFG HJKL", words
+        )
+
+    def test_band_is_caption_rejects_repeated_token_wall(self) -> None:
+        from pdfparser.pipeline.figures import _WORD_RE, _band_is_caption
+
+        # a row the model fails to read collapses to one caption word repeated —
+        # ~1.0 word-overlap but no diversity, so it must be rejected as degenerate
+        words = set(_WORD_RE.findall((self._CAPTION + " bmsdh").lower()))
+        assert not _band_is_caption("bmsdh " * 200, words)
+
+    def test_band_is_caption_rejects_short_repeated_wall(self) -> None:
+        from pdfparser.pipeline.figures import _WORD_RE, _band_is_caption
+
+        # the wall need not be long: three identical caption words must still fail
+        # (the old type-ratio guard let this through; the distinct-word floor stops it)
+        words = set(_WORD_RE.findall((self._CAPTION + " panel").lower()))
+        assert not _band_is_caption("panel panel panel", words)
+
+    def test_band_is_caption_rejects_too_few_words(self) -> None:
+        from pdfparser.pipeline.figures import _WORD_RE, _band_is_caption
+
+        words = set(_WORD_RE.findall(self._CAPTION.lower()))
+        assert not _band_is_caption("Fig 9", words)
+
+    def test_ink_bands_split_on_gaps(self) -> None:
+        from pdfparser.pipeline.figures import _ink_bands
+
+        mask = np.zeros((200, 50), bool)
+        mask[10:40] = True  # band 1
+        mask[120:160] = True  # band 2, separated by a 80-row gap
+        assert _ink_bands(mask, gap=12) == [(10, 40), (120, 160)]
+
+    def test_ocr_band_pads_thin_band(self) -> None:
+        from pdfparser.pipeline.figures import _FIGURE_OCR_MIN_BAND_PX, _ocr_band
+
+        seen: list[tuple[int, int]] = []
+        _ocr_band(
+            Image.new("RGB", (700, 600), "white"),
+            (0, 100, 700, 110),  # a 10-px band
+            lambda im: seen.append(im.size) or "",
+        )
+        assert seen and seen[0][1] >= _FIGURE_OCR_MIN_BAND_PX
+
+    @staticmethod
+    def _striped(a: np.ndarray, y0: int, y1: int) -> None:
+        a[y0:y1, 50:750:9] = 0  # text-like: thin ink columns (short runs)
+
+    def _text_image(self) -> Image.Image:
+        # figure (top), then a caption band and a note band low in the crop
+        a = np.full((600, 800), 255, np.uint8)
+        for y0, y1 in ((40, 300), (400, 470), (500, 530)):
+            self._striped(a, y0, y1)
+        return Image.fromarray(a, "L").convert("RGB")
+
+    def test_trim_baked_caption_drops_caption_and_note(self) -> None:
+        from pdfparser.pipeline.figures import _trim_baked_caption
+
+        # scan runs bottom→top: note (DOI) → caption → figure band (re-OCRed once to
+        # confirm the boundary, then the scan stops as it isn't caption)
+        replies = iter(
+            ["see https://doi.org/10.1/x", self._CAPTION, "unrelated figure axis tick"]
+        )
+        y1 = _trim_baked_caption(
+            self._text_image(), 0, 800, 0, 530, self._CAPTION, lambda im: next(replies)
+        )
+        assert y1 == 400  # trimmed to the caption's top, note swept with it
+
+    def test_safe_crop_without_ocr_region_keeps_baked_caption(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        # no ocr_region → the OCR trim never runs, so a text-bodied baked caption
+        # stays (the crop reaches the note band's bottom)
+        crop = _safe_crop(
+            self._text_image(), (0, 0, 800, 530), caption_text=self._CAPTION
+        )
+        assert crop is not None and crop.size[1] == 530
 
 
 class TestCrossPageMerge:
@@ -2110,3 +2335,39 @@ class TestPlosSidebarMetadata:
         body = _body(plos_html)
         assert "<h3>Purification of SpRDH</h3>" in body
         assert "<h2>Purification of SpRDH</h2>" in body
+
+
+@pytest.mark.integration
+class TestPlosFigureCrops:
+    """Figure crops on 32639976.pdf (PLOS ONE).  The model's bbox clips the right
+    edge of the wide Fig 5 alignment, and for several figures sits low enough that
+    the bottom-growth would bake the caption into the crop.  The right edge is
+    recovered by ``_extend_right_to_content``; ``_trim_swallowed_caption`` drops a
+    recovered band that reads as the caption when the OCR also emitted that caption
+    as its own text block."""
+
+    def test_fig5_alignment_right_edge_recovered(self, plos_html: str) -> None:
+        # The model clips Fig 5's right edge to ≈0.88·page-width; the alignment
+        # actually spans the full text column, so the recovered crop must reach
+        # well past that — independent of the model's clipped x1, which growth
+        # ignores in favour of the figure's real right edge on the page.
+        size = _figure_size_by_caption(plos_html, "Multiple sequence alignments")
+        assert size is not None, "Fig 5 alignment figure not embedded"
+        assert size[0] > 920, f"Fig 5 width {size[0]}px — right edge not recovered"
+
+    def test_fig5_baked_caption_trimmed(self, plos_html: str) -> None:
+        # The alignment is itself text, so the model boxes its caption + DOI inside
+        # the figure; re-OCR confirms those trailing bands reproduce the caption and
+        # trims them.  Left in, the crop runs ~130 px taller (caption + DOI baked in).
+        size = _figure_size_by_caption(plos_html, "Multiple sequence alignments")
+        assert size is not None, "Fig 5 alignment figure not embedded"
+        assert size[1] < 830, f"Fig 5 height {size[1]}px — caption baked into crop"
+
+    def test_carbon_source_plot_caption_not_baked_in(self, plos_html: str) -> None:
+        # Fig 1 is a roughly square growth-curve plot; the model's box bottom abuts
+        # its 3-line caption + DOI, which the bottom-growth pulls in.  With the
+        # caption trimmed the crop stays near the plot's own height (~590 px); left
+        # un-trimmed it grows past 700 px.
+        size = _figure_size_by_caption(plos_html, "Effect of different carbon sources")
+        assert size is not None, "Fig 1 plot figure not embedded"
+        assert size[1] < 660, f"Fig 1 height {size[1]}px — caption baked into crop"
