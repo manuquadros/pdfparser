@@ -439,11 +439,24 @@ def _is_standalone_page_number(part: str) -> bool:
 
 def _strip_running_furniture(parts: list[str]) -> list[str]:
     """Drop short, recurring header/footer lines (page-number-insensitive) and
-    standalone page-number blocks."""
-    counts: Counter[str] = Counter(
-        key for part in parts if (key := _is_furniture_candidate(part)) is not None
-    )
-    repeated = {key for key, n in counts.items() if n > 1}
+    standalone page-number blocks.
+
+    A heading form only counts as furniture when the same line also appears as a
+    plain paragraph somewhere: a running header/footer is body text the OCR
+    promotes to a heading on sparse pages, so it shows up in both forms.  A line
+    that recurs *only* as a heading is a genuine section heading that the article
+    legitimately repeats (e.g. "Purification of X" under both Methods and
+    Results), not furniture, and must be kept."""
+    counts: Counter[str] = Counter()
+    as_paragraph: set[str] = set()
+    for part in parts:
+        key = _is_furniture_candidate(part)
+        if key is None:
+            continue
+        counts[key] += 1
+        if _plain_p_text(part) is not None:
+            as_paragraph.add(key)
+    repeated = {key for key, n in counts.items() if n > 1 and key in as_paragraph}
     return [
         p
         for p in parts

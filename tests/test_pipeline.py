@@ -143,6 +143,20 @@ class TestRunningFurniture:
         out = _strip_running_furniture(parts)
         assert out == ["<p>Real body sentence one.</p>"]
 
+    def test_heading_repeated_only_as_heading_kept(self) -> None:
+        # A section heading the article legitimately repeats ("Purification of
+        # SpRDH" under both Methods and Results) recurs but never appears as a
+        # plain paragraph, so it is structure, not a running header, and must
+        # survive in both places.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = [
+            "<h3>Purification of SpRDH</h3>",
+            "<p>Real body sentence one.</p>",
+            "<h2>Purification of SpRDH</h2>",
+        ]
+        assert _strip_running_furniture(parts) == parts
+
     def test_standalone_page_number_removed(self) -> None:
         # OCR sometimes isolates the folio into its own block, away from the
         # journal line, so digit-stripped recurrence can't catch it; a number-only
