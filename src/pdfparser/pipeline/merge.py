@@ -13,6 +13,7 @@ from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
     _TABLE_CAPTION_RE,
+    _heading_inner,
     _opens_with_caption_label,
     _plain_p_text,
     _visible_text,
@@ -71,6 +72,24 @@ _BARE_TABLE_LABEL_RE = re.compile(
 )
 
 
+def _bare_table_label_inner(part: str) -> str | None:
+    """The inner HTML of a block that is a *bare* table label ("TABLE IV"), whether
+    the OCR left it a plain ``<p>`` or promoted it to a heading
+    (``<h2>TABLE IV</h2>``).  ``None`` when the block isn't a lone table label.
+
+    A label rendered as a heading must be recognised too: otherwise its title,
+    stranded in the next paragraph, never folds into the table and — lacking
+    terminal punctuation — is mistaken for a body fragment and glued onto the
+    prose that resumes after the table.
+    """
+    inner = _plain_p_text(part)
+    if inner is None and (heading := _heading_inner(part)) is not None:
+        inner = heading[1]
+    if inner is not None and _BARE_TABLE_LABEL_RE.match(_visible_text(inner).strip()):
+        return inner
+    return None
+
+
 def _join_split_table_caption_labels(parts: list[str]) -> list[str]:
     """Rejoin a table caption OCR split into a bare label paragraph and its title.
 
@@ -80,20 +99,17 @@ def _join_split_table_caption_labels(parts: list[str]) -> list[str]:
     adjacent to the table, and the cross-table paragraph merge can't see past
     the stray ``<p>`` either.  A bare label (nothing after the table identifier)
     is never a body sentence, so the following plain paragraph is its title and
-    the two are one caption.
+    the two are one caption.  The label may arrive as a ``<p>`` or as a heading
+    the OCR promoted it to (``<h2>TABLE IV</h2>``).
     """
     out: list[str] = []
     i = 0
     while i < len(parts):
-        inner = _plain_p_text(parts[i])
-        if (
-            inner is not None
-            and _BARE_TABLE_LABEL_RE.match(_visible_text(inner).strip())
-            and i + 1 < len(parts)
-        ):
+        label = _bare_table_label_inner(parts[i])
+        if label is not None and i + 1 < len(parts):
             title = _plain_p_text(parts[i + 1])
             if title is not None and not _opens_with_caption_label(title):
-                out.append(f"<p>{inner.rstrip()} {title.lstrip()}</p>")
+                out.append(f"<p>{label.rstrip()} {title.lstrip()}</p>")
                 i += 2
                 continue
         out.append(parts[i])

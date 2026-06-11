@@ -1110,6 +1110,26 @@ class TestTableCaptionColocation:
             "used to investigate.</caption><tbody><tr><td>a</td></tr></tbody></table>"
         ]
 
+    def test_heading_label_rejoined_then_folded(self) -> None:
+        from pdfparser.pipeline.merge import (
+            _colocate_table_captions,
+            _join_split_table_caption_labels,
+        )
+
+        # The OCR sometimes promotes the bare label to a heading
+        # ("## TABLE IV" → <h2>), stranding the title below it just like the
+        # <p>-form label; it must rejoin and fold the same way.
+        parts = [
+            "<h2>TABLE IV</h2>",
+            "<p>Comparison of rR- and rS-HPCDH kinetic parameters.</p>",
+            "<table><tbody><tr><td>a</td></tr></tbody></table>",
+        ]
+        out = _colocate_table_captions(_join_split_table_caption_labels(parts))
+        assert out == [
+            "<table><caption>TABLE IV Comparison of rR- and rS-HPCDH kinetic "
+            "parameters.</caption><tbody><tr><td>a</td></tr></tbody></table>"
+        ]
+
     def test_labelled_caption_not_rejoined(self) -> None:
         from pdfparser.pipeline.merge import _join_split_table_caption_labels
 
@@ -1164,6 +1184,31 @@ class TestTableCaptionColocation:
         assert "to form <strong>TABLE 1</strong>" not in body
         # The caption no longer appears as a stand-alone paragraph.
         assert "<p><strong>TABLE 1</strong>" not in body
+
+    def test_heading_label_title_not_absorbed_by_body_continuation(self) -> None:
+        # 30592559 page 5→6: the OCR rendered "TABLE IV" as a heading with its
+        # untitled-looking title stranded below.  Lacking terminal punctuation the
+        # title was mistaken for a body fragment and the prose resuming after the
+        # table ("reaction stereospecificity was not…") was glued onto the caption
+        # instead of onto the page-5 paragraph it continues.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Implementation\n\n"
+            "Although the general mechanism of a Zn-dependent alcohol "
+            "dehydrogenase was covered, the\n\n"
+            "## TABLE IV\n\n"
+            "Comparison of rR- and rS-HPCDH kinetic parameters and stereoselectivity"
+            "\n\n"
+            "<table><tbody><tr><td>Km</td></tr></tbody></table>\n\n"
+            "reaction stereospecificity was not. An additional prerequisite topic "
+            "was prochirality."
+        )
+        body = _body(_run_lighton([md]))
+        assert (
+            "dehydrogenase was covered, the reaction stereospecificity was not." in body
+        )
+        assert "<caption>TABLE IV Comparison of rR- and rS-HPCDH" in body
+        # The caption text must not have swallowed the body continuation.
+        assert "stereoselectivity reaction stereospecificity" not in body
 
 
 class TestTableFootnoteColocation:
@@ -1767,6 +1812,27 @@ class TestPipeline:
         assert note in body
         # The note sits immediately after a </table>, not adrift in the prose.
         assert '</table><p class="footnote">Molecule structures' in body
+
+    def test_table_iv_heading_label_does_not_absorb_body_continuation(
+        self, article_html: str
+    ) -> None:
+        # Page 5→6: "TABLE IV" is OCR'd as a heading with its title stranded below.
+        # The page-5 paragraph ("…alcohol dehydrogenase was covered, the") continues
+        # as "reaction stereospecificity was not. …prochirality." after the table; it
+        # must rejoin that paragraph, not be glued onto the TABLE IV caption.
+        body = _body(article_html)
+        assert (
+            "alcohol dehydrogenase was covered, the reaction stereospecificity"
+            " was not. An additional prerequisite topic, covered on the same day"
+            " of the case study, was prochirality." in body
+        )
+        # The TABLE IV title is folded into the table as a caption, not left as a
+        # body paragraph that swallowed the continuation.
+        assert (
+            "<caption>TABLE IV Comparison of rR- and rS-HPCDH kinetic parameters"
+            " and stereoselectivity</caption>" in body
+        )
+        assert "stereoselectivity reaction stereospecificity was not" not in body
 
 
 @pytest.fixture(scope="session")
