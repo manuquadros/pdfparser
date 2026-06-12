@@ -42,11 +42,15 @@ _FUNCTION_WORD_END_RE = re.compile(
     r"|\b(?:that|which|who|whom|this|these|those)[\s,;]*$",
     re.IGNORECASE,
 )
-# An all-caps acronym ("TRII", "DNA", "NAD") opening the continuation is part
-# of the same sentence, not a new-sentence capital, so it must not trip the
-# function-word guard — otherwise a clause split across a column/page break
-# ("…TRI and" / "TRII compete…") is wrongly left as two paragraphs.
-_ACRONYM_HEAD_RE = re.compile(r"^[A-Z]{2,}[0-9]*\b")
+# A scientific identifier opening the continuation — an all-caps acronym ("TRII",
+# "DNA", "NAD") or a mixed-case gene/protein name ("SpRDH", "PtTRI") — is part of
+# the same sentence, not a new-sentence capital, so it must not trip the
+# function-word guard; otherwise a clause split across a column/page break
+# ("…TRI and" / "TRII compete…", or "…carbon metabolism. The" / "SpRDH operon…")
+# is wrongly left as two paragraphs.  The tell is an uppercase letter *inside* the
+# first token (an ordinary sentence-opening word is capitalized only on its first
+# letter), which also subsumes the all-caps acronym case.
+_MIDSENTENCE_HEAD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*[A-Z]")
 # A column/page break can strand a paragraph's continuation behind a whole float
 # cluster — observed as two figures plus a table between the two halves — so the
 # skip window must clear such a cluster.  The grammatical guards below (the
@@ -170,7 +174,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and not (
                             _FUNCTION_WORD_END_RE.search(visible)
                             and cont[:1].isupper()
-                            and not _ACRONYM_HEAD_RE.match(cont)
+                            and not _MIDSENTENCE_HEAD_RE.match(cont)
                         )
                     ):
                         dehyphenated, n = _HYPHEN_BREAK_RE.subn("", stripped)

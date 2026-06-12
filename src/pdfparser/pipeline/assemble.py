@@ -46,6 +46,7 @@ from pdfparser.pipeline.merge import (
 )
 from pdfparser.pipeline.model import OcrModel, _ocr_page, load_ocr_model
 from pdfparser.pipeline.render import _render_page_images
+from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
 from pdfparser.pipeline.text import _looks_like_figure_caption, _visible_text
 
 _WRAPPER_CSS = """
@@ -282,8 +283,10 @@ def _assemble_html(
     pages_md = pages_md[start:]
     images = images[start:]
 
+    # Close any table the OCR left open at a page's bottom before block-splitting,
+    # so a table that overran the page does not swallow the next page's prose.
     per_page_parts = [
-        _page_to_html_parts(md, img, ocr_region)
+        _page_to_html_parts(_close_unclosed_tables(md), img, ocr_region)
         for md, img in zip(pages_md, images, strict=True)
     ]
     # Front matter the OCR scattered into the article's first page — a glossary
@@ -342,4 +345,6 @@ def lightonocr_pdf_to_html(
         ocr = load_ocr_model(device)
     images = _render_page_images(Path(pdf_path))
     pages_md = [_ocr_page(img, ocr) for img in images]
-    return _assemble_html(pages_md, images, lambda region: _ocr_page(region, ocr))
+    ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
+    pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_region)
+    return _assemble_html(pages_md, images, ocr_region)

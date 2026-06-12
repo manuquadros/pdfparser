@@ -63,6 +63,31 @@ def _body(html: str) -> str:
     raise AssertionError("unclosed body div")
 
 
+def _tables_text(html: str) -> str:
+    """Visible text rendered *inside* any <table> in the body, tag-stripped.
+
+    Depth-aware (not a `<table>...</table>` regex) so an unclosed table — one the
+    OCR left open at a page bottom — is seen to extend to the document end and thus
+    captures any following prose it swallows.  Used both to assert real cell content
+    is present and to assert post-table prose is *not* absorbed."""
+    body = _body(html)
+    out: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(body):
+        if body[i : i + 6].lower() == "<table":
+            depth += 1
+            i += 6
+        elif body[i : i + 8].lower() == "</table>":
+            depth = max(0, depth - 1)
+            i += 8
+        else:
+            if depth > 0:
+                out.append(body[i])
+            i += 1
+    return re.sub(r"<[^>]+>", "", "".join(out))
+
+
 def _metadata(html: str) -> str:
     """Content of the collapsible <details class='metadata'> panel."""
     start = html.find("<details class='metadata'>")
@@ -1223,6 +1248,31 @@ class TestCrossPageMerge:
         assert "This suggests that TRI and TRII compete for the same substrate" in html
         assert "This suggests that TRI and</p>" not in html
 
+    def test_mixed_case_identifier_continuation_after_the(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # the fragment ends in "The"; the continuation opens with a mixed-case
+        # identifier ("SpRDH"), which is mid-sentence, not a new-sentence capital —
+        # so the merge fires across the intervening table float
+        parts = [
+            "<p>enter the pentose phosphate pathway for carbon metabolism. The</p>",
+            "<table><tr><td>x</td></tr></table>",
+            "<p>SpRDH operon of the genome contains a transporter.</p>",
+        ]
+        merged = _merge_split_paragraphs(parts)
+        assert any("metabolism. The SpRDH operon of the genome" in p for p in merged)
+
+    def test_function_word_guard_still_refuses_new_sentence(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # a plain capitalized word after "The" (no internal capital) signals a
+        # dropped continuation — the guard must still refuse the merge
+        parts = [
+            "<p>they use the Entner-Doudoroff pathway for glucose metabolism. The</p>",
+            "<p>Many sugar alcohols enter the pentose phosphate pathway.</p>",
+        ]
+        assert _merge_split_paragraphs(parts) == parts
+
 
 class TestCaptionMergeBarrier:
     """A figure/table caption is never absorbed as a paragraph continuation,
@@ -2371,3 +2421,297 @@ class TestPlosFigureCrops:
         size = _figure_size_by_caption(plos_html, "Effect of different carbon sources")
         assert size is not None, "Fig 1 plot figure not embedded"
         assert size[1] < 660, f"Fig 1 height {size[1]}px — caption baked into crop"
+
+
+class TestTableTextHelpers:
+    """Pure markup helpers for table re-OCR substitution."""
+
+    def test_cell_texts_and_count(self) -> None:
+        from pdfparser.pipeline.tables import _cell_texts, _nonempty_cell_count
+
+        table = (
+            "<table><thead><tr><th>Metal ion</th><th></th></tr></thead>"
+            "<tbody><tr><td>Mg<sup>2+</sup></td><td>3.0</td></tr></tbody></table>"
+        )
+        assert _cell_texts(table) == ["Metal ion", "Mg2+", "3.0"]
+        # the empty <th> does not count
+        assert _nonempty_cell_count(table) == 3
+
+    def test_table_regions_group_consecutive_split_on_prose(self) -> None:
+        from pdfparser.pipeline.tables import _table_regions
+
+        md = (
+            "intro\n\n"
+            "<table><tr><td>a</td></tr></table>\n\n"
+            "<table><tr><td>b</td></tr></table>\n\n"
+            "some prose\n\n"
+            "<table><tr><td>c</td></tr></table>"
+        )
+        regions = _table_regions(md)
+        assert [len(tables) for _, _, tables in regions] == [2, 1]
+        # the spans address only the <table> blocks, not the prose between regions
+        start, end, _ = regions[1]
+        assert md[start:end] == "<table><tr><td>c</td></tr></table>"
+
+    def test_crop_trailing_returns_text_after_last_table(self) -> None:
+        from pdfparser.pipeline.tables import _crop_trailing
+
+        legend = "MW: molecular weight, NR: Not reported"
+        md = f"<table><tr><td>x</td></tr></table>\n\n{legend}"
+        assert _crop_trailing(md) == legend
+        assert _crop_trailing("no table here") == ""
+
+    def test_extract_tables_strips_inner_caption(self) -> None:
+        from pdfparser.pipeline.tables import _extract_tables
+
+        # a level-1 heading is the overall caption (carried separately), so it is
+        # not folded into the table
+        md = (
+            "# Table 2\n\n"
+            "<table><caption>Table 2. X</caption><tr><td>x</td></tr></table>\n"
+        )
+        assert _extract_tables(md) == ["<table><tr><td>x</td></tr></table>"]
+
+    def test_extract_tables_folds_subheading_as_spanning_row(self) -> None:
+        from pdfparser.pipeline.tables import _extract_tables
+
+        # the crop re-OCR lifts a sub-table label into a level-2 heading; it must
+        # come back as a spanning header row spanning all the table's columns
+        md = (
+            "## A. Effect on activity\n\n"
+            "<table><tbody><tr><td>None</td><td>100</td><td>99</td></tr>"
+            "</tbody></table>"
+        )
+        [table] = _extract_tables(md)
+        expected = '<thead><tr><th colspan="3">A. Effect on activity</th></tr></thead>'
+        assert expected in table
+
+
+class TestTableNormalization:
+    """NFKD-plus-alnum folding closes the encoding gap between an OCR'd cell and
+    the PDF text layer so the same content matches across both."""
+
+    def test_superscript_and_micro_fold_to_text_layer_form(self) -> None:
+        from pdfparser.pipeline.tables import _normalize
+
+        assert _normalize("Mg²⁺") == _normalize("Mg2+") == "mg2"
+        # micro sign vs Greek mu, and superscript ⁻¹ (a U+2212 minus) vs ASCII -1
+        assert _normalize("µg L⁻¹") == _normalize("μg L-1")
+
+    def test_index_map_recovers_source_range(self) -> None:
+        from pdfparser.pipeline.tables import _normalize_with_map
+
+        text = "A: Mg²⁺ ok"
+        norm, idx_map = _normalize_with_map(text)
+        assert len(norm) == len(idx_map)
+        # the normalized "mg2" maps back onto the original "Mg²" span
+        p = norm.index("mg2")
+        assert text[idx_map[p] : idx_map[p + 2] + 1] == "Mg²"
+
+
+class TestTableLocalization:
+    """``_locate_bbox`` grows an anchor seed through the table's rows but halts at
+    the wider margin to body prose, so a re-OCR crop stays tight on the table."""
+
+    @staticmethod
+    def _layout(
+        lines: list[tuple[str, float | int, float | int]],
+    ) -> tuple[str, list[tuple[float, float, float, float] | None]]:
+        # Lay each (text, y_top, x_left) line out as fixed 6×8 pt glyph boxes,
+        # spaces and the inter-line newline carrying a degenerate (None) box —
+        # mirroring how pdfium reports them.
+        text = ""
+        boxes: list[tuple[float, float, float, float] | None] = []
+        for i, (s, y_top, x_left) in enumerate(lines):
+            if i:
+                text += "\n"
+                boxes.append(None)
+            x = float(x_left)
+            top = float(y_top)
+            for ch in s:
+                text += ch
+                boxes.append(None if ch == " " else (x, top - 8, x + 6, top))
+                x += 6
+        return text, boxes
+
+    def test_bbox_covers_table_rows_excludes_prose(self) -> None:
+        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+
+        # A 5-row table at the top, then a wide gap, then dense prose.  Only the
+        # heading row is a (unique) anchor; growth must still reach the trailing
+        # rows yet stop before the prose.
+        lines = [
+            ("Effect of EDTA on activity", 700, 50),
+            ("Relative activity percent", 688, 200),
+            ("None 100 100", 676, 50),
+            ("EDTA 100 99", 664, 50),
+            ("12 34 56", 652, 50),
+            ("Discussion text begins here now", 600, 50),
+            ("and continues across the page", 588, 50),
+        ]
+        text, boxes = self._layout(lines)
+        norm, idx_map = _normalize_with_map(text)
+        bbox = _locate_bbox(
+            ["effect of edta on activity"], norm, idx_map, boxes, (400.0, 800.0)
+        )
+        assert bbox is not None
+        left, bottom, right, top = bbox
+        assert top >= 700 and bottom <= 644  # spans heading down to the "12 34 56" row
+        assert bottom > 600  # the Discussion prose is excluded
+        # the dropped-style interior row lies within the located region
+        assert bottom <= 680 and top >= 688
+
+    def test_returns_none_when_no_anchor_matches(self) -> None:
+        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+
+        text, boxes = self._layout([("Effect of EDTA on activity", 700, 50)])
+        norm, idx_map = _normalize_with_map(text)
+        assert _locate_bbox(["nowhere"], norm, idx_map, boxes, (400.0, 800.0)) is None
+
+    def test_repeated_anchor_is_ambiguous_and_skipped(self) -> None:
+        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+
+        # "alpha beta" occurs twice, so it cannot seed the box on its own.
+        text, boxes = self._layout(
+            [("alpha beta", 700, 50), ("filler here", 660, 50), ("alpha beta", 300, 50)]
+        )
+        norm, idx_map = _normalize_with_map(text)
+        bbox = _locate_bbox(["alpha beta"], norm, idx_map, boxes, (400.0, 800.0))
+        assert bbox is None
+
+
+@pytest.mark.integration
+class TestPlosTableReocr:
+    """32639976.pdf Table 2: the full-page OCR pass drops the column-spanning
+    subheader "Relative activity (%)" from part A.  Re-OCRing the table region as a
+    tight crop (localized via the text layer) recovers it, with the spanning markup
+    the full-page pass omitted."""
+
+    def test_relative_activity_header_recovered(self, plos_html: str) -> None:
+        body = _body(plos_html)
+        assert "Relative activity (%)" in body
+
+    def test_recovered_header_spans_its_columns(self, plos_html: str) -> None:
+        # the crop re-OCR emits the subheader as a colspan cell over the two data
+        # columns — structure the full-page pass never produced
+        body = _body(plos_html)
+        m = re.search(r'colspan="2"[^>]*>\s*Relative activity', body)
+        assert m is not None, "spanning subheader not recovered with colspan"
+
+
+# The table-content needles below are not harvested from the pipeline's own OCR
+# output (that would be circular — it would only pin whatever the OCR happens to
+# emit, garbage included).  Each is verified to exist in the PDF's embedded text
+# layer — the publisher's ground truth, independent of our OCR — so the test
+# catches a re-OCR that drops or mislocates a table into wrong-region content.
+
+
+@pytest.mark.integration
+class TestHpcdhTableContent:
+    """30592559.pdf carries four data tables (TABLE I–IV); each must keep its real
+    cell content through the table re-OCR pass.  Needles confirmed in the PDF text
+    layer (ground truth), not copied from OCR output."""
+
+    def test_all_four_table_captions_present(self, article_html: str) -> None:
+        body = _body(article_html)
+        for caption in ("TABLE I", "TABLE II", "TABLE III", "TABLE IV"):
+            assert caption in body, f"{caption!r} missing"
+
+    def test_distinctive_cells_live_in_tables(self, article_html: str) -> None:
+        # one distinctive ground-truth cell per table, asserted inside <table>
+        # markup (not merely loose in the body prose)
+        cells = _tables_text(article_html)
+        for needle in (
+            "Enantioselectivity",  # TABLE I header
+            "2-Butanone",  # TABLE II column
+            "2-Butanol production",  # TABLE III header
+            "rR-HPCDH",  # TABLE IV row
+        ):
+            assert needle in cells, f"{needle!r} not found inside any table"
+
+
+@pytest.mark.integration
+class TestTropinoneTableContent:
+    """31051047.pdf has two kinetics tables (TABLE 1 and an uncaptioned homolog
+    comparison).  Needles confirmed in the PDF text layer (ground truth)."""
+
+    def test_kinetics_table_content(self, ad_prefix_html: str) -> None:
+        cells = _tables_text(ad_prefix_html)
+        # nKat is the kinetics table's activity unit; both isoforms are its rows
+        assert "nKat" in cells
+        assert "PtTRI" in cells and "PtTRII" in cells
+
+    def test_homolog_table_species_and_reference(self, ad_prefix_html: str) -> None:
+        # the second table lists homologs by species with a reference column; its
+        # rows must not be lost
+        cells = _tables_text(ad_prefix_html)
+        assert "Przewalskia tangutica" in cells
+        assert "In this study" in cells
+
+
+class TestUnclosedTableClosing:
+    """A table the OCR leaves open at a page bottom must be closed before assembly,
+    or it swallows whatever follows (most visibly the next page's prose)."""
+
+    def test_close_unclosed_tables_balances_and_is_idempotent(self) -> None:
+        from pdfparser.pipeline.tables import _close_unclosed_tables
+
+        assert (
+            _close_unclosed_tables("<table><tr><td>a</td><td>0")
+            == "<table><tr><td>a</td><td>0</table>"
+        )
+        balanced = "<table><tr><td>a</td></tr></table>"
+        assert _close_unclosed_tables(balanced) == balanced
+
+    def test_overrun_table_does_not_swallow_next_page_prose(self) -> None:
+        # page 1's table runs off the bottom with no </table>; page 2 opens with
+        # prose that must render as body text, not inside the table
+        page1 = "<table>\n<tr><td>Organism</td><td>M.W.</td></tr>\n<tr><td>X</td><td>0"
+        page2 = "Downstream prose that follows the table on the next page."
+        html = _run_lighton([page1, page2])
+        assert "Downstream prose that follows" in _body(html)
+        assert "Downstream prose that follows" not in _tables_text(html)
+
+
+@pytest.mark.integration
+class TestPlosTableOverrun:
+    """Table 3 of 32639976.pdf overruns its page; the OCR leaves it unclosed and the
+    following page's prose ("SpRDH operon …", verified in the PDF text layer) would
+    render inside the table.  It must stay body prose, and tables must be balanced."""
+
+    def test_post_table_prose_not_in_table(self, plos_html: str) -> None:
+        cells = _tables_text(plos_html)
+        assert "SpRDH operon" in _body(plos_html)  # present as prose
+        assert "SpRDH operon" not in cells
+        assert "PAMC 26621 genome" not in cells
+
+    def test_all_tables_balanced(self, plos_html: str) -> None:
+        # the general invariant: no table is left open to absorb following content
+        body = _body(plos_html)
+        assert body.count("<table") == body.count("</table>")
+
+    def test_truncated_last_row_recovered(self, plos_html: str) -> None:
+        # the last row (Enterobacter aerogenes) was cut at the page bottom; once the
+        # table is closed it becomes a region the crop re-OCR recovers in full,
+        # restoring the row's tail — Km NAD⁺ 0.16, kcat 318, kcat/Km 30.9 (all
+        # verified in the PDF text layer)
+        cells = _tables_text(plos_html)
+        for value in ("0.16", "318", "30.9"):
+            assert value in cells, f"{value!r} not recovered into the table"
+
+    def test_table_legend_recovered(self, plos_html: str) -> None:
+        # the legend was truncated together with the overrun row; the crop re-OCR
+        # (bbox extended one line to reach it) recovers it as a footnote under the
+        # table — verified in the PDF text layer
+        text = re.sub(r"<[^>]+>", "", _body(plos_html))
+        assert "MW: molecular weight, NR: Not reported" in text
+
+    def test_paragraph_split_across_tables_rejoined(self, plos_html: str) -> None:
+        # the sentence is split at the page break ("…carbon metabolism. The" on one
+        # page, "SpRDH operon …" on the next) with Tables 2 and 3 between the halves;
+        # the cross-table merge must rejoin it into one paragraph
+        text = re.sub(r"<[^>]+>", "", _body(plos_html))
+        assert (
+            "The SpRDH operon of Sphingomonas sp. PAMC 26621 genome "
+            "contains a putative ABC transporter" in text
+        )

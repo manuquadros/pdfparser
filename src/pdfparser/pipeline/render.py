@@ -11,6 +11,20 @@ _RENDER_SCALE = 200 / 72  # 200 DPI per the model card
 _OCR_MAX_LONG_SIDE = 1540  # model-card target; VRAM ≈ 2.7/6.1 GiB at this size
 
 
+def _downscale_to_long_side(img: Image.Image) -> Image.Image:
+    """Shrink ``img`` so its long side is ≤ ``_OCR_MAX_LONG_SIDE`` (no-op if it
+    already fits).  Shared by full-page render and the table-crop render so both
+    honour the model's long-side budget from one place."""
+    long_side = max(img.size)
+    if long_side <= _OCR_MAX_LONG_SIDE:
+        return img
+    ratio = _OCR_MAX_LONG_SIDE / long_side
+    return img.resize(
+        (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+        Image.Resampling.LANCZOS,
+    )
+
+
 def _render_page_images(pdf_path: Path) -> list[Image.Image]:
     """Render every page to an RGB image, long side ≤ ``_OCR_MAX_LONG_SIDE``.
 
@@ -19,17 +33,11 @@ def _render_page_images(pdf_path: Path) -> list[Image.Image]:
     """
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
-        images: list[Image.Image] = []
-        for page in pdf:
-            img = page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
-            long_side = max(img.size)
-            if long_side > _OCR_MAX_LONG_SIDE:
-                ratio = _OCR_MAX_LONG_SIDE / long_side
-                img = img.resize(
-                    (int(img.size[0] * ratio), int(img.size[1] * ratio)),
-                    Image.Resampling.LANCZOS,
-                )
-            images.append(img)
-        return images
+        return [
+            _downscale_to_long_side(
+                page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
+            )
+            for page in pdf
+        ]
     finally:
         pdf.close()

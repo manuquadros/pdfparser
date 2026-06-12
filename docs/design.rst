@@ -25,6 +25,9 @@ The flow (design *B-prime*)::
      │  model.py         LightOnOCR → per-page markdown   ← the only GPU/IO seam
      ▼
     per-page markdown
+     │  tables.py        re-OCR each table region as a tight crop  ← GPU/IO leaf
+     ▼
+    per-page markdown (richer tables)
      │  markdown.py      markdown → list of block-HTML strings
      │  latex.py         inline $…$ → <sup>/<sub>/Unicode
      │  figures.py       ![image] box → cropped <figure>
@@ -46,6 +49,14 @@ rendering and OCR around.  That is what makes the hard parts unit-testable
 without a GPU: feed synthetic markdown plus blank images straight into the core
 and assert on the HTML.  When you add a stage, keep it on the pure side of the
 seam unless it genuinely needs pixels.
+
+The one GPU/IO leaf *upstream* of the core is
+:mod:`pdfparser.pipeline.tables` (the table re-OCR pass): the orchestrator runs
+it on the per-page markdown before handing the markdown to the pure core, so the
+core still sees only ``(markdown, images)`` and stays model-free.  Its own pure
+helpers — cell extraction, text folding, table-region grouping, and the
+bbox-from-the-text-layer geometry — are unit-tested directly with synthetic
+inputs; only the render-and-re-OCR wrapper touches the GPU.
 
 A note on testing: because real OCR output is the thing the heuristics actually
 face, the highest-value regression tests replay *recorded* model markdown through
@@ -157,10 +168,14 @@ internalizing because they encode this caution:
   real continuation was probably dropped by OCR, and the merge is *refused*
   rather than gluing unrelated text together.
 
-* The **acronym exception** (``_ACRONYM_HEAD_RE``):
-  an all-caps head ("TRII", "DNA") is mid-sentence, not a new-sentence capital, so
-  it is allowed through — without this, a clause split as "…TRI and" / "TRII
-  compete…" would be wrongly left in two.
+* The **identifier exception** (``_MIDSENTENCE_HEAD_RE``):
+  a continuation opening with a scientific identifier — an all-caps acronym
+  ("TRII", "DNA") or a mixed-case gene/protein name ("SpRDH", "PtTRI") — is
+  mid-sentence, not a new-sentence capital, so it is allowed through.  The tell is
+  an uppercase letter *inside* the first token (a sentence-opening word is
+  capitalized only on its first letter).  Without this, a clause split as
+  "…TRI and" / "TRII compete…", or "…carbon metabolism. The" / "SpRDH operon…",
+  is wrongly left in two.
 
 A subtlety that bites if you touch these predicates: terminal punctuation often
 hides inside a closing inline tag (``…carboxylase.</em>``).  Run sentence-end and
@@ -212,6 +227,47 @@ OCR decoding is greedy (:func:`~pdfparser.pipeline.model._ocr_page`).  OCR wants
 the single most-likely transcription, and a deterministic decode avoids
 run-to-run drift — notably a figure box that occasionally over-segments into two
 stacked crops on a sampled decode.
+
+Tables are re-OCR'd from a tight crop (:mod:`pdfparser.pipeline.tables`).  The
+full-page pass silently drops small in-table content — a column-spanning
+subheader, the ``colspan``/``rowspan`` structure of a header — and does so at
+*every* render resolution; the loss is to the dense full page, not to pixels.
+Re-OCRing the table on its own recovers it.  The hard part is locating the table
+to crop: the model boxes figures but never tables, and ignores any prompt asking
+it to, so the geometry has to come from elsewhere.  The choice (Option 3) is to
+use the **PDF text layer for geometry only** — a deliberately narrow carve-out of
+B-prime's "OCR reads, nothing else does" rule.  The cells the full-page pass
+*did* capture are matched against the text layer (after an NFKD-plus-alphanumeric
+fold that closes the encoding gap — superscripts, the micro sign, the assorted
+dashes — between OCR'd cell and text-layer glyph) to seed a bounding box, which
+is then grown line-by-line through the table's rows and **halted at the wider gap
+to body prose** (the threshold is the table's own median line spacing, robust to a
+single wide internal row-group break).  The text layer's *content* is never read
+into the document; it only supplies coordinates, so the model stays the sole
+reader.  Two biases mirror the figure logic: localization may **over-shoot into
+surrounding prose** — mostly harmless, because only ``<table>`` blocks are lifted
+from the crop's re-OCR and the prose discarded — and a region is replaced only when
+the re-OCR returns *at least as many non-empty cells* as the original, so a crop
+that came back worse leaves the full-page transcription untouched.
+
+Two limitations ride on this, both currently acceptable because the corpus is
+single-column in the table band.  Horizontal extent is the union of the table's
+lines, which on a **two-column page** would pull in the neighbouring column; if
+that column's prose then re-OCRs back *as* table markup it can inflate the
+cell-count guard and slip through, so the guard is a backstop, not a proof of
+correctness.  And the guard counts cells, not structure — it cannot by itself tell
+a table that traded a data row for header cells from one that genuinely improved;
+the per-fixture table-content integration tests are what hold that line.  Pages
+with no text layer (scanned PDFs) simply fail to localize and keep the full-page
+table — a geometric/CV detector would be the fallback for either case if it ever
+matters.
+
+Separately, a table that *overruns the bottom of a page* is transcribed without a
+closing ``</table>`` — the model stops mid-table at the page edge — so the next
+page's opening prose would render inside it.
+:func:`~pdfparser.pipeline.tables._close_unclosed_tables` balances the tags per
+page (the unit the model transcribes) before block-splitting, scoped to the pure
+core so it runs whether or not the re-OCR pass did.
 
 Stage order is load-bearing.  In
 :func:`~pdfparser.pipeline.assemble._assemble_html` the clean-up runs in a fixed
