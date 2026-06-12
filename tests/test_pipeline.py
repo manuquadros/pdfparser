@@ -2032,6 +2032,50 @@ class TestMdToHtmlBlocks:
         table = "<table><tbody><tr><td>1</td></tr></tbody></table>"
         assert _md_to_html_blocks(table) == [table]
 
+    def test_table_cell_emphasis_rendered(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # Raw-HTML table cells carry the model's ``*emphasis*`` unparsed; organism
+        # names in a cell must still italicise instead of showing bare asterisks.
+        table = (
+            "<table><tbody><tr><td>*Sphingomonas* sp. PAMC 26621</td></tr>"
+            "<tr><th>*Klebsiella aerogenes*</th></tr></tbody></table>"
+        )
+        (block,) = _md_to_html_blocks(table)
+        assert "<td><em>Sphingomonas</em> sp. PAMC 26621</td>" in block
+        assert "<th><em>Klebsiella aerogenes</em></th>" in block
+        assert "*" not in block
+
+    def test_table_cell_lone_asterisk_kept_literal(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # A single footnote-marker asterisk is not an emphasis span — it must stay.
+        (block,) = _md_to_html_blocks(
+            "<table><tbody><tr><td>100*</td></tr></tbody></table>"
+        )
+        assert "<td>100*</td>" in block
+
+    def test_table_cell_spaced_asterisks_not_emphasis(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # Asterisks flanked by spaces (multiplication, paired footnote daggers) are
+        # not CommonMark emphasis — they must stay literal, not wrap an <em>.
+        (block,) = _md_to_html_blocks(
+            "<table><tbody><tr><td>5 * 10 * 3</td></tr></tbody></table>"
+        )
+        assert "<td>5 * 10 * 3</td>" in block
+        assert "<em>" not in block
+
+    def test_table_cell_stray_lt_and_amp_escaped(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # A bare "<" / "&" / ">" inside a cell must be escaped, not left to start a
+        # bogus tag or a broken entity.
+        (block,) = _md_to_html_blocks(
+            "<table><tbody><tr><td>n<5 & p>0.05</td></tr></tbody></table>"
+        )
+        assert "<td>n&lt;5 &amp; p&gt;0.05</td>" in block
+
     def test_sup_passthrough(self) -> None:
         from pdfparser.pipeline.markdown import _md_to_html_blocks
 
@@ -2461,6 +2505,28 @@ class TestTableTextHelpers:
         assert _crop_trailing(md) == legend
         assert _crop_trailing("no table here") == ""
 
+    def test_legend_footnote_preserves_sup_marker(self) -> None:
+        from pdfparser.pipeline.tables import _legend_footnote_html
+
+        # The recovered legend's <sup> marker and *emphasis* are OCR markup: render
+        # them, don't HTML-escape (which would print a literal "<sup>a</sup>").
+        legend = "<sup>a</sup>Each value represents the mean ± SD, *n* = 3."
+        assert _legend_footnote_html(legend) == (
+            '<p class="footnote"><sup>a</sup>Each value represents the mean ± SD, '
+            "<em>n</em> = 3.</p>"
+        )
+
+    def test_legend_footnote_escapes_stray_markup(self) -> None:
+        from pdfparser.pipeline.tables import _legend_footnote_html
+
+        # A bare "<"/"&" in a legend ("n<5", "Tris & HCl") must be escaped, not left
+        # to start a bogus tag — while a real <sup> marker still passes through.
+        legend = "<sup>a</sup>Significant at n<5; Tris & HCl buffer"
+        assert _legend_footnote_html(legend) == (
+            '<p class="footnote"><sup>a</sup>Significant at n&lt;5; '
+            "Tris &amp; HCl buffer</p>"
+        )
+
     def test_extract_tables_strips_inner_caption(self) -> None:
         from pdfparser.pipeline.tables import _extract_tables
 
@@ -2715,3 +2781,28 @@ class TestPlosTableOverrun:
             "The SpRDH operon of Sphingomonas sp. PAMC 26621 genome "
             "contains a putative ABC transporter" in text
         )
+
+
+@pytest.mark.integration
+class TestPlosTableFormatting:
+    """Inline markup the OCR leaves inside table blocks must render, not surface
+    as literal source: organism names in Table 3 cells are italicised, and Table
+    2's footnote keeps its real <sup> marker rather than an escaped tag."""
+
+    def test_table3_organism_names_italicised(self, plos_html: str) -> None:
+        # Table 3's Organism column carries ``*Klebsiella aerogenes*`` etc. as raw
+        # markdown inside the HTML cell; it must come out as <em>, not bare "*".
+        body = _body(plos_html)
+        assert "<em>Klebsiella aerogenes</em>" in body
+        assert "<em>Zymomonas mobilis</em>" in body
+        assert "*Klebsiella" not in body
+
+    def test_table2_footnote_marker_not_escaped(self, plos_html: str) -> None:
+        # Table 2's footnote marker is recovered as ``<sup>a</sup>…``; it must render
+        # as a superscript, never as an HTML-escaped "&lt;sup&gt;" literal anywhere.
+        text = re.sub(r"<[^>]+>", "", _body(plos_html))
+        assert (
+            "Each value represents the mean ± SD of three independent experiments"
+            in text
+        )
+        assert "&lt;sup&gt;" not in plos_html
