@@ -8,7 +8,7 @@ rendered page, and assembles a document shell.
 
 The package is split by concern:
 
-* ``model`` — load LightOnOCR and OCR one page (the only GPU seam).
+* ``model`` — HTTP client seam: OCR one page via the vLLM server.
 * ``render`` — PDF page → PIL image.
 * ``latex`` / ``markdown`` — text → HTML conversion.
 * ``figures`` — bbox geometry, crop recovery, ``<figure>`` emission.

@@ -26,9 +26,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Output HTML path (default: input path with a .html suffix).",
     )
     parser.add_argument(
-        "--device",
+        "--vllm-url",
         default=None,
-        help="Torch device for the model (default: cuda if available, else cpu).",
+        help="vLLM endpoint root (default: $PDFPARSER_VLLM_URL or "
+        "http://127.0.0.1:8000/v1).",
+    )
+    parser.add_argument(
+        "--vllm-model",
+        default=None,
+        help="Served model name (default: $PDFPARSER_VLLM_MODEL or lightonocr).",
     )
     args = parser.parse_args(argv)
 
@@ -37,7 +43,9 @@ def main(argv: list[str] | None = None) -> int:
 
     output = args.output or args.pdf.with_suffix(".html")
 
-    html = lightonocr_pdf_to_html(args.pdf, device=args.device)
+    html = lightonocr_pdf_to_html(
+        args.pdf, base_url=args.vllm_url, model=args.vllm_model
+    )
     output.write_text(html, encoding="utf-8")
     print(f"Wrote {output}")
     return 0

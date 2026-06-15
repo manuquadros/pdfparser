@@ -332,19 +332,26 @@ def lightonocr_pdf_to_html(
     pdf_path: Path | str,
     *,
     ocr: OcrModel | None = None,
-    device: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Convert a PDF to self-contained HTML with LightOnOCR-2-1B-bbox.
 
     Args:
         pdf_path: Path to the input PDF.
-        ocr: Pre-loaded model bundle.  ``None`` calls ``load_ocr_model()``.
-        device: Torch device string.  Only used when ``ocr`` is ``None``.
+        ocr: Open connection bundle.  ``None`` calls ``load_ocr_model()``.
+        base_url: vLLM endpoint root, used only when ``ocr`` is ``None``.
+        model: Served model name, used only when ``ocr`` is ``None``.
     """
+    owns_ocr = ocr is None
     if ocr is None:
-        ocr = load_ocr_model(device)
-    images = _render_page_images(Path(pdf_path))
-    pages_md = [_ocr_page(img, ocr) for img in images]
-    ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
-    pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_region)
-    return _assemble_html(pages_md, images, ocr_region)
+        ocr = load_ocr_model(base_url=base_url, model=model)
+    try:
+        images = _render_page_images(Path(pdf_path))
+        pages_md = [_ocr_page(img, ocr) for img in images]
+        ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
+        pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_region)
+        return _assemble_html(pages_md, images, ocr_region)
+    finally:
+        if owns_ocr:
+            ocr.close()

@@ -40,6 +40,94 @@ def _run_lighton(pages_md: list[str], image: Image.Image | None = None) -> str:
     return _assemble_html(pages_md, [img for _ in pages_md])
 
 
+class TestOcrSeam:
+    """The model seam is now an HTTP client to the vLLM server, so it is
+    unit-testable with a mock transport — no GPU, no model load."""
+
+    def test_ocr_page_request_shape_and_parsing(self) -> None:
+        import json
+
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "# OCR markdown"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        result = _ocr_page(_fake_image(8, 8), ocr)
+
+        assert result == "# OCR markdown"
+        assert captured["url"] == "http://srv/v1/chat/completions"
+        body = captured["body"]
+        assert isinstance(body, dict)
+        # Greedy decode (matches the former in-process do_sample=False) against
+        # the served model name.
+        assert body["temperature"] == 0.0
+        assert body["model"] == "lightonocr"
+        part = body["messages"][0]["content"][0]
+        assert part["type"] == "image_url"
+        assert part["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_ocr_page_raises_on_server_error(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "boom"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        with pytest.raises(httpx.HTTPStatusError):
+            _ocr_page(_fake_image(8, 8), ocr)
+
+    def test_ocr_page_null_content_returns_empty_string(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {"choices": [{"message": {"content": None}}]}
+            return httpx.Response(200, json=body)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        # A degenerate page must yield "" (a str), not trip the return contract.
+        assert _ocr_page(_fake_image(8, 8), ocr) == ""
+
+    def test_ocr_page_raises_on_malformed_response(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"choices": []})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        with pytest.raises(RuntimeError, match="unexpected OCR response"):
+            _ocr_page(_fake_image(8, 8), ocr)
+
+    def test_ocr_model_context_manager_closes_client(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel
+
+        transport = httpx.MockTransport(lambda r: httpx.Response(200))
+        client = httpx.Client(transport=transport)
+        with OcrModel(client=client, base_url="http://srv/v1", model="m") as ocr:
+            assert not ocr.client.is_closed
+        assert client.is_closed
+
+
 def _body(html: str) -> str:
     """Extract the content of the <div class="body"> element.
 

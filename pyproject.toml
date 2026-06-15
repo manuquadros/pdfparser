@@ -7,9 +7,7 @@ readme = "README.md"
 requires-python = "<3.14,>=3.13"
 license = "GPL-3.0-or-later"
 dependencies = [
-  "transformers>=5.9",
-  "torch",
-  "torchvision",
+  "httpx",
   "pypdfium2",
   "pillow",
   "markdown-it-py>=3",
@@ -37,16 +35,6 @@ dev = [
   "ipython-autotime>=0.3.2",
   "starlette>=1.0.1",
 ]
-
-[[tool.pdm.source]]
-name = "torch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-include_packages = ["torch", "torchvision", "torchaudio"]
-
-[[tool.pdm.source]]
-name = "pypi"
-url = "https://pypi.org/simple"
-exclude_packages = ["torch", "torchvision", "torchaudio"]
 
 [tool.pdm.scripts]
 to-html = "python -m pdfparser"

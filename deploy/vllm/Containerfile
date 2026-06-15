@@ -1,0 +1,41 @@
+# Unified image: the vLLM server (GPU + torch 2.11) and the pdfparser client in
+# one container. vLLM owns torch/transformers; pdfparser carries neither, so
+# there is no version conflict to resolve — it just talks to 127.0.0.1:8000.
+#
+# Build:  podman build -f deploy/vllm/Containerfile -t lighton-pdfparser .
+# (build context is the repo root so the COPYs see src/ and pyproject.toml)
+ARG VLLM_TAG=v0.22.1
+FROM docker.io/vllm/vllm-openai:${VLLM_TAG}
+
+# pdfparser's runtime deps. httpx and pillow already ship in the vLLM image, but
+# listing them keeps the install self-contained if the base ever drops them;
+# pip no-ops anything already satisfied and does not touch torch/transformers.
+RUN pip install --no-cache-dir \
+      httpx \
+      pillow \
+      pypdfium2 \
+      "markdown-it-py>=3" \
+      "pylatexenc>=2.10"
+
+# Install pdfparser itself with --no-deps: the deps above are already present, so
+# this only adds the package and cannot disturb the image's torch/transformers.
+COPY pyproject.toml README.md /opt/pdfparser/
+COPY src /opt/pdfparser/src
+RUN pip install --no-cache-dir --no-deps /opt/pdfparser
+
+# Flashinfer JIT sampler needs nvcc (absent here); fall back to the Torch sampler.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0 \
+    PDFPARSER_VLLM_URL=http://127.0.0.1:8000/v1 \
+    PDFPARSER_VLLM_MODEL=lightonocr
+
+# The base image's ENTRYPOINT is `vllm serve`; these are its arguments, tuned for
+# the 6 GiB card (see spike_results/vllm_determinism.md). Running the image starts
+# the warm server; convert PDFs against it with `podman exec`:
+#   podman exec <name> python3 -m pdfparser /data/in.pdf /data/out.html
+CMD ["lightonai/LightOnOCR-2-1B-bbox", \
+     "--served-model-name", "lightonocr", \
+     "--dtype", "bfloat16", \
+     "--gpu-memory-utilization", "0.85", \
+     "--max-model-len", "8192", \
+     "--limit-mm-per-prompt", "{\"image\": 1}", \
+     "--enforce-eager"]
