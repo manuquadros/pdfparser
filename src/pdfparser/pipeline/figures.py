@@ -94,6 +94,12 @@ _FIGURE_CAPTION_MIN_WORDS = 3  # ignore one/two-word figure labels that match by
 _FIGURE_CAPTION_MIN_DISTINCT = 3
 # only hunt a baked caption in the bottom half of a crop
 _FIGURE_CAPTION_SCAN_FRAC = 0.5
+# A caption is a minority of a figure; if trimming would leave less than this
+# fraction of the figure, the "caption" bands were really figure content that
+# echoes the caption words (a GC-MS trace labelled with the retention times its
+# caption lists, a sequence alignment naming its own rows) — reject the trim and
+# keep the full crop rather than annihilate a real figure.
+_FIGURE_CAPTION_MIN_KEEP_FRAC = _FIGURE_CAPTION_SCAN_FRAC
 _FIGURE_CAPTION_NOTE_BANDS = 2  # trailing note lines (a DOI) tolerated below a caption
 _FIGURE_BLOCK_GAP_FRAC = 0.008  # blank run separating caption / figure / note blocks
 _FIGURE_OCR_MIN_BAND_PX = 48  # pad thinner bands so the vision model can patch them
@@ -382,6 +388,7 @@ def _safe_crop(
     x1 = _extend_right_to_content(image, y0, y1, x1)
     grown_y1 = _extend_bottom_to_content(image, x0, x1, y1)
     if caption_text is not None:
+        untrimmed_y1 = grown_y1
         grown_y1 = _trim_swallowed_caption(image, x0, x1, y1, grown_y1)
         if ocr_region is not None:
             # A band re-OCR can fail on a transient OOM (the GPU is shared) or a
@@ -391,6 +398,11 @@ def _safe_crop(
                 grown_y1 = _trim_baked_caption(
                     image, x0, x1, y0, grown_y1, caption_text, ocr_region
                 )
+        # Measured against the model's box (y0..y1), not the grown bottom, so a
+        # legitimately swallowed caption pulled in by _extend_bottom_to_content can
+        # still be trimmed off a short figure without tripping the guard.
+        if grown_y1 - y0 < _FIGURE_CAPTION_MIN_KEEP_FRAC * (y1 - y0):
+            grown_y1 = untrimmed_y1  # trim ran away on a text-bodied figure
     if grown_y1 - y0 < _MIN_FIGURE_HEIGHT:  # a trim left too little to be a figure
         return None
     return image.crop((x0, y0, x1, grown_y1))

@@ -2344,12 +2344,14 @@ class TestPipeline:
     def test_figure_caption_not_glued_to_following_paragraph(
         self, article_html: str
     ) -> None:
-        # The Fig. 1 caption ends in a period *inside* a closing </em>; the body
-        # paragraph that follows ("Herein, I propose …") must not be absorbed onto
-        # the caption (the sentence-end test runs on visible text, not raw HTML).
+        # The Fig. 1 caption is emitted as its own <figcaption>; the body
+        # paragraph that follows ("Herein, I propose …") must stay a separate
+        # block, not be absorbed onto the caption.
         body = _body(article_html)
-        assert "oxidoreductase/carboxylase.</em> Herein, I propose" not in body
-        assert "carboxylase.</em></p>" in body
+        assert "carboxylase.</figcaption>" in body
+        assert "<p>Herein, I propose" in body
+        assert "carboxylase. Herein, I propose" not in body
+        assert "carboxylase.</em> Herein, I propose" not in body
 
     def test_paragraph_rejoined_across_table_i(self, article_html: str) -> None:
         # The clause "…revealed that," / "with no additives present…" is split by
@@ -2467,26 +2469,41 @@ def plos_html(ocr_model: object) -> str:
 class TestPlosSidebarMetadata:
     """32639976.pdf (PLOS ONE) prints a left-column metadata sidebar beside the
     abstract; the OCR interleaves it into the body.  Every piece — the affiliation
-    and the bold-labelled Citation/Editor/dates/Copyright/Data-Availability/Funding/
-    Competing-interests run — must land in the collapsed Metadata panel, not the
-    body."""
+    and the Citation/Editor/dates/Copyright/Data-Availability/Funding/
+    Competing-interests run, which LightOnOCR emits as ``<h3>`` label headings —
+    must land in the collapsed Metadata panel, not the body."""
 
     def test_sidebar_metadata_in_panel_not_body(self, plos_html: str) -> None:
         panel, body = _metadata(plos_html), _body(plos_html)
+        # The labels relocate as their own headings (not bold "**Label:**" lines),
+        # so match the heading form — and use it for "Funding" specifically, whose
+        # bare word also appears in the body's "Funding acquisition:" CRediT role.
         for fragment in (
             "Department of Biomedical Science and Center for Bio-Nanomaterials",
-            "<strong>Citation:</strong>",
-            "<strong>Editor:</strong>",
-            "<strong>Received:</strong>",
-            "<strong>Accepted:</strong>",
-            "<strong>Published:</strong>",
-            "<strong>Copyright:</strong>",
-            "<strong>Data Availability Statement:</strong>",
-            "<strong>Funding:</strong>",
-            "<strong>Competing interests:</strong>",
+            "<h3>Citation</h3>",
+            "<h3>Editor</h3>",
+            "<h3>Received</h3>",
+            "<h3>Accepted</h3>",
+            "<h3>Published</h3>",
+            "<h3>Copyright</h3>",
+            "<h3>Data Availability Statement</h3>",
+            "<h3>Funding</h3>",
+            "<h3>Competing interests</h3>",
         ):
             assert fragment in panel, f"{fragment!r} missing from metadata panel"
             assert fragment not in body, f"{fragment!r} leaked into body"
+
+    def test_title_in_header_not_masthead(self, plos_html: str) -> None:
+        # The journal masthead "PLOS ONE" must not be taken as the article title;
+        # the real title (with its italicised species) belongs in the header.
+        header = plos_html[: plos_html.find("</header>")]
+        title = (
+            "Purification and characterization of a novel medium-chain ribitol "
+            "dehydrogenase from a lichen-associated bacterium "
+            "<em>Sphingomonas</em> sp."
+        )
+        assert title in header, "article title missing from header"
+        assert "<h1>PLOS ONE</h1>" not in header
 
     def test_body_opens_with_introduction_prose(self, plos_html: str) -> None:
         # With the sidebar relocated, the body proper opens at the Introduction —

@@ -504,6 +504,39 @@ def _is_title_heading(inner: str) -> bool:
     return plain not in _DOCUMENT_TYPE_LABELS and not _ARTICLE_HEADING_RE.match(plain)
 
 
+_MASTHEAD_MAX_WORDS = 4
+
+
+def _is_masthead_heading(inner: str) -> bool:
+    """A short all-caps multi-word heading — a journal masthead / running head
+    ("PLOS ONE") the OCR emitted as a leading heading.  Multi-word so a minimal
+    single-token title ("T") is never mistaken for one; the caller additionally
+    requires a real title heading to follow before dropping it."""
+    plain = _visible_text(inner).strip()
+    return (
+        2 <= len(plain.split()) <= _MASTHEAD_MAX_WORDS
+        and plain == plain.upper()
+        and plain.lower() != plain
+    )
+
+
+def _leading_title_follows(parts: list[str], idx: int) -> bool:
+    """True when, skipping leading furniture headings (mastheads and document-type
+    labels like "RESEARCH ARTICLE"), the next heading in the run is a real title —
+    i.e. the heading at ``idx`` sits above the title, not at it.  A non-heading
+    block before any title heading means there is none, so it returns False."""
+    for k in range(idx + 1, len(parts)):
+        heading = _heading_inner(parts[k])
+        if heading is None:
+            return False
+        inner = heading[1]
+        folded = _visible_text_folded(inner)
+        if _is_masthead_heading(inner) or folded in _DOCUMENT_TYPE_LABELS:
+            continue
+        return _is_title_heading(inner)
+    return False
+
+
 def _looks_like_name_list(plain: str) -> bool:
     segments = [s.strip() for s in re.split(r",|\s+and\s+|;", plain) if s.strip()]
     return len(segments) >= 2 and all(
@@ -567,14 +600,21 @@ def _classify_parts(parts: list[str]) -> _Meta:
     expect_byline = False
     in_abstract = False
 
-    for part in parts:
+    for idx, part in enumerate(parts):
         heading = _heading_inner(part)
         if heading is not None:
             _, inner = heading
-            if not title_html and _is_title_heading(inner):
-                title_html = inner
-                expect_byline = True
-                continue
+            if not title_html:
+                # A masthead / running head ("PLOS ONE", which may sit above a
+                # "RESEARCH ARTICLE" doc-type label) is dropped only when the real
+                # title heading follows it in the leading heading run; a section
+                # heading like "Abstract" after it means this heading IS the title.
+                if _is_masthead_heading(inner) and _leading_title_follows(parts, idx):
+                    continue
+                if _is_title_heading(inner):
+                    title_html = inner
+                    expect_byline = True
+                    continue
             expect_byline = False
             if _ABSTRACT_HEADING_RE.match(_visible_text(inner)):
                 in_abstract = True
@@ -625,6 +665,18 @@ def _is_named_metadata_heading(part: str) -> bool:
         return False
     title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
     return title in _FRONTMATTER_HEADING_LABELS
+
+
+def _is_publication_metadata_heading(part: str) -> bool:
+    """A heading whose text is a journal-sidebar label ("Citation", "Editor",
+    "Received" …).  LightOnOCR renders the PLOS-style first-page metadata sidebar
+    as a run of such label headings, each followed by its value paragraph(s),
+    rather than the bold ``**Label:**`` lines other journals' OCR produces."""
+    heading = _heading_inner(part)
+    if heading is None:
+        return False
+    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+    return title in _PUBLICATION_METADATA_LABELS
 
 
 def _has_place_like_tail(plain: str) -> bool:
@@ -800,6 +852,33 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
                 metadata.extend(parts[i:j])
                 i = j
                 continue
+        if _is_publication_metadata_heading(part):
+            # A sidebar label heading owns the <p> value(s) directly under it, and
+            # the sidebar is a contiguous run of such headings.  Pull label headings
+            # and their values — but a <p> that neither directly follows a label
+            # heading nor is itself recognised front matter ends the run, so trailing
+            # body prose is never swept into the hidden panel (a valueless label like
+            # a bare "Editor" still relocates via the heading clause).
+            j = i + 1
+            while j < len(parts):
+                nxt = parts[j]
+                if _is_publication_metadata_heading(nxt):
+                    j += 1
+                    continue
+                if (
+                    _heading_inner(nxt) is None
+                    and _plain_p_text(nxt) is not None
+                    and (
+                        _is_publication_metadata_heading(parts[j - 1])
+                        or _is_frontmatter_text(nxt, strict=False)
+                    )
+                ):
+                    j += 1
+                    continue
+                break
+            metadata.extend(parts[i:j])
+            i = j
+            continue
         rest.append(part)
         i += 1
     return metadata, rest
@@ -808,7 +887,8 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
 def _is_publication_metadata_label(inner: str) -> bool:
     """True when a ``<p>`` opens with a recognised journal-metadata bold label
     ("**Citation:**", "**Competing interests:**" …) — see
-    ``_PUBLICATION_METADATA_LABELS``."""
+    ``_PUBLICATION_METADATA_LABELS``.  (When the OCR emits the sidebar as label
+    *headings* instead, ``_extract_named_metadata_sections`` relocates it.)"""
     m = _BOLD_LABEL_CAPTURE_RE.match(inner)
     return m is not None and m.group(1).strip().lower() in _PUBLICATION_METADATA_LABELS
 
@@ -825,6 +905,11 @@ def _is_stray_metadata(part: str) -> bool:
     if _is_publication_metadata_label(inner):
         return True
     plain = _visible_text(inner)
+    # An affiliation is front matter wherever it sits — relocate it even when the
+    # leading run that _extract_front_matter scans was broken (e.g. a masthead
+    # heading pushed the title, byline and affiliation down into the body).
+    if _is_affiliation_line(plain):
+        return True
     if len(plain) > _STRAY_METADATA_MAX_LEN:
         return False
     if _STRAY_METADATA_PHRASE_RE.search(plain):
