@@ -23,6 +23,7 @@ import io
 import logging
 import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
+from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtime
 
 import numpy as np
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
@@ -40,6 +41,19 @@ _FIGURE_PLACEHOLDER_RE = re.compile(
     r"^!\[[^\]]*\]\([^)]*\)"
     r"(?:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+))?\s*$"
 )
+# A figure label the model emitted as its own block with no caption sentence after
+# the number ("FIG. 2", "Figure 3.", "**Fig 4**").  When the descriptive caption
+# arrives as the *following* block, it must be rejoined onto this label — otherwise
+# the figure owns only the label, the caption is stranded in the body, and the
+# baked-caption trim never receives the words it needs to recognise the caption.
+_BARE_FIGURE_LABEL_RE = re.compile(
+    r"^\*{0,2}\s*fig(?:ure|\.|\b)\s*\.?\s*\d+[a-z]?\s*[.:]?\s*\*{0,2}\s*$",
+    re.IGNORECASE,
+)
+# A single-letter panel label ("A", "(B)", "C.") the model split out of a
+# multi-panel figure as its own text block.  It belongs to the figure (baked into
+# the crop), not the prose, so it is dropped when adjacent to a figure placeholder.
+_PANEL_LABEL_RE = re.compile(r"^\(?[A-Z]\)?[.:]?$")
 
 _MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
 # The model's box often clips a figure's bottom or right edge.  Rather than pad
@@ -128,18 +142,58 @@ def _parse_figure_placeholder(line: str) -> tuple[int, int, int, int] | None | b
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
 
 
-def _figure_html(crop: Image.Image, caption_text: str | None) -> str:
-    """Encode a figure crop as a base64 PNG and return a <figure> element."""
+def _is_bare_figure_label(block: str) -> bool:
+    """True when ``block`` is a figure label with no caption sentence after it."""
+    return bool(_BARE_FIGURE_LABEL_RE.match(block.strip()))
+
+
+def _is_panel_label(block: str) -> bool:
+    """True when ``block`` is a lone single-letter panel label ("A", "(B)")."""
+    return bool(_PANEL_LABEL_RE.match(block.strip()))
+
+
+def _base64_src(crop: Image.Image) -> str:
+    """Encode a crop as an inline ``data:`` PNG URI (the self-contained default)."""
     buf = io.BytesIO()
     crop.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    data_uri = f"data:image/png;base64,{b64}"
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _file_image_writer(image_dir: Path) -> Callable[[Image.Image], str]:
+    """Return an image encoder that writes each crop as a PNG into ``image_dir`` and
+    references it by a path relative to ``image_dir``'s parent.
+
+    So when the HTML is written into that parent directory it links the sidecar
+    PNGs (quick to regenerate, live-editable in a browser) instead of inlining a
+    base64 data URI.  The counter is per-document, shared across pages."""
+    image_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+
+    def encode(crop: Image.Image) -> str:
+        nonlocal count
+        count += 1
+        name = f"fig_{count:03d}.png"
+        crop.save(image_dir / name, format="PNG")
+        return f"{image_dir.name}/{name}"
+
+    return encode
+
+
+def _figure_html(
+    crop: Image.Image,
+    caption_text: str | None,
+    encode_src: Callable[[Image.Image], str] = _base64_src,
+) -> str:
+    """Return a ``<figure>`` element; ``encode_src`` turns the crop into the
+    ``<img src>`` (an inline data URI by default, a sidecar PNG path with
+    :func:`_file_image_writer`)."""
+    src = encode_src(crop)
     caption_html = (
         f"<figcaption>{_inline_md_to_html(caption_text)}</figcaption>"
         if caption_text
         else ""
     )
-    return f'<figure><img src="{data_uri}" alt="">{caption_html}</figure>'
+    return f'<figure><img src="{src}" alt="">{caption_html}</figure>'
 
 
 def _denormalize_bbox(

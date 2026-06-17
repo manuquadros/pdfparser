@@ -29,9 +29,13 @@ from pdfparser.pipeline.classify import (
 )
 from pdfparser.pipeline.figures import (
     _FIGURE_MERGE_GAP_FRAC,
+    _base64_src,
     _cluster_figure_boxes,
     _denormalize_bbox,
     _figure_html,
+    _file_image_writer,
+    _is_bare_figure_label,
+    _is_panel_label,
     _parse_figure_placeholder,
     _safe_crop,
     _union_box,
@@ -47,7 +51,11 @@ from pdfparser.pipeline.merge import (
 from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_model
 from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
-from pdfparser.pipeline.text import _looks_like_figure_caption, _visible_text
+from pdfparser.pipeline.text import (
+    _looks_like_figure_caption,
+    _opens_with_caption_label,
+    _visible_text,
+)
 
 _WRAPPER_CSS = """
 body {
@@ -106,12 +114,32 @@ class _FigBlock:
 _Block = _MdBlock | _FigBlock
 
 
+def _starts_figure(block: str) -> bool:
+    """True when ``block``'s first line is a figure placeholder."""
+    block = block.strip()
+    return bool(block) and _parse_figure_placeholder(block.splitlines()[0]) is not None
+
+
+def _is_caption_continuation(block: str) -> bool:
+    """A block that continues a bare figure label's caption: running prose, not the
+    start of a new structural element (another float, a heading, a table)."""
+    block = block.strip()
+    if not block:
+        return False
+    first = block.splitlines()[0].lstrip()
+    if _starts_figure(block) or first.startswith(("#", "|")):
+        return False
+    return not _opens_with_caption_label(block)
+
+
 def _parse_page_blocks(md: str) -> list[_Block]:
     """Split a page's markdown into an ordered stream of prose and figure blocks.
 
     Pure: no image needed.  A figure's caption is taken from the placeholder's
     own trailing text, else the following caption-like block (which is then
-    consumed)."""
+    consumed); a bare ``FIG. N`` label has its following descriptive block
+    rejoined onto it.  Lone single-letter panel labels the model split out of a
+    multi-panel figure are dropped when they abut a placeholder."""
     blocks: list[_Block] = []
     raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
     k = 0
@@ -120,6 +148,11 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         lines = block.splitlines()
         fig = _parse_figure_placeholder(lines[0]) if lines else None
         if fig is None:
+            next_is_fig = k + 1 < len(raw_blocks) and _starts_figure(raw_blocks[k + 1])
+            prev_is_fig = bool(blocks) and isinstance(blocks[-1], _FigBlock)
+            if _is_panel_label(block) and (next_is_fig or prev_is_fig):
+                k += 1
+                continue
             blocks.append(_MdBlock(block))
             k += 1
             continue
@@ -132,6 +165,14 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         ):
             k += 1
             caption = raw_blocks[k].strip()
+        if (
+            caption is not None
+            and _is_bare_figure_label(caption)
+            and k + 1 < len(raw_blocks)
+            and _is_caption_continuation(raw_blocks[k + 1])
+        ):
+            k += 1
+            caption = f"{caption} {raw_blocks[k].strip()}"
         blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
         k += 1
     return blocks
@@ -180,11 +221,14 @@ def _page_to_html_parts(
     md: str,
     image: Image.Image,
     ocr_region: Callable[[Image.Image], str] | None = None,
+    encode_image: Callable[[Image.Image], str] = _base64_src,
 ) -> list[str]:
     """Convert one page's markdown to block HTML, replacing each ``![image]``
     placeholder with a cropped ``<figure>`` and stitching consecutive prose into
     a single markdown render.  ``ocr_region`` (re-OCR a sub-image), when supplied,
-    lets the crop trim a caption the model baked into a text-bodied figure box."""
+    lets the crop trim a caption the model baked into a text-bodied figure box.
+    ``encode_image`` turns each crop into its ``<img src>`` (inline data URI by
+    default; a sidecar PNG path when a file writer is supplied)."""
     blocks = _parse_page_blocks(md)
     box_at, caption_at, drop = _resolve_figure_clusters(blocks, image)
 
@@ -212,7 +256,7 @@ def _page_to_html_parts(
             else None
         )
         if crop is not None:
-            parts.append(_figure_html(crop, caption_html))
+            parts.append(_figure_html(crop, caption_html, encode_image))
         elif caption_html is not None:
             parts.append(_figcaption_only(caption_html))
     flush()
@@ -278,6 +322,7 @@ def _assemble_html(
     pages_md: list[str],
     images: list[Image.Image],
     ocr_region: Callable[[Image.Image], str] | None = None,
+    encode_image: Callable[[Image.Image], str] = _base64_src,
 ) -> str:
     start = _leading_pages_to_skip_md(pages_md)
     pages_md = pages_md[start:]
@@ -286,7 +331,7 @@ def _assemble_html(
     # Close any table the OCR left open at a page's bottom before block-splitting,
     # so a table that overran the page does not swallow the next page's prose.
     per_page_parts = [
-        _page_to_html_parts(_close_unclosed_tables(md), img, ocr_region)
+        _page_to_html_parts(_close_unclosed_tables(md), img, ocr_region, encode_image)
         for md, img in zip(pages_md, images, strict=True)
     ]
     # Front matter the OCR scattered into the article's first page — a glossary
@@ -334,14 +379,20 @@ def lightonocr_pdf_to_html(
     ocr: OcrModel | None = None,
     base_url: str | None = None,
     model: str | None = None,
+    image_dir: Path | None = None,
 ) -> str:
-    """Convert a PDF to self-contained HTML with LightOnOCR-2-1B-bbox.
+    """Convert a PDF to HTML with LightOnOCR-2-1B-bbox.
 
     Args:
         pdf_path: Path to the input PDF.
         ocr: Open connection bundle.  ``None`` calls ``load_ocr_model()``.
         base_url: vLLM endpoint root, used only when ``ocr`` is ``None``.
         model: Served model name, used only when ``ocr`` is ``None``.
+        image_dir: When given, figure crops are written here as sidecar PNGs and
+            referenced by a path relative to its parent (so the HTML, written into
+            that parent, links them) instead of inlined as base64 — quicker to
+            regenerate and live-editable in a browser.  ``None`` (default) inlines
+            the images, keeping the HTML self-contained.
     """
     owns_ocr = ocr is None
     if ocr is None:
@@ -354,7 +405,10 @@ def lightonocr_pdf_to_html(
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
         pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_regions)
-        return _assemble_html(pages_md, images, ocr_region)
+        encode_image = (
+            _file_image_writer(image_dir) if image_dir is not None else _base64_src
+        )
+        return _assemble_html(pages_md, images, ocr_region, encode_image)
     finally:
         if owns_ocr:
             ocr.close()

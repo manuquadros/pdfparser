@@ -15,20 +15,34 @@ def _fake_image(width: int = 800, height: int = 1000) -> Image.Image:
     return Image.new("RGB", (width, height), color="white")
 
 
-def _figure_sizes(html: str) -> list[tuple[int, int]]:
-    """Decode every embedded ``data:image/png`` figure and return its (w, h)."""
-    uris = re.findall(r"data:image/png;base64,([A-Za-z0-9+/=]+)", html)
-    return [Image.open(io.BytesIO(base64.b64decode(u))).size for u in uris]
+def _img_size(fragment: str, base_dir: Path | None) -> tuple[int, int] | None:
+    """Size of the first figure image in ``fragment``: a base64 data URI when
+    ``base_dir`` is ``None``, else a sidecar PNG resolved relative to ``base_dir``."""
+    if base_dir is None:
+        uri = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)", fragment)
+        if not uri:
+            return None
+        return Image.open(io.BytesIO(base64.b64decode(uri.group(1)))).size
+    src = re.search(r'<img src="([^"]+\.png)"', fragment)
+    return Image.open(base_dir / src.group(1)).size if src else None
 
 
-def _figure_size_by_caption(html: str, needle: str) -> tuple[int, int] | None:
-    """Decode the embedded figure whose ``<figcaption>`` contains ``needle`` and
-    return its ``(w, h)``; ``None`` if no such figure is present."""
+def _figure_sizes(html: str, base_dir: Path | None = None) -> list[tuple[int, int]]:
+    """Every figure image's (w, h) — inlined base64, or sidecar PNGs under
+    ``base_dir`` when figures were written to files."""
+    sizes = [_img_size(fig, base_dir) for fig in re.findall(r"<img [^>]*>", html)]
+    return [s for s in sizes if s is not None]
+
+
+def _figure_size_by_caption(
+    html: str, needle: str, base_dir: Path | None = None
+) -> tuple[int, int] | None:
+    """The (w, h) of the figure whose ``<figcaption>`` contains ``needle``;
+    ``None`` if no such figure is present."""
     for fig in re.findall(r"<figure>.*?</figure>", html, re.DOTALL):
         cap = re.search(r"<figcaption>(.*?)</figcaption>", fig, re.DOTALL)
-        uri = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)", fig)
-        if cap and uri and needle in cap.group(1):
-            return Image.open(io.BytesIO(base64.b64decode(uri.group(1)))).size
+        if cap and needle in cap.group(1):
+            return _img_size(fig, base_dir)
     return None
 
 
@@ -1016,6 +1030,97 @@ class TestLightonAssembly:
         md = "# T\n\n## Abstract\n\nA.\n\n## Body\n\n![image](i.png)0,0,1000,1000"
         html = _run_lighton([md], image=img)
         assert _figure_sizes(html) == [(1190, 1540)]
+
+
+class TestSplitFigureCaption:
+    """A bare ``FIG. N`` label and its descriptive sentence the model emitted as
+    two blocks are rejoined into one figcaption; stray panel labels are dropped."""
+
+    def test_bare_label_rejoins_following_caption_block(self) -> None:
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "FIG. 2\n\n"
+            "Protein alignments of TRI and TRII. (A) panel one. (B) panel two."
+        )
+        html = _run_lighton([md], image=img)
+        assert (
+            "<figcaption>FIG. 2 Protein alignments of TRI and TRII."
+            " (A) panel one. (B) panel two.</figcaption>" in html
+        )
+        # The descriptive caption is owned by the figure, not stranded as a body
+        # paragraph (it appears only inside the figcaption, never in a <p>).
+        assert "<p>Protein alignments of TRI and TRII" not in html
+
+    def test_panel_labels_between_split_boxes_dropped(self) -> None:
+        # The motivating Fig 2 case: the model split the figure into two panel
+        # boxes and emitted the bare "A"/"B" panel labels as their own blocks; the
+        # stray "B" must not survive to glue onto the caption ("B Protein …").
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "A\n\n"
+            "![image](a.png)100,100,900,500\n\n"
+            "B\n\n"
+            "![image](b.png)100,500,900,600\n\n"
+            "FIG. 2\n\n"
+            "Protein alignments of TRI and TRII."
+        )
+        body = _body(_run_lighton([md], image=img))
+        assert "<p>A</p>" not in body
+        assert "<p>B</p>" not in body
+        assert "B Protein alignments" not in body
+
+    def test_full_label_caption_does_not_swallow_next_block(self) -> None:
+        # A caption already complete in one block must not pull the next paragraph.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "FIG. 3 Phylogenetic tree analysis.\n\n"
+            "This is the next body paragraph, not part of the caption."
+        )
+        html = _run_lighton([md], image=img)
+        assert "<figcaption>FIG. 3 Phylogenetic tree analysis.</figcaption>" in html
+        assert "next body paragraph, not part of the caption" in _body(html)
+
+
+class TestFigureLabelPredicates:
+    def test_bare_figure_label(self) -> None:
+        from pdfparser.pipeline.figures import _is_bare_figure_label
+
+        assert _is_bare_figure_label("FIG. 2")
+        assert _is_bare_figure_label("Figure 3.")
+        assert _is_bare_figure_label("**Fig 4**")
+        assert not _is_bare_figure_label("FIG. 2 Protein alignments of TRI and TRII.")
+        assert not _is_bare_figure_label("Figures are shown below.")
+
+    def test_panel_label(self) -> None:
+        from pdfparser.pipeline.figures import _is_panel_label
+
+        assert _is_panel_label("A")
+        assert _is_panel_label("(B)")
+        assert _is_panel_label("C.")
+        assert not _is_panel_label("AB")
+        assert not _is_panel_label("A nice sentence.")
+
+
+class TestFigureFileOutput:
+    """With an image directory, crops are written as sidecar PNGs and referenced
+    by a relative path instead of inlined as base64."""
+
+    def test_image_dir_writes_sidecar_png(self, tmp_path: Path) -> None:
+        from pdfparser.pipeline.assemble import _assemble_html
+        from pdfparser.pipeline.figures import _file_image_writer
+
+        img = _fake_image(1190, 1540)
+        md = "# T\n\n## Abstract\n\nA.\n\n## Body\n\n![image](i.png)0,0,1000,1000"
+        image_dir = tmp_path / "doc_files"
+        html = _assemble_html([md], [img], None, _file_image_writer(image_dir))
+        assert "data:image/png;base64," not in html
+        assert 'src="doc_files/fig_001.png"' in html
+        assert Image.open(image_dir / "fig_001.png").size == (1190, 1540)
 
 
 class TestDenormalizeBbox:
@@ -2499,8 +2604,10 @@ def _run_pipeline_to_file(pdf: Path, ocr: object) -> str:
     from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
 
     assert isinstance(ocr, OcrModel)
-    html = lightonocr_pdf_to_html(pdf, ocr=ocr)
     _OUTPUT_DIR.mkdir(exist_ok=True)
+    html = lightonocr_pdf_to_html(
+        pdf, ocr=ocr, image_dir=_OUTPUT_DIR / f"{pdf.stem}_files"
+    )
     (_OUTPUT_DIR / f"{pdf.stem}.html").write_text(html, encoding="utf-8")
     return html
 
@@ -2682,14 +2789,14 @@ class TestAdPageExclusion:
     def test_figures_embedded_by_detector(self, ad_prefix_html: str) -> None:
         # LightOnOCR-bbox emits a crop box per figure (incl. the Fig 2 alignment
         # the old engine OCRed into a token wall); each is cropped and embedded.
-        assert ad_prefix_html.count("data:image/png;base64,") >= 4
+        assert len(_figure_sizes(ad_prefix_html, _OUTPUT_DIR)) >= 4
 
     def test_figures_not_truncated(self, ad_prefix_html: str) -> None:
         # The model emits boxes normalized to [0, 1000]; cropping them as raw
         # pixels truncated every figure.  A page-spanning figure (the Fig 2
         # alignment) only exceeds 1000 px wide once the box is denormalized to
         # the ~1190 px render width — impossible if coords are read as pixels.
-        widest = max(w for w, _ in _figure_sizes(ad_prefix_html))
+        widest = max(w for w, _ in _figure_sizes(ad_prefix_html, _OUTPUT_DIR))
         assert widest > 1000, f"widest figure is only {widest}px — boxes not scaled"
 
     def test_cross_page_paragraph_not_split(self, ad_prefix_html: str) -> None:
@@ -2700,6 +2807,25 @@ class TestAdPageExclusion:
             in ad_prefix_html
         )
         assert "This suggests that TRI and</p>" not in ad_prefix_html
+
+    def test_fig2_caption_rejoined_and_panel_label_not_stray(
+        self, ad_prefix_html: str
+    ) -> None:
+        # The model splits Fig 2 into two panel boxes and emits bare "A"/"B" panel
+        # labels as their own blocks.  The descriptive caption ("FIG. 2" + "Protein
+        # alignments …", two OCR blocks) must be rejoined onto the figure, and the
+        # stray "B" must not survive to prefix the caption ("B Protein alignments").
+        fig2 = next(
+            (
+                f
+                for f in re.findall(r"<figure>.*?</figure>", ad_prefix_html, re.DOTALL)
+                if "Protein alignments of TRI and TRII" in f
+            ),
+            None,
+        )
+        assert fig2 is not None, "Fig 2 caption not attached to its figure"
+        assert "B Protein alignments" not in _body(ad_prefix_html)
+        assert "<p>B</p>" not in _body(ad_prefix_html)
 
 
 @pytest.fixture(scope="session")
@@ -2746,11 +2872,13 @@ def plos_run(ocr_model: object) -> object:
     # Count actual gate decisions, so the gate test can't be satisfied by a region
     # that merely failed to localize (which also lowers the batch size).
     mp.setattr(tables, "_region_fully_captured", gate_with_spy)
+    _OUTPUT_DIR.mkdir(exist_ok=True)
     try:
-        spy.html = lightonocr_pdf_to_html(_PLOS_PDF, ocr=ocr_model)
+        spy.html = lightonocr_pdf_to_html(
+            _PLOS_PDF, ocr=ocr_model, image_dir=_OUTPUT_DIR / f"{_PLOS_PDF.stem}_files"
+        )
     finally:
         mp.undo()
-    _OUTPUT_DIR.mkdir(exist_ok=True)
     (_OUTPUT_DIR / f"{_PLOS_PDF.stem}.html").write_text(spy.html, encoding="utf-8")
     return spy
 
@@ -2846,7 +2974,9 @@ class TestPlosFigureCrops:
         # actually spans the full text column, so the recovered crop must reach
         # well past that — independent of the model's clipped x1, which growth
         # ignores in favour of the figure's real right edge on the page.
-        size = _figure_size_by_caption(plos_html, "Multiple sequence alignments")
+        size = _figure_size_by_caption(
+            plos_html, "Multiple sequence alignments", _OUTPUT_DIR
+        )
         assert size is not None, "Fig 5 alignment figure not embedded"
         assert size[0] > 920, f"Fig 5 width {size[0]}px — right edge not recovered"
 
@@ -2854,7 +2984,9 @@ class TestPlosFigureCrops:
         # The alignment is itself text, so the model boxes its caption + DOI inside
         # the figure; re-OCR confirms those trailing bands reproduce the caption and
         # trims them.  Left in, the crop runs ~130 px taller (caption + DOI baked in).
-        size = _figure_size_by_caption(plos_html, "Multiple sequence alignments")
+        size = _figure_size_by_caption(
+            plos_html, "Multiple sequence alignments", _OUTPUT_DIR
+        )
         assert size is not None, "Fig 5 alignment figure not embedded"
         assert size[1] < 830, f"Fig 5 height {size[1]}px — caption baked into crop"
 
@@ -2863,7 +2995,9 @@ class TestPlosFigureCrops:
         # its 3-line caption + DOI, which the bottom-growth pulls in.  With the
         # caption trimmed the crop stays near the plot's own height (~590 px); left
         # un-trimmed it grows past 700 px.
-        size = _figure_size_by_caption(plos_html, "Effect of different carbon sources")
+        size = _figure_size_by_caption(
+            plos_html, "Effect of different carbon sources", _OUTPUT_DIR
+        )
         assert size is not None, "Fig 1 plot figure not embedded"
         assert size[1] < 660, f"Fig 1 height {size[1]}px — caption baked into crop"
 

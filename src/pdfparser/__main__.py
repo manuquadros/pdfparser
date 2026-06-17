@@ -36,6 +36,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Served model name (default: $PDFPARSER_VLLM_MODEL or lightonocr).",
     )
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=None,
+        help="Write figure crops as sidecar PNGs into this directory (referenced "
+        "relative to its parent) instead of inlining them as base64.  Default: "
+        "inline, keeping the HTML self-contained.",
+    )
     args = parser.parse_args(argv)
 
     if not args.pdf.is_file():
@@ -44,7 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     output = args.output or args.pdf.with_suffix(".html")
 
     html = lightonocr_pdf_to_html(
-        args.pdf, base_url=args.vllm_url, model=args.vllm_model
+        args.pdf,
+        base_url=args.vllm_url,
+        model=args.vllm_model,
+        image_dir=args.image_dir,
     )
     output.write_text(html, encoding="utf-8")
     print(f"Wrote {output}")

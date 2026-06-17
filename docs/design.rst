@@ -106,7 +106,11 @@ that bias is intentional.  It shows up in three places:
   :func:`~pdfparser.pipeline.figures._union_box`).  The model sometimes splits one
   tall figure into stacked boxes.  Boxes that share a column and sit close
   vertically are unioned back into one crop, so a panel never gets dropped on the
-  floor between two boxes.
+  floor between two boxes.  The same over-segmentation also emits the bare panel
+  labels (``A``, ``B``) as their own text blocks;
+  :func:`~pdfparser.pipeline.assemble._parse_page_blocks` drops a lone
+  single-letter label that abuts a figure placeholder, since it belongs to the
+  figure (baked into the crop), not the prose.
 
 * **Render resolution** (:mod:`pdfparser.pipeline.render`).  Pages are rasterized
   at 200 DPI and only downscaled to the model's long-side budget, so the crop has
@@ -131,7 +135,12 @@ with no gap, or — when the figure is *itself* text (a sequence alignment, a da
 table) whose caption is pixel-identical to it — the model can draw the box low
 enough to bake the caption *inside* it.  In both, the geometry waves it through, and
 a *document-level* signal breaks the tie: the OCR already emitted the caption as its
-own text block, so its words are known.
+own text block, so its words are known.  That signal is only as good as the caption
+text actually attached to the figure: when the model splits a caption into a bare
+``FIG. N`` label and a following descriptive block, :func:`~pdfparser.pipeline.assemble._parse_page_blocks`
+rejoins them so the figure owns the *whole* caption — otherwise the trim is handed
+only "FIG. N", finds none of those words in the baked band, and leaves the caption
+baked in (and the descriptive sentence stranded in the body).
 
 So when a caption is present and an OCR seam is available,
 :func:`~pdfparser.pipeline.figures._trim_baked_caption` is **authoritative**.  It
