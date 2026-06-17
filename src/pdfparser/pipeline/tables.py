@@ -451,8 +451,8 @@ def _adjacent_para_tokens(md: str, start: int, end: int) -> set[str]:
 
 
 def _is_distinctive(token: str) -> bool:
-    """A token strong enough to judge table completeness: a real word
-    (``_COVERAGE_MIN_TOKEN_LEN``+) or a multi-char number (table data)."""
+    """A token strong enough to judge table completeness: a real word (length
+    ``_COVERAGE_MIN_TOKEN_LEN`` or more) or a multi-char number (table data)."""
     return len(token) >= _COVERAGE_MIN_TOKEN_LEN or (
         len(token) >= _COVERAGE_MIN_NUMERIC_LEN and any(c.isdigit() for c in token)
     )

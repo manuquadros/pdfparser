@@ -19,8 +19,8 @@ extended blindly into caption, body text, or a neighbouring column.  See the
 from __future__ import annotations
 
 import base64
-import contextlib
 import io
+import logging
 import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 
@@ -28,6 +28,8 @@ import numpy as np
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.latex import _inline_md_to_html
+
+_log = logging.getLogger(__name__)
 
 # LightOnOCR-bbox emits figures as a markdown image placeholder with the crop
 # box appended as bare ``x0,y0,x1,y1`` integers **normalized to [0, 1000]** (per
@@ -181,18 +183,49 @@ def _ink_run_end(ink_per_line: np.ndarray, gap: int, lead_gap: int) -> int | Non
     return None
 
 
-def _grow_edge(ink_profile: np.ndarray, dim: int) -> int:
+def _grow_edge(
+    ink_profile: np.ndarray, dim: int, gap_frac: float = _FIGURE_GAP_FRAC
+) -> int:
     """Offset to extend an edge along ``ink_profile`` (the ink profile of the strip
-    past the edge), or 0 to leave it; the gap thresholds scale to page ``dim``."""
+    past the edge), or 0 to leave it; the gap thresholds scale to page ``dim``.
+
+    ``gap_frac`` sizes the trailing whitespace run that ends growth — the caller
+    passes a smaller one (``_FIGURE_BLOCK_GAP_FRAC``) when a caption follows so
+    growth halts at the figure↔caption gap instead of stepping over it."""
     run = _ink_run_end(
         ink_profile,
-        max(1, round(_FIGURE_GAP_FRAC * dim)),
+        max(1, round(gap_frac * dim)),
         max(1, round(_FIGURE_LEAD_GAP_FRAC * dim)),
     )
     return run if run is not None else 0
 
 
-def _extend_bottom_to_content(image: Image.Image, x0: int, x1: int, y1: int) -> int:
+def _grow_edge_offset(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    dim: int,
+    *,
+    axis: int,
+    reverse: bool,
+    gap_frac: float = _FIGURE_GAP_FRAC,
+) -> int:
+    """Non-negative offset to grow one edge over the contiguous ink in ``box``.
+
+    Crops the strip past the edge, reduces it to a 1-D ink profile (mean over
+    ``axis``), reverses it when growing toward 0 (the left edge) so the scan always
+    runs outward from the edge, and returns the run length before the whitespace
+    gap.  The three ``_extend_*`` wrappers clamp the search ``box`` and apply the
+    direction; this holds the shared strip→profile→``_grow_edge`` body."""
+    strip = np.asarray(image.crop(box).convert("L"))
+    profile = (strip < _FIGURE_INK_LEVEL).mean(axis=axis)
+    if reverse:
+        profile = profile[::-1]
+    return _grow_edge(profile, dim, gap_frac)
+
+
+def _extend_bottom_to_content(
+    image: Image.Image, x0: int, x1: int, y1: int, gap_frac: float = _FIGURE_GAP_FRAC
+) -> int:
     """Grow ``y1`` downward to recover a figure bottom the box clipped.
 
     Grows over figure ink directly below ``y1`` and stops at the whitespace gap
@@ -200,13 +233,16 @@ def _extend_bottom_to_content(image: Image.Image, x0: int, x1: int, y1: int) -> 
     the ink runs to the search cap with no gap (ambiguous), or when a leading gap
     separates the box from what is below (the box already ends at the figure
     bottom and a caption — not clipped figure — follows), so no text is pulled in.
+    ``gap_frac`` is tightened by the caller when a caption follows, so growth halts
+    at the figure↔caption gap rather than leaping past the caption.
     """
     h = image.size[1]
     limit = min(h, y1 + round(_FIGURE_MAX_GROW_FRAC * h))
     if y1 >= limit:
         return y1
-    strip = np.asarray(image.crop((x0, y1, x1, limit)).convert("L"))
-    return y1 + _grow_edge((strip < _FIGURE_INK_LEVEL).mean(axis=1), h)
+    return y1 + _grow_edge_offset(
+        image, (x0, y1, x1, limit), h, axis=1, reverse=False, gap_frac=gap_frac
+    )
 
 
 def _extend_right_to_content(image: Image.Image, y0: int, y1: int, x1: int) -> int:
@@ -222,8 +258,23 @@ def _extend_right_to_content(image: Image.Image, y0: int, y1: int, x1: int) -> i
     limit = min(w, x1 + round(_FIGURE_MAX_GROW_FRAC * w))
     if x1 >= limit:
         return x1
-    strip = np.asarray(image.crop((x1, y0, limit, y1)).convert("L"))
-    return x1 + _grow_edge((strip < _FIGURE_INK_LEVEL).mean(axis=0), w)
+    return x1 + _grow_edge_offset(image, (x1, y0, limit, y1), w, axis=0, reverse=False)
+
+
+def _extend_left_to_content(image: Image.Image, y0: int, y1: int, x0: int) -> int:
+    """Grow ``x0`` leftward to recover a figure left edge the box clipped.
+
+    The mirror of :func:`_extend_right_to_content`: only grows when the ink left of
+    ``x0`` ends in a clear whitespace gap.  The column profile is reversed so growth
+    proceeds outward from ``x0``, so a right-column figure stops at the inter-column
+    gutter and never reaches the previous column; if the ink runs to the cap with no
+    gap the box is left unchanged.
+    """
+    w = image.size[0]
+    limit = max(0, x0 - round(_FIGURE_MAX_GROW_FRAC * w))
+    if x0 <= limit:
+        return x0
+    return x0 - _grow_edge_offset(image, (limit, y0, x0, y1), w, axis=0, reverse=True)
 
 
 def _mean_norm_run_length(mask: np.ndarray) -> float:
@@ -364,6 +415,42 @@ def _trim_baked_caption(
     return caption_top if caption_top is not None else y1
 
 
+def _trim_caption_band(
+    image: Image.Image,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+    grown_y1: int,
+    caption_text: str,
+    ocr_region: Callable[[Image.Image], str] | None,
+) -> int:
+    """Trim the caption out of the bottom of a grown crop, returning the kept ``y``.
+
+    When ``ocr_region`` is available, the OCR-based band trim is authoritative: it
+    cuts at a baked/abutting caption's true top, and — finding none — leaves the
+    crop as grown.  Bottom growth already halts at the figure↔caption gap, so a
+    "no caption found" result means the grown band is the recovered figure tail;
+    keeping it is correct, whereas the cheap run-length trim would mistake a sparse
+    tail (axis tick labels) for prose and clip it.  The run-length trim is only the
+    backstop when OCR is unavailable or raises (a band re-OCR can fail on a
+    transient OOM on the shared GPU, or a degenerate strip — the trim is cosmetic,
+    so the failure is logged and the run-length trim takes over)."""
+    if ocr_region is not None:
+        try:
+            return _trim_baked_caption(
+                image, x0, x1, y0, grown_y1, caption_text, ocr_region
+            )
+        except Exception:
+            # ocr_region is an opaque injected callable (network OCR), so the failure
+            # type isn't nameable here; degrade to the pixel-only trim rather than
+            # abort the document, but log it so a real defect isn't silently masked.
+            _log.warning(
+                "baked-caption trim failed; using run-length trim", exc_info=True
+            )
+    return _trim_swallowed_caption(image, x0, x1, y1, grown_y1)
+
+
 def _safe_crop(
     image: Image.Image,
     bbox: tuple[int, int, int, int],
@@ -385,19 +472,19 @@ def _safe_crop(
     y1 = max(0, min(bbox[3], h))
     if x1 - x0 < _MIN_FIGURE_HEIGHT or y1 - y0 < _MIN_FIGURE_HEIGHT:
         return None
+    x0 = _extend_left_to_content(image, y0, y1, x0)
     x1 = _extend_right_to_content(image, y0, y1, x1)
-    grown_y1 = _extend_bottom_to_content(image, x0, x1, y1)
+    # With a caption below, halt bottom growth at the figure↔caption gap (the
+    # smaller block gap) so it recovers the clipped tail without leaping into the
+    # caption; without one, the larger gap steps over inter-row gaps as before.
+    has_caption = caption_text is not None
+    bottom_gap = _FIGURE_BLOCK_GAP_FRAC if has_caption else _FIGURE_GAP_FRAC
+    grown_y1 = _extend_bottom_to_content(image, x0, x1, y1, bottom_gap)
     if caption_text is not None:
         untrimmed_y1 = grown_y1
-        grown_y1 = _trim_swallowed_caption(image, x0, x1, y1, grown_y1)
-        if ocr_region is not None:
-            # A band re-OCR can fail on a transient OOM (the GPU is shared) or a
-            # degenerate strip; the trim is cosmetic, so keep the crop as-is rather
-            # than abort the whole document.
-            with contextlib.suppress(Exception):
-                grown_y1 = _trim_baked_caption(
-                    image, x0, x1, y0, grown_y1, caption_text, ocr_region
-                )
+        grown_y1 = _trim_caption_band(
+            image, x0, x1, y0, y1, grown_y1, caption_text, ocr_region
+        )
         # Measured against the model's box (y0..y1), not the grown bottom, so a
         # legitimately swallowed caption pulled in by _extend_bottom_to_content can
         # still be trimmed off a short figure without tripping the guard.

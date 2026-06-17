@@ -1213,6 +1213,60 @@ class TestFigureRightGrowth:
         assert crop is not None and crop.size == (200, 300)
 
 
+class TestFigureLeftGrowth:
+    """The crop grows left over contiguous ink to the figure's true left edge and
+    stops at the whitespace before the page margin or inter-column gutter; a box
+    already ending in whitespace grows nothing, so a neighbouring column is never
+    pulled in.  Mirror of :class:`TestFigureRightGrowth`."""
+
+    @staticmethod
+    def _image() -> Image.Image:
+        # White page: a strip at x[20,40) (page-margin neighbour), a 60 px gap, then
+        # the figure block x[100,300).
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (20, 300), "black"), (20, 50))
+        img.paste(Image.new("RGB", (200, 300), "black"), (100, 50))
+        return img
+
+    def test_tight_box_grows_to_figure_left(self) -> None:
+        from pdfparser.pipeline.figures import _extend_left_to_content
+
+        # box left clipped 50 px into the figure → grows back out to x=100
+        assert _extend_left_to_content(self._image(), 50, 350, 150) == 100
+
+    def test_box_at_left_does_not_grow(self) -> None:
+        from pdfparser.pipeline.figures import _extend_left_to_content
+
+        assert _extend_left_to_content(self._image(), 50, 350, 100) == 100
+
+    def test_no_growth_when_ink_runs_without_gap(self) -> None:
+        # Ink continues left past the search window with no gap (a column abutting a
+        # correct box) → ambiguous → leave the box unchanged.
+        from pdfparser.pipeline.figures import _extend_left_to_content
+
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (300, 300), "black"), (100, 50))  # x[100,400)
+        assert _extend_left_to_content(img, 50, 350, 350) == 350
+
+    def test_gutter_stops_growth_before_previous_column(self) -> None:
+        # Right-column figure, a whitespace gutter, then left-column text: growth
+        # recovers the clipped figure edge but stops at the gutter, never reaching
+        # the previous column.
+        from pdfparser.pipeline.figures import _extend_left_to_content
+
+        img = Image.new("RGB", (800, 400), "white")
+        img.paste(Image.new("RGB", (200, 300), "black"), (50, 50))  # left column
+        img.paste(Image.new("RGB", (200, 300), "black"), (360, 50))  # x[360,560)
+        assert _extend_left_to_content(img, 50, 350, 410) == 360
+
+    def test_safe_crop_recovers_clipped_left_edge(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        # box left clipped to x=150; the crop grows back out to the figure's x=100.
+        crop = _safe_crop(self._image(), (150, 50, 300, 350))
+        assert crop is not None and crop.size == (200, 300)
+
+
 class TestSwallowedCaptionTrim:
     """A bottom band that growth recovers is trimmed when it reads as the figure's
     caption (short prose ink-runs) but kept when it is figure content (long shaded

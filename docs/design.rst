@@ -81,16 +81,25 @@ whitespace is cosmetic.  So when the model's crop box and the actual figure
 disagree, the code leans toward **including too much rather than too little**, and
 that bias is intentional.  It shows up in three places:
 
-* **Bottom and right recovery**
+* **Bottom, left and right recovery**
   (:func:`~pdfparser.pipeline.figures._extend_bottom_to_content`,
-  :func:`~pdfparser.pipeline.figures._extend_right_to_content`).
-  The model's box routinely clips the bottom — and, for a wide figure, the right
-  edge — of a figure.  Rather than trust the box, the crop grows over figure
-  content and stops at the whitespace gap beyond it (the space before the caption
-  below, or the page margin / inter-column gutter to the right).  The "is this
-  line blank?" threshold (``_FIGURE_BLANK_LINE_FRAC``) is kept near-empty on
+  :func:`~pdfparser.pipeline.figures._extend_right_to_content`,
+  :func:`~pdfparser.pipeline.figures._extend_left_to_content`).
+  The model's box routinely clips a figure's edges — most often the bottom, but
+  either side too (a wide figure's right edge, a plot's left axis line).  Rather
+  than trust the box, the crop grows over figure content and stops at the
+  whitespace gap beyond it (the space before the caption below, or the page margin
+  / inter-column gutter to either side).  All three edges share one body
+  (:func:`~pdfparser.pipeline.figures._grow_edge_offset`); the left edge reverses
+  the ink profile so the scan always runs outward from the edge.  The **top** edge
+  is deliberately *not* grown — the model does not clip tops in practice, and a
+  top-grown crop would reach up into the title/prose above the figure.  The "is
+  this line blank?" threshold (``_FIGURE_BLANK_LINE_FRAC``) is kept near-empty on
   purpose: a sparse figure line — a thin axis, content narrower than the box —
   must count as *content* so growth doesn't stop early and behead the figure.
+  When a caption follows the figure, bottom growth tightens its stop gap to the
+  smaller ``_FIGURE_BLOCK_GAP_FRAC`` so it halts at the figure↔caption gap rather
+  than stepping over it into the caption.
 
 * **Over-segmentation merge**
   (:func:`~pdfparser.pipeline.figures._cluster_figure_boxes`,
@@ -114,37 +123,39 @@ box already ends at the figure boundary and what follows is separated from it (a
 caption below, a neighbouring column to the right), so growth is declined.  A real
 clip leaves no such gap — it cuts straight through figure ink.
 
-Third — and this is the one case where the page geometry alone is not enough — a
-caption can sit close *below* a clipped figure, contiguous with the recovered
-tail, so the gap rules wave it through.  Here a *second, document-level* signal
-breaks the tie: the OCR already emitted the caption as its own text block, so we
-know prose sits below the figure.  When it does,
-:func:`~pdfparser.pipeline.figures._trim_swallowed_caption` re-examines the
-recovered band and drops it if it *reads* as prose — judged by the mean horizontal
-ink-run length (``_FIGURE_PROSE_RUN_FRAC``): caption text is short letter runs,
-while figure content worth recovering here (shaded panels, gel lanes, sequence
-alignments) is long continuous runs.  The band is judged whole and kept-or-dropped
-all-or-nothing, so a band mixing a real figure tail with a little caption is kept
-rather than risk clipping the figure.  This one trades a sliver of the bias the
-other way: a clipped *sparse* line-art tail (thin axes, tick labels) shares prose's
-short runs and may be trimmed with the caption — an accepted loss, since the
-caption is always re-emitted as ``<figcaption>`` and baking a whole caption into
-the image is worse.
+Third — and this is where page geometry alone is not enough — a caption sits close
+*below* the figure.  When a clear gap separates the figure tail from the caption,
+the tightened bottom-growth gap (above) already halts growth at it, so the caption
+is never recovered in the first place.  But the caption can abut the recovered tail
+with no gap, or — when the figure is *itself* text (a sequence alignment, a data
+table) whose caption is pixel-identical to it — the model can draw the box low
+enough to bake the caption *inside* it.  In both, the geometry waves it through, and
+a *document-level* signal breaks the tie: the OCR already emitted the caption as its
+own text block, so its words are known.
 
-That last check has a blind spot, though: when the figure is *itself* text — a
-sequence alignment, a data table — the caption is pixel-identical to it, and the
-model sometimes draws the box low enough to bake the caption *inside* it, where no
-run-length test can find it.  The only thing that still separates them is meaning,
-and the OCR already supplies it: the caption was emitted as its own text block, so
-its words are known.  :func:`~pdfparser.pipeline.figures._trim_baked_caption`
-re-OCRs the trailing text bands (cheap and rare — gated on a caption being present
-and the band being text- rather than dense-figure-textured, and confined to the
-bottom of the crop) and drops a band that *reproduces the caption's words*.  Two
-guards keep that honest: a high word-overlap bar, so a figure row the caption
+So when a caption is present and an OCR seam is available,
+:func:`~pdfparser.pipeline.figures._trim_baked_caption` is **authoritative**.  It
+re-OCRs the trailing text bands (cheap and rare — gated on the band being text-
+rather than dense-figure-textured, and confined to the bottom of the crop) and cuts
+at the caption's true top, dropping a band that *reproduces the caption's words*.
+Two guards keep that honest: a high word-overlap bar, so a figure row the caption
 merely *names* (an alignment labels its own rows — ``BsSDH``, ``HmSDH`` …) isn't
-mistaken for the caption; and a distinct-word floor, so a row the model fails to
-read and OCRs into a repeated-token wall (``BMSDH BMSDH BMSDH …``) — which would
-otherwise score ~1.0 against a caption that names it — is rejected as degenerate.
+mistaken for the caption; and a distinct-word floor, so a row the model OCRs into a
+repeated-token wall (``BMSDH BMSDH BMSDH …``) — which would otherwise score ~1.0
+against a caption that names it — is rejected as degenerate.  Crucially, finding
+*no* caption in the (gap-bounded) recovered region, it keeps the crop as grown — so
+a clipped *sparse* tail (thin axes, tick labels), whose short ink runs a pixel-only
+test would mistake for prose, survives, because its words (axis numbers) are not the
+caption's.
+
+The pixel-only run-length test
+(:func:`~pdfparser.pipeline.figures._trim_swallowed_caption`,
+``_FIGURE_PROSE_RUN_FRAC`` — caption text is short letter runs, recoverable figure
+content long continuous runs) remains only as the backstop when no OCR seam is
+available, or a band re-OCR fails on the shared GPU.  Without the OCR signal it
+cannot tell a sparse tail from a caption and may trim such a tail — an accepted loss
+in that degraded mode, since the caption is always re-emitted as ``<figcaption>``
+and baking a whole caption into the image is worse.
 
 The rule, then, is "expand toward the figure whenever the page shows you where it
 ends; don't expand blindly into text — and when the OCR tells you a caption is
