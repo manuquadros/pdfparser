@@ -349,8 +349,11 @@ def lightonocr_pdf_to_html(
     try:
         images = _render_page_images(Path(pdf_path))
         pages_md = _ocr_pages(images, ocr)
+        # Single-region re-OCR for figure caption-trimming; batched (concurrent)
+        # re-OCR for the document's table crops.
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
-        pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_region)
+        ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
+        pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_regions)
         return _assemble_html(pages_md, images, ocr_region)
     finally:
         if owns_ocr:

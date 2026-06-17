@@ -12,8 +12,12 @@ text layer to seed a bounding box, then flood it out to the connected text block
 The text layer's *content* is never read into the document; that stays the model's
 job, preserving design B-prime's "OCR reads, nothing else does" split.
 
+Crops are planned for the whole document first (text-layer localization plus a
+coverage gate that skips regions the page already captured in full), then re-OCR'd
+in one batched ``ocr_regions`` call so the server processes them concurrently.
+
 Leaf module: touches the PDF (render + text layer) and the GPU (via the injected
-``ocr_region`` callback), so the pure ``_assemble_html`` core stays model-free.
+``ocr_regions`` callback), so the pure ``_assemble_html`` core stays model-free.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
+from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtime
 
 import pypdfium2 as pdfium
@@ -50,6 +55,19 @@ _SUBHEADING_RE = re.compile(r"^#{2,6}\s+(.*\S)\s*$", re.MULTILINE)
 # spot, so only distinctive multi-word cells anchor the box; the flood then fills
 # the rest of the table around them.
 _MIN_ANCHOR_LEN = 4
+
+# The coverage gate ignores one-letter/one-symbol noise, but a multi-char numeric
+# token ("100", "26621") is real table data — a dropped data column is exactly the
+# kind of loss the gate must not skip over — so digit-bearing tokens count as
+# evidence from length 2, while plain words must reach _COVERAGE_MIN_TOKEN_LEN
+# (shorter words like "of"/"the" recur in prose and would misjudge completeness).
+_COVERAGE_MIN_TOKEN_LEN = 4
+_COVERAGE_MIN_NUMERIC_LEN = 2
+
+# A table's caption (above) and legend (below) are short; a block longer than this
+# is body prose the located bbox happened to overrun, and folding it into the gate's
+# "captured" set would mask a genuine drop, so it is not treated as adjacent.
+_ADJACENT_PARA_MAX_LEN = 300
 
 # Vertical growth stops when the gap to the next text line exceeds this multiple
 # of the table's own line spacing — large enough to step over inter-row gaps,
@@ -371,40 +389,165 @@ def _page_text_and_boxes(
     return "".join(parts), boxes
 
 
-def _recover_page_tables(
-    md: str,
-    page: pdfium.PdfPage,
-    ocr_region: Callable[[Image.Image], str],
-) -> str:
-    """Re-OCR each table region of one page and splice the richer markup back in.
+def _glyph_centers(
+    page_norm: str, idx_map: list[int], char_boxes: list[_Box | None]
+) -> list[tuple[float, float] | None]:
+    """Per-``page_norm``-position glyph centre (``None`` for a space or box-less
+    char), computed once per page so the coverage gate's per-region containment test
+    is a cheap lookup rather than re-deriving every centre for every table region."""
+    centers: list[tuple[float, float] | None] = []
+    for pos, ch in enumerate(page_norm):
+        box = None if ch == " " else char_boxes[idx_map[pos]]
+        centers.append(
+            None if box is None else ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        )
+    return centers
 
-    A region is replaced only when the re-OCR yields tables with at least as many
-    non-empty cells as the originals — so a crop that came back worse (or empty)
-    leaves the full-page transcription untouched."""
-    # Close a table the OCR left open at the page bottom first, so a table that
-    # overran the page (and was thus truncated mid-row) is a closed region the
-    # crop re-OCR can locate and recover in full, not an unmatched fragment.
+
+def _in_bbox_tokens(
+    bbox: _Box, page_norm: str, centers: list[tuple[float, float] | None]
+) -> list[str]:
+    """Folded text-layer tokens whose glyphs fall inside ``bbox``.
+
+    Walks ``page_norm`` (its single spaces preserved as word boundaries) and keeps
+    an alnum char only when its precomputed glyph centre lies in ``bbox``, so words
+    outside the box drop out without gluing onto their in-box neighbours.  The
+    boundary must come from ``page_norm`` rather than from filtering glyph boxes
+    directly: a text-layer space carries no glyph box (pdfium reports none), so
+    dropping box-less chars would weld adjacent words into one unmatchable token."""
+    left, bottom, right, top = bbox
+    kept: list[str] = []
+    for ch, center in zip(page_norm, centers, strict=True):
+        if (
+            ch != " "
+            and center is not None
+            and left <= center[0] <= right
+            and bottom <= center[1] <= top
+        ):
+            kept.append(ch)
+        else:
+            kept.append(" ")
+    return "".join(kept).split()
+
+
+def _adjacent_para_tokens(md: str, start: int, end: int) -> set[str]:
+    """Folded tokens of the short paragraphs flanking a table region — the caption
+    above and any legend below.  The located bbox grows to include these lines, yet
+    they are captured in the page markdown though not in the cells, so the coverage
+    gate must count them as already-present; otherwise every captioned table would
+    look like it had dropped content and the gate would never fire.
+
+    Only a genuinely short flanking block (a caption/legend) is folded in: a long
+    block — or the whole pre-table content when no blank line separates it — is body
+    prose the bbox overran, and adding it to ``captured`` would mask a real drop."""
+    before = md[:start].rstrip().rsplit("\n\n", 1)[-1]
+    after = md[end:].lstrip().split("\n\n", 1)[0]
+    tokens: set[str] = set()
+    for chunk in (before, after):
+        text = _visible_text(chunk)
+        if len(text) <= _ADJACENT_PARA_MAX_LEN:
+            tokens.update(_normalize(text).split())
+    return tokens
+
+
+def _is_distinctive(token: str) -> bool:
+    """A token strong enough to judge table completeness: a real word
+    (``_COVERAGE_MIN_TOKEN_LEN``+) or a multi-char number (table data)."""
+    return len(token) >= _COVERAGE_MIN_TOKEN_LEN or (
+        len(token) >= _COVERAGE_MIN_NUMERIC_LEN and any(c.isdigit() for c in token)
+    )
+
+
+def _region_fully_captured(
+    bbox: _Box,
+    page_norm: str,
+    centers: list[tuple[float, float] | None],
+    captured: set[str],
+) -> bool:
+    """Whether the page already captured every distinctive text-layer token inside
+    the region — in which case the crop re-OCR has nothing to recover and is skipped.
+
+    Conservative by construction: only the *provably complete* case skips (no
+    distinctive in-box token missing from ``captured``).  Distinctive covers real
+    words and multi-char numbers, so a dropped data column counts and is not skipped.
+    A scanned or empty text layer yields no distinctive tokens, so it returns
+    ``False`` and the region is re-OCR'd as before — the gate is an opt-out for
+    proven completeness, never an opt-out on absence of evidence.  This is
+    deliberately strict: the cross-fixture data shows the located bbox pulls in body
+    prose, so a loose threshold cannot separate a genuine drop (often a single
+    token) from that prose noise; only the zero-missing case is safe to skip (see
+    optimize-pipeline-performance.md §2)."""
+    distinctive = [
+        t for t in _in_bbox_tokens(bbox, page_norm, centers) if _is_distinctive(t)
+    ]
+    if not distinctive:
+        return False
+    return all(t in captured for t in distinctive)
+
+
+@dataclass(frozen=True)
+class _RegionPlan:
+    """A table region whose crop re-OCR is worth attempting: its char span in the
+    page's markdown, the original table blocks, and the rendered crop image.  Held
+    per page (the caller keeps the page partition), so it carries no page index, and
+    the re-OCR markdown flows as a separate value rather than mutating the plan."""
+
+    start: int
+    end: int
+    tables: list[str]
+    crop: Image.Image
+
+
+def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionPlan]]:
+    """Localize each table region on the page and render its re-OCR crop, dropping
+    regions the page already captured in full (the coverage gate) or that cannot be
+    localized.  Pure CPU work — no OCR.  Returns the page markdown with open tables
+    closed (so the apply pass splices into the same string) and the crop plans.
+
+    Closing unclosed tables first means a table that overran the page (and was thus
+    truncated mid-row) is a closed region the crop re-OCR can locate and recover in
+    full, not an unmatched fragment."""
     md = _close_unclosed_tables(md)
     regions = _table_regions(md)
     if not regions:
-        return md
+        return md, []
 
     page_text, char_boxes = _page_text_and_boxes(page.get_textpage())
     page_norm, idx_map = _normalize_with_map(page_text)
+    centers = _glyph_centers(page_norm, idx_map, char_boxes)
     page_size = page.get_size()
-    source_norm = _normalize(md)  # to tell a recovered legend from one already in md
 
-    # Splice from the back so earlier char offsets stay valid.
-    for start, end, tables in reversed(regions):
-        anchors = _anchor_texts([c for tbl in tables for c in _cell_texts(tbl)])
-        bbox = _locate_bbox(anchors, page_norm, idx_map, char_boxes, page_size)
+    plans: list[_RegionPlan] = []
+    for start, end, tables in regions:
+        cells = [c for tbl in tables for c in _cell_texts(tbl)]
+        bbox = _locate_bbox(
+            _anchor_texts(cells), page_norm, idx_map, char_boxes, page_size
+        )
         if bbox is None:
             continue
-        crop_md = ocr_region(_scaled_crop(page, bbox, page_size))
+        captured = {t for c in cells for t in _normalize(c).split()}
+        captured |= _adjacent_para_tokens(md, start, end)
+        if _region_fully_captured(bbox, page_norm, centers, captured):
+            continue
+        crop = _scaled_crop(page, bbox, page_size)
+        plans.append(_RegionPlan(start, end, tables, crop))
+    return md, plans
+
+
+def _apply_page_results(md: str, results: list[tuple[_RegionPlan, str]]) -> str:
+    """Splice each planned region's re-OCR markup back into the page markdown.
+
+    Each ``(plan, crop_md)`` pairs a region with its batched re-OCR output.  A region
+    is replaced only when its re-OCR yields tables with at least as many non-empty
+    cells as the originals, so a crop that came back worse (or empty) leaves the
+    full-page transcription untouched.  Splices run from the back so earlier char
+    offsets stay valid."""
+    source_norm = _normalize(md)  # to tell a recovered legend from one already in md
+    for plan, crop_md in sorted(results, key=lambda pc: pc[0].start, reverse=True):
         new_tables = _extract_tables(crop_md)
         if not new_tables:
             continue
-        old_cells = sum(_nonempty_cell_count(t) for t in tables)
+        old_cells = sum(_nonempty_cell_count(t) for t in plan.tables)
         new_cells = sum(_nonempty_cell_count(t) for t in new_tables)
         if new_cells < old_cells:
             continue
@@ -419,27 +562,45 @@ def _recover_page_tables(
             and _normalize(legend) not in source_norm
         ):
             new_tables[-1] += "\n" + _legend_footnote_html(legend)
-        md = _splice_region(md, start, end, new_tables)
+        md = _splice_region(md, plan.start, plan.end, new_tables)
     return md
 
 
 def _recover_dropped_tables(
     pdf_path: Path | str,
     pages_md: list[str],
-    ocr_region: Callable[[Image.Image], str],
+    ocr_regions: Callable[[list[Image.Image]], list[str]],
 ) -> list[str]:
-    """Re-OCR every page's table regions as tight crops; return updated markdown.
+    """Re-OCR the table regions the page pass may have under-captured and splice the
+    richer markup back in; return updated markdown, one entry per input page.
 
-    Pages are processed in place against the source PDF; pages without a table are
-    returned unchanged.  Order and length match ``pages_md`` so the caller's
-    page-to-image alignment is preserved."""
+    Every page's crops are planned first (text-layer localization + the coverage
+    gate, pure CPU work), then OCR'd in **one batched call** so the server can
+    process them concurrently, then spliced back per page.  Pages without a table —
+    and regions the gate found already complete — incur no OCR at all.  Order and
+    length match ``pages_md`` so the caller's page-to-image alignment is preserved."""
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
-        return [
-            _recover_page_tables(md, pdf[i], ocr_region)
-            if "<table" in md.lower()
-            else md
-            for i, md in enumerate(pages_md)
-        ]
+        closed_md: list[str] = []
+        per_page_plans: list[list[_RegionPlan]] = []
+        for i, md in enumerate(pages_md):
+            if "<table" not in md.lower():
+                closed_md.append(md)
+                per_page_plans.append([])
+                continue
+            page_md, plans = _plan_page_tables(md, pdf[i])
+            closed_md.append(page_md)
+            per_page_plans.append(plans)
+
+        flat = [plan for plans in per_page_plans for plan in plans]
+        if not flat:
+            return closed_md
+
+        crop_mds = iter(ocr_regions([plan.crop for plan in flat]))
+        for i, plans in enumerate(per_page_plans):
+            if plans:
+                pairs = [(plan, next(crop_mds)) for plan in plans]
+                closed_md[i] = _apply_page_results(closed_md[i], pairs)
+        return closed_md
     finally:
         pdf.close()

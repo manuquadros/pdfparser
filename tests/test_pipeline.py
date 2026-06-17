@@ -2493,14 +2493,62 @@ class TestAdPageExclusion:
 
 
 @pytest.fixture(scope="session")
-def plos_html(ocr_model: object) -> str:
-    """Full pipeline output for the PLOS ONE 32639976.pdf fixture.
+def plos_run(ocr_model: object) -> object:
+    """Run the PLOS ONE 32639976.pdf pipeline once, capturing the table re-OCR
+    batching and gate decisions so the gate test needs no second OCR pass.
 
-    Writes the result to spike_results/32639976.html for visual inspection.
+    Wraps ``_recover_dropped_tables`` to record the size of each batched
+    ``ocr_regions`` call, and ``_region_fully_captured`` to count how many regions
+    the coverage gate actually skipped.  Returns the HTML plus that spy data;
+    ``plos_html`` derives from it, so the whole fixture costs a single pipeline run.
+    Writes spike_results/32639976.html too.
     """
     if not _PLOS_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_PLOS_PDF}")
-    return _run_pipeline_to_file(_PLOS_PDF, ocr_model)
+    from types import SimpleNamespace
+
+    from pdfparser.pipeline import (
+        OcrModel,
+        assemble,
+        lightonocr_pdf_to_html,
+        tables,
+    )
+
+    assert isinstance(ocr_model, OcrModel)
+    real_recover = assemble._recover_dropped_tables
+    real_gate = tables._region_fully_captured
+    spy = SimpleNamespace(batches=[], gate_skips=0, html="")
+
+    def recover_with_spy(pdf_path, pages_md, ocr_regions):  # type: ignore[no-untyped-def]
+        def counting(regions):  # type: ignore[no-untyped-def]
+            spy.batches.append(len(regions))
+            return ocr_regions(regions)
+
+        return real_recover(pdf_path, pages_md, counting)
+
+    def gate_with_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+        skipped = real_gate(*args, **kwargs)
+        spy.gate_skips += int(skipped)
+        return skipped
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(assemble, "_recover_dropped_tables", recover_with_spy)
+    # Count actual gate decisions, so the gate test can't be satisfied by a region
+    # that merely failed to localize (which also lowers the batch size).
+    mp.setattr(tables, "_region_fully_captured", gate_with_spy)
+    try:
+        spy.html = lightonocr_pdf_to_html(_PLOS_PDF, ocr=ocr_model)
+    finally:
+        mp.undo()
+    _OUTPUT_DIR.mkdir(exist_ok=True)
+    (_OUTPUT_DIR / f"{_PLOS_PDF.stem}.html").write_text(spy.html, encoding="utf-8")
+    return spy
+
+
+@pytest.fixture(scope="session")
+def plos_html(plos_run: object) -> str:
+    """Full pipeline HTML for the PLOS fixture (the single run in ``plos_run``)."""
+    return plos_run.html
 
 
 @pytest.mark.integration
@@ -2789,6 +2837,113 @@ class TestTableLocalization:
         assert bbox is None
 
 
+class TestCoverageGate:
+    """``_region_fully_captured`` skips a table's crop re-OCR only when the page
+    already captured every distinctive text-layer token inside the located bbox."""
+
+    @staticmethod
+    def _centers(
+        lines: list[tuple[str, float | int, float | int]],
+    ) -> tuple[str, list[tuple[float, float] | None]]:
+        from pdfparser.pipeline.tables import _glyph_centers, _normalize_with_map
+
+        text, boxes = TestTableLocalization._layout(lines)
+        norm, idx_map = _normalize_with_map(text)
+        return norm, _glyph_centers(norm, idx_map, boxes)
+
+    def test_in_bbox_tokens_keeps_only_in_box_words(self) -> None:
+        from pdfparser.pipeline.tables import _in_bbox_tokens
+
+        norm, centers = self._centers(
+            [("alpha beta", 700, 50), ("gamma delta", 600, 50)]
+        )
+        toks = _in_bbox_tokens((0.0, 690.0, 400.0, 710.0), norm, centers)
+        assert toks == ["alpha", "beta"]  # top line only, bottom line excluded
+
+    def test_in_bbox_tokens_does_not_glue_clipped_word(self) -> None:
+        from pdfparser.pipeline.tables import _in_bbox_tokens
+
+        # The right edge cuts off "beta"; "alpha" must survive as its own token —
+        # the box-less space still has to break the words, not weld "alphabeta".
+        norm, centers = self._centers([("alpha beta", 700, 50)])
+        toks = _in_bbox_tokens((0.0, 690.0, 82.0, 710.0), norm, centers)
+        assert toks == ["alpha"]
+
+    def test_fully_captured_when_all_distinctive_tokens_present(self) -> None:
+        from pdfparser.pipeline.tables import _region_fully_captured
+
+        norm, centers = self._centers([("alpha beta", 700, 50)])
+        assert _region_fully_captured(
+            (0.0, 690.0, 400.0, 710.0), norm, centers, {"alpha", "beta"}
+        )
+
+    def test_not_captured_when_a_token_is_missing(self) -> None:
+        from pdfparser.pipeline.tables import _region_fully_captured
+
+        # "beta" is in the text layer but not the captured cells — content the page
+        # pass dropped — so the gate must not fire and the region is re-OCR'd.
+        norm, centers = self._centers([("alpha beta", 700, 50)])
+        assert not _region_fully_captured(
+            (0.0, 690.0, 400.0, 710.0), norm, centers, {"alpha"}
+        )
+
+    def test_numeric_drop_is_not_skipped(self) -> None:
+        from pdfparser.pipeline.tables import _region_fully_captured
+
+        # All words captured but a multi-digit data value (26621) missing — a dropped
+        # data cell. Numbers count as distinctive evidence, so the gate must not fire.
+        norm, centers = self._centers([("alpha 26621", 700, 50)])
+        assert not _region_fully_captured(
+            (0.0, 690.0, 400.0, 710.0), norm, centers, {"alpha"}
+        )
+
+    def test_empty_text_layer_forces_reocr(self) -> None:
+        from pdfparser.pipeline.tables import _region_fully_captured
+
+        # A bbox over a region with no glyphs (a scanned page) gives no evidence, so
+        # the gate stays off — it never opts out on absence of evidence.
+        norm, centers = self._centers([("alpha beta", 700, 50)])
+        assert not _region_fully_captured(
+            (0.0, 100.0, 400.0, 200.0), norm, centers, {"alpha", "beta"}
+        )
+
+    def test_short_non_numeric_tokens_are_not_evidence(self) -> None:
+        from pdfparser.pipeline.tables import _region_fully_captured
+
+        # Only short non-numeric tokens in the bbox — no distinctive token to judge
+        # completeness, so the gate does not fire even with nothing captured.
+        norm, centers = self._centers([("ab cd ef", 700, 50)])
+        assert not _region_fully_captured(
+            (0.0, 690.0, 400.0, 710.0), norm, centers, set()
+        )
+
+    def test_adjacent_para_tokens_pick_caption_and_legend(self) -> None:
+        from pdfparser.pipeline.tables import _adjacent_para_tokens
+
+        md = (
+            "Table 1. Effect of metals on activity\n\n"
+            "<table><tr><td>x</td></tr></table>\n\n"
+            "MW molecular weight reported"
+        )
+        start = md.index("<table>")
+        end = md.index("</table>") + len("</table>")
+        toks = _adjacent_para_tokens(md, start, end)
+        assert {"effect", "metals"} <= toks  # caption above the table
+        assert {"molecular", "reported"} <= toks  # legend below the table
+
+    def test_adjacent_para_ignores_long_prose_block(self) -> None:
+        from pdfparser.pipeline.tables import _adjacent_para_tokens
+
+        # A long block flanking the table (e.g. body prose the bbox overran, or the
+        # whole pre-table content when no blank line separates it) is NOT folded into
+        # 'captured' — otherwise its tokens could mask a genuinely dropped table cell.
+        long_prose = "discussion " * 60  # well past _ADJACENT_PARA_MAX_LEN
+        md = f"{long_prose}<table><tr><td>x</td></tr></table>"
+        start = md.index("<table>")
+        end = md.index("</table>") + len("</table>")
+        assert "discussion" not in _adjacent_para_tokens(md, start, end)
+
+
 @pytest.mark.integration
 class TestPlosTableReocr:
     """32639976.pdf Table 2: the full-page OCR pass drops the column-spanning
@@ -2806,6 +2961,22 @@ class TestPlosTableReocr:
         body = _body(plos_html)
         m = re.search(r'colspan="2"[^>]*>\s*Relative activity', body)
         assert m is not None, "spanning subheader not recovered with colspan"
+
+
+@pytest.mark.integration
+class TestTableReocrGate:
+    """The coverage gate skips re-OCR for a table the page pass already captured in
+    full, and the crops that remain are re-OCR'd in one batched (concurrent) call."""
+
+    def test_complete_table_skipped_and_crops_batched(self, plos_run: object) -> None:
+        # The coverage gate actually skipped at least one region (measured at the
+        # gate itself, so a mere localization failure can't satisfy this): PLOS
+        # Table 1 (Purification summary) is fully captured.  And the crops that
+        # remain are re-OCR'd in a single batched call, not one request per region.
+        # Spy data comes from the shared plos_run, so there is no second OCR.
+        assert plos_run.gate_skips >= 1, "coverage gate skipped no complete table"
+        assert len(plos_run.batches) == 1, "table crops were not OCR'd in one batch"
+        assert plos_run.batches[0] >= 1, "no table region was re-OCR'd"
 
 
 # The table-content needles below are not harvested from the pipeline's own OCR
