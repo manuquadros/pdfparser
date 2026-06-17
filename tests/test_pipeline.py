@@ -2360,6 +2360,88 @@ class TestReflowWrappedParagraph:
         assert block.count("<p>") == 1
 
 
+class TestDehyphenateJoin:
+    """A line/block break drops a soft hyphen only for a syllabic word split;
+    a genuine compound, range, or acronym hyphen is kept.  Shared by the
+    markdown reflow and the block-merge stitcher."""
+
+    def test_syllabic_split_merging_to_real_word_is_joined(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # Merged form is a dictionary word -> drop the hyphen.
+        assert _dehyphenate_join("biosynthesis. Unfortu-", "nately, regulation") == (
+            "biosynthesis. Unfortunately, regulation"
+        )
+        assert _dehyphenate_join("co-", "operate fully") == "cooperate fully"
+        # "fore" is a word, but "therefore" is too, so the merged form wins.
+        assert _dehyphenate_join("there-", "fore we") == "therefore we"
+
+    def test_lowercase_nonword_split_is_joined(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # Neither the merge nor the halves are words; a lowercase-to-lowercase
+        # boundary is a syllabic split (a genus name here), so drop the hyphen.
+        assert _dehyphenate_join("such as *At-", "ropa belladonna*") == (
+            "such as *Atropa belladonna*"
+        )
+
+    def test_compound_hyphen_is_kept(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # Both halves are words but the merge is not -> a real compound.
+        assert _dehyphenate_join("a well-", "known result") == "a well-known result"
+        assert _dehyphenate_join("high-", "density lipoprotein") == (
+            "high-density lipoprotein"
+        )
+        # An acronym half ("TA") is a known word, so the compound hyphen survives.
+        assert _dehyphenate_join("TA-", "producing plants") == "TA-producing plants"
+        # "self-"/"cross-" are compound-formers, not solid prefixes -> keep.
+        assert _dehyphenate_join("self-", "assembly of") == "self-assembly of"
+        assert _dehyphenate_join("cross-", "section view") == "cross-section view"
+
+    def test_solid_prefix_fuses_even_when_solid_form_absent(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # Productive prefixes attach without a hyphen; their solid form is absent
+        # from a general dictionary, so the prefix list (not the dict) must fuse
+        # them — the exact scientific vocabulary this pipeline processes.
+        assert _dehyphenate_join("over-", "expression of") == "overexpression of"
+        assert _dehyphenate_join("co-", "expression levels") == "coexpression levels"
+        assert _dehyphenate_join("up-", "regulation of") == "upregulation of"
+        assert _dehyphenate_join("pseudo-", "tropine reductase") == (
+            "pseudotropine reductase"
+        )
+
+    def test_solid_prefix_keeps_hyphen_before_capital_or_number(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # A prefix before a capital or digit is a real hyphenated coinage.
+        assert _dehyphenate_join("anti-", "CRISPR system") == "anti-CRISPR system"
+        assert _dehyphenate_join("pre-", "2020 data") == "pre-2020 data"
+
+    def test_non_alphabetic_boundary_keeps_hyphen(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # A numeric range is not a word split; the hyphen must survive.
+        assert _dehyphenate_join("pages 2-", "3 here") == "pages 2-3 here"
+
+    def test_hyphen_across_inline_tag_keeps_compound(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        # The continuation opens with a tag, so the right-hand word is opaque;
+        # default to keeping the hyphen ("multi-faceted") rather than fusing.
+        assert _dehyphenate_join("the multi-", "<em>faceted</em> view") == (
+            "the multi-<em>faceted</em> view"
+        )
+
+    def test_break_without_hyphen_joins_with_space(self) -> None:
+        from pdfparser.pipeline.dehyphenate import _dehyphenate_join
+
+        assert _dehyphenate_join("normal word", "continues here") == (
+            "normal word continues here"
+        )
+
+
 class TestParseFigurePlaceholder:
     """LightOnOCR-bbox emits figures as `![image](...)x0,y0,x1,y1`; the parser
     must recover the crop box, recognise a bbox-less placeholder, and reject

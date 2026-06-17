@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from pdfparser.pipeline.classify import _is_stray_metadata
+from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
@@ -20,7 +21,6 @@ from pdfparser.pipeline.text import (
 )
 
 _FLOAT_RE = re.compile(r"^<(?:table|figure)[\s>]", re.IGNORECASE)
-_HYPHEN_BREAK_RE = re.compile(r"-\s*$")
 _ENUM_RE = re.compile(
     r"^\s*(?:\d+[.)]\s|\[\d|[•\-]\s|\([a-z0-9ivx]+\)\s)", re.IGNORECASE
 )
@@ -177,8 +177,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                             and not _MIDSENTENCE_HEAD_RE.match(cont)
                         )
                     ):
-                        dehyphenated, n = _HYPHEN_BREAK_RE.subn("", stripped)
-                        joined = dehyphenated + ("" if n else " ") + cont.lstrip()
+                        joined = _dehyphenate_join(stripped, cont)
                         out.append(f"<p>{joined}</p>")
                         out.extend(floats)
                         i = j + 1

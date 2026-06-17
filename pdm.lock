@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:55756b58d2eabfa6e90db15d49fcfa7d8d4637810c30aead2eb40dd061e13e23"
+content_hash = "sha256:819d05e84bb7ac52604ddbb2b8a2069768b9b17248d72927e05a2828d4d5d97d"
 
 [[metadata.targets]]
 requires_python = ">=3.13,<3.14"
@@ -743,6 +743,15 @@ files = [
     {file = "pypdfium2-5.9.0-py3-none-win_amd64.whl", hash = "sha256:06508c33b9772cf3878e48364c6e14c70cefc18a3abd6983ac9f338da9305275"},
     {file = "pypdfium2-5.9.0-py3-none-win_arm64.whl", hash = "sha256:565ddfc98795fd2f6054b544ee9791d7b9032f9cf77a57891b6e501fafd0ef3f"},
     {file = "pypdfium2-5.9.0.tar.gz", hash = "sha256:db1274bd27844db6fda17ef1dbcd0026c47d357437058d838e98060c0da9e92e"},
+]
+
+[[package]]
+name = "pyspellchecker"
+version = "0.9.0"
+summary = ""
+files = [
+    {file = "pyspellchecker-0.9.0-py3-none-any.whl", hash = "sha256:97eaed776e0854f69aafb723f6962b403099e50c9a1d9c05525c819f4b0f5d54"},
+    {file = "pyspellchecker-0.9.0.tar.gz", hash = "sha256:eb1a594161c84a4e67df7db1c269a3392a645bd50e4c82e1298892db0cdb0965"},
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ import re
 
 from markdown_it import MarkdownIt
 
+from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.latex import _latex_to_html
 from pdfparser.pipeline.text import _plain_p_text, _visible_text
 
@@ -21,10 +22,9 @@ _MD = MarkdownIt("commonmark", {"html": True}).enable("table")
 # line wrapping, emitting one paragraph as many soft-wrapped lines (CommonMark
 # keeps these as ``\n`` inside the rendered <p>).  Two artefacts follow from
 # that, both repaired by ``_reflow_paragraph``: a word split across the wrap
-# keeps its soft hyphen ("Unfortu-\nnately"), and a paragraph break that fell on
-# a line boundary is lost (the next paragraph just continues on the next line).
-_SOFT_HYPHEN_RE = re.compile(r"[a-z]-$")
-_LINE_STARTS_LOWER_RE = re.compile(r"[a-z]")
+# keeps its soft hyphen ("Unfortu-\nnately", de-hyphenated by ``_dehyphenate_join``),
+# and a paragraph break that fell on a line boundary is lost (the next paragraph
+# just continues on the next line).
 # A wrapped line ends a paragraph only when it ends a sentence; ``;:`` and commas
 # never do, so they stay mid-paragraph.  Closing brackets/quotes may follow the
 # terminal mark.
@@ -59,19 +59,11 @@ def _render_cell_markdown(table_html: str) -> str:
 
 
 def _join_wrapped_lines(lines: list[str]) -> str:
-    """Join soft-wrapped lines of one paragraph back into a single run.
-
-    A line broken mid-word keeps a soft hyphen ("Unfortu-" + "nately"); drop it
-    and join without a space.  Every other break is word-wrap, joined with a
-    space.  The hyphen test runs on the raw line tail, never inside a tag, so a
-    genuine ``word-</em>`` end is left alone.
-    """
+    """Join the soft-wrapped lines of one paragraph back into a single run,
+    de-hyphenating words split across a wrap (see ``_dehyphenate_join``)."""
     out = lines[0]
     for line in lines[1:]:
-        if _SOFT_HYPHEN_RE.search(out) and _LINE_STARTS_LOWER_RE.match(line):
-            out = out[:-1] + line
-        else:
-            out = out + " " + line
+        out = _dehyphenate_join(out, line)
     return out
 
 

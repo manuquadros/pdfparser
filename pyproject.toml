@@ -12,6 +12,7 @@ dependencies = [
   "pillow",
   "markdown-it-py>=3",
   "pylatexenc>=2.10",
+  "pyspellchecker>=0.9.0",
 ]
 
 [build-system]
