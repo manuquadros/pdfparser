@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import httpx
@@ -20,6 +21,11 @@ from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 _DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 _DEFAULT_MODEL = "lightonocr"
 _OCR_MAX_NEW_TOKENS = 2048
+# Pages OCR independently, so the client issues several requests at once to let
+# the vLLM server's continuous batching engage — a serial caller pins
+# ``num_requests_running`` at 1, leaving most of the GPU idle.  Bounded because
+# the card is small and shared; override with ``PDFPARSER_OCR_CONCURRENCY``.
+_DEFAULT_OCR_CONCURRENCY = 4
 # A cold page can take tens of seconds on a small GPU; httpx's 5 s default would
 # abort mid-decode, so OCR requests use a generous per-request budget.
 _REQUEST_TIMEOUT_S = 600.0
@@ -123,3 +129,42 @@ def _ocr_page(
     # in-process decode did) rather than tripping the str return contract.
     text: str = content or ""
     return text
+
+
+def _resolve_ocr_concurrency() -> int:
+    raw = os.environ.get("PDFPARSER_OCR_CONCURRENCY")
+    if raw is None:
+        return _DEFAULT_OCR_CONCURRENCY
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_OCR_CONCURRENCY
+
+
+def _ocr_pages(
+    images: list[Image.Image],
+    ocr: OcrModel,
+    max_new_tokens: int = _OCR_MAX_NEW_TOKENS,
+    concurrency: int | None = None,
+) -> list[str]:
+    """OCR page images via the vLLM server, returning their markdown in page order.
+
+    Requests are issued with up to ``concurrency`` in flight at once (default
+    ``PDFPARSER_OCR_CONCURRENCY``, else ``_DEFAULT_OCR_CONCURRENCY``) over the
+    shared, thread-safe ``httpx.Client``.  Per-page OCR is independent, so the
+    results are gathered back in input order and the page↔image alignment the
+    pipeline depends on is preserved.
+
+    Output is semantically equivalent to the serial path but not byte-identical
+    across runs: continuous batching means batch composition now varies with
+    request timing, jittering the low-order bits (mostly figure bbox digits).  The
+    acceptance gate is substring/structural for exactly this reason — see
+    ``spike_results/vllm_determinism.md``.
+    """
+    if len(images) <= 1:
+        return [_ocr_page(img, ocr, max_new_tokens) for img in images]
+    workers = min(concurrency or _resolve_ocr_concurrency(), len(images))
+    if workers <= 1:
+        return [_ocr_page(img, ocr, max_new_tokens) for img in images]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda img: _ocr_page(img, ocr, max_new_tokens), images))

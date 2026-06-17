@@ -116,6 +116,44 @@ class TestOcrSeam:
         with pytest.raises(RuntimeError, match="unexpected OCR response"):
             _ocr_page(_fake_image(8, 8), ocr)
 
+    def test_ocr_pages_preserves_order_under_concurrency(self) -> None:
+        import json
+
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_pages
+
+        # Each page carries a distinct width so the handler can echo its identity;
+        # concurrent completion must still gather back in input (page) order.
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            url = body["messages"][0]["content"][0]["image_url"]["url"]
+            png = base64.b64decode(url.split(",", 1)[1])
+            width = Image.open(io.BytesIO(png)).size[0]
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": f"page-{width}"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        images = [_fake_image(w, 8) for w in range(10, 18)]
+        result = _ocr_pages(images, ocr, concurrency=4)
+
+        assert result == [f"page-{w}" for w in range(10, 18)]
+
+    def test_ocr_pages_propagates_page_error(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_pages
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "boom"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        with pytest.raises(httpx.HTTPStatusError):
+            _ocr_pages([_fake_image(8, 8), _fake_image(9, 8)], ocr, concurrency=2)
+
     def test_ocr_model_context_manager_closes_client(self) -> None:
         import httpx
 

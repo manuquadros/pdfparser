@@ -44,7 +44,7 @@ from pdfparser.pipeline.merge import (
     _join_split_table_caption_labels,
     _merge_split_paragraphs_stable,
 )
-from pdfparser.pipeline.model import OcrModel, _ocr_page, load_ocr_model
+from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_model
 from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
 from pdfparser.pipeline.text import _looks_like_figure_caption, _visible_text
@@ -348,7 +348,7 @@ def lightonocr_pdf_to_html(
         ocr = load_ocr_model(base_url=base_url, model=model)
     try:
         images = _render_page_images(Path(pdf_path))
-        pages_md = [_ocr_page(img, ocr) for img in images]
+        pages_md = _ocr_pages(images, ocr)
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_region)
         return _assemble_html(pages_md, images, ocr_region)
