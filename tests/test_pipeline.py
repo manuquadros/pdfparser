@@ -2286,6 +2286,80 @@ class TestMdToHtmlBlocks:
         assert "<li>one</li>" in block and "<li>two</li>" in block
 
 
+class TestReflowWrappedParagraph:
+    """When LightOnOCR preserves a column's visual line wrapping, a paragraph
+    arrives as soft-wrapped lines inside one <p>: words break across the wrap
+    with a soft hyphen, and a dropped paragraph break lands on a line boundary.
+    """
+
+    def test_soft_hyphen_rejoined_without_space(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # 31051047: "Unfortu-\nnately" must read "Unfortunately", not "Unfortu- nately".
+        (block,) = _md_to_html_blocks(
+            "interesting plant species for studying TA biosynthesis. Unfortu-\n"
+            "nately, biosynthesis and regulation of TAs are unknown at the\n"
+            "molecular, biochemical, and biotechnological level."
+        )
+        assert "Unfortunately, biosynthesis" in block
+        assert "Unfortu" not in block.replace("Unfortunately", "")
+
+    def test_soft_hyphen_rejoined_inside_emphasis(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # 31051047: "*At-\nropa belladonna*" must render "<em>Atropa belladonna</em>".
+        (block,) = _md_to_html_blocks(
+            "species, such as *Hyoscyamus niger* [2], *Datura species* [3], *At-\n"
+            "ropa belladonna* [4], *P. tangutica* [5], and so on, the highest."
+        )
+        assert "<em>Atropa belladonna</em>" in block
+
+    def test_dropped_paragraph_break_recovered(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # 31051047: a sentence ending at a line boundary where the next line's
+        # first word would have fit marks a paragraph the model failed to break.
+        # Verbatim wrapped lines from the fixture, so the widest line (the
+        # self-calibrating fill width) matches the real column.
+        blocks = _md_to_html_blocks(
+            "gives the highest yields of TAs [1]. It is not only a valuable plant\n"
+            "source for commercially producing hyoscyamine but also an\n"
+            "interesting plant species for studying TA biosynthesis. Unfortu-\n"
+            "nately, biosynthesis and regulation of TAs are unknown at the\n"
+            "level. Therefore, it is necessary to develop novel methods to\n"
+            "increase the yield of TA using metabolic engineering [6].\n"
+            "Although the precise biosynthetic pathway of TAs is still\n"
+            "unclear, several enzymes and their corresponding genes have"
+        )
+        assert len(blocks) == 2
+        assert blocks[0].endswith("metabolic engineering [6].</p>")
+        assert "Unfortunately, biosynthesis" in blocks[0]
+        assert blocks[1].startswith("<p>Although the precise")
+
+    def test_mid_paragraph_sentence_end_not_split(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # A sentence ending at the widest line is a wrap, not a paragraph break:
+        # the next word could not have fit, so the lines stay one paragraph.
+        (block,) = _md_to_html_blocks(
+            "the reduction of the 3-carbonyl group of tropinone yields one.\n"
+            "Tropinone reductase reduces the ketone to the tropine alcohol."
+        )
+        assert block.count("<p>") == 1
+        assert "yields one. Tropinone reductase" in block
+
+    def test_hard_break_block_left_untouched(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        # Explicit <br> hard breaks (affiliation lists) are not soft wrap: reflow
+        # must not join or split across them.
+        (block,) = _md_to_html_blocks(
+            "First affiliation line.  \nSecond affiliation line."
+        )
+        assert "<br" in block
+        assert block.count("<p>") == 1
+
+
 class TestParseFigurePlaceholder:
     """LightOnOCR-bbox emits figures as `![image](...)x0,y0,x1,y1`; the parser
     must recover the crop box, recognise a bbox-less placeholder, and reject

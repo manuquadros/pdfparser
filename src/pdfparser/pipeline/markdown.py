@@ -13,8 +13,22 @@ import re
 from markdown_it import MarkdownIt
 
 from pdfparser.pipeline.latex import _latex_to_html
+from pdfparser.pipeline.text import _plain_p_text, _visible_text
 
 _MD = MarkdownIt("commonmark", {"html": True}).enable("table")
+
+# When LightOnOCR transcribes a page column-by-column it preserves the visual
+# line wrapping, emitting one paragraph as many soft-wrapped lines (CommonMark
+# keeps these as ``\n`` inside the rendered <p>).  Two artefacts follow from
+# that, both repaired by ``_reflow_paragraph``: a word split across the wrap
+# keeps its soft hyphen ("Unfortu-\nnately"), and a paragraph break that fell on
+# a line boundary is lost (the next paragraph just continues on the next line).
+_SOFT_HYPHEN_RE = re.compile(r"[a-z]-$")
+_LINE_STARTS_LOWER_RE = re.compile(r"[a-z]")
+# A wrapped line ends a paragraph only when it ends a sentence; ``;:`` and commas
+# never do, so they stay mid-paragraph.  Closing brackets/quotes may follow the
+# terminal mark.
+_LINE_SENTENCE_END_RE = re.compile(r"[.!?][)\]\"'»]*$")
 
 # LightOnOCR emits tables as raw HTML, which CommonMark passes through verbatim —
 # so ``*emphasis*`` the model leaves inside a cell (organism names: ``*Klebsiella
@@ -44,6 +58,52 @@ def _render_cell_markdown(table_html: str) -> str:
     )
 
 
+def _join_wrapped_lines(lines: list[str]) -> str:
+    """Join soft-wrapped lines of one paragraph back into a single run.
+
+    A line broken mid-word keeps a soft hyphen ("Unfortu-" + "nately"); drop it
+    and join without a space.  Every other break is word-wrap, joined with a
+    space.  The hyphen test runs on the raw line tail, never inside a tag, so a
+    genuine ``word-</em>`` end is left alone.
+    """
+    out = lines[0]
+    for line in lines[1:]:
+        if _SOFT_HYPHEN_RE.search(out) and _LINE_STARTS_LOWER_RE.match(line):
+            out = out[:-1] + line
+        else:
+            out = out + " " + line
+    return out
+
+
+def _reflow_paragraph(p_html: str) -> list[str]:
+    """Reflow a soft-wrapped ``<p>`` block: de-hyphenate broken words and split
+    where the model dropped a paragraph break onto a line boundary.
+
+    A line that ends a sentence marks a paragraph break only when the next line's
+    first word would have fit on it — i.e. the break was forced by the paragraph
+    ending, not by the line filling up.  Width is read off the block's own widest
+    line, so the test is self-calibrating per column.  Blocks with no soft wrap,
+    or with explicit ``<br>`` hard breaks (affiliation lists, addresses), are
+    left untouched.
+    """
+    inner = p_html[len("<p>") : -len("</p>")]
+    if "\n" not in inner or "<br" in inner:
+        return [p_html]
+    lines = inner.split("\n")
+    visibles = [_visible_text(line).strip() for line in lines]
+    fill = max(len(v) for v in visibles)
+    paragraphs: list[list[str]] = [[]]
+    for idx, line in enumerate(lines):
+        paragraphs[-1].append(line)
+        if idx + 1 >= len(lines):
+            continue
+        first_word = visibles[idx + 1].split(" ", 1)[0]
+        would_fit = len(visibles[idx]) + 1 + len(first_word) <= fill
+        if _LINE_SENTENCE_END_RE.search(visibles[idx]) and would_fit:
+            paragraphs.append([])
+    return [f"<p>{_join_wrapped_lines(par)}</p>" for par in paragraphs]
+
+
 def _md_to_html_blocks(md_text: str) -> list[str]:
     """Convert a page's markdown to a list of top-level block HTML strings.
 
@@ -70,8 +130,12 @@ def _md_to_html_blocks(md_text: str) -> list[str]:
         else:
             group, i = [token], i + 1
         html = _MD.renderer.render(group, _MD.options, {}).strip()
-        if html and not html.startswith("<hr"):
-            if "<td" in html or "<th" in html:
-                html = _render_cell_markdown(html)
+        if not html or html.startswith("<hr"):
+            continue
+        if "<td" in html or "<th" in html:
+            blocks.append(_render_cell_markdown(html))
+        elif _plain_p_text(html) is not None:
+            blocks.extend(_reflow_paragraph(html))
+        else:
             blocks.append(html)
     return blocks
