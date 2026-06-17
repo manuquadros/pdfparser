@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -138,6 +139,12 @@ def _resolve_ocr_concurrency() -> int:
     try:
         return max(1, int(raw))
     except ValueError:
+        # A misconfigured deployment should be visible, not silently defaulted.
+        warnings.warn(
+            f"PDFPARSER_OCR_CONCURRENCY={raw!r} is not an integer; "
+            f"falling back to {_DEFAULT_OCR_CONCURRENCY}",
+            stacklevel=2,
+        )
         return _DEFAULT_OCR_CONCURRENCY
 
 
@@ -149,11 +156,17 @@ def _ocr_pages(
 ) -> list[str]:
     """OCR page images via the vLLM server, returning their markdown in page order.
 
-    Requests are issued with up to ``concurrency`` in flight at once (default
-    ``PDFPARSER_OCR_CONCURRENCY``, else ``_DEFAULT_OCR_CONCURRENCY``) over the
-    shared, thread-safe ``httpx.Client``.  Per-page OCR is independent, so the
-    results are gathered back in input order and the page↔image alignment the
-    pipeline depends on is preserved.
+    Requests are issued with up to ``concurrency`` in flight at once (``None`` ->
+    ``PDFPARSER_OCR_CONCURRENCY``/``_DEFAULT_OCR_CONCURRENCY``; an explicit value is
+    floored at 1, so ``concurrency=0`` means serial, not "use the default") over the
+    shared, thread-safe ``httpx.Client``.  Per-page OCR is independent, so results
+    are gathered back in input order and the page↔image alignment the pipeline
+    depends on is preserved.
+
+    On a per-page error, the first failing page's exception propagates and the pool
+    is torn down without waiting on still-running siblings (queued requests are
+    cancelled), so one quick failure can't be stalled for minutes behind a wedged
+    request near the long per-request timeout.
 
     Output is semantically equivalent to the serial path but not byte-identical
     across runs: continuous batching means batch composition now varies with
@@ -161,10 +174,12 @@ def _ocr_pages(
     acceptance gate is substring/structural for exactly this reason — see
     ``spike_results/vllm_determinism.md``.
     """
-    if len(images) <= 1:
-        return [_ocr_page(img, ocr, max_new_tokens) for img in images]
-    workers = min(concurrency or _resolve_ocr_concurrency(), len(images))
-    if workers <= 1:
-        return [_ocr_page(img, ocr, max_new_tokens) for img in images]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(lambda img: _ocr_page(img, ocr, max_new_tokens), images))
+    if not images:
+        return []
+    limit = _resolve_ocr_concurrency() if concurrency is None else max(1, concurrency)
+    pool = ThreadPoolExecutor(max_workers=min(limit, len(images)))
+    try:
+        futures = [pool.submit(_ocr_page, img, ocr, max_new_tokens) for img in images]
+        return [future.result() for future in futures]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
