@@ -785,6 +785,60 @@ class TestLightonAssembly:
         assert "Polyols have a role" in body
         assert "<hr" not in body
 
+    def test_frontiers_open_access_sidebar_pulled_into_panel(self) -> None:
+        # 32117944 (Frontiers) page 0: the first-page sidebar opens with an
+        # "OPEN ACCESS" banner heading and carries a "Specialty section:" routing
+        # line after the Edited by / Reviewed by / Correspondence / Citation run.
+        # The banner heading broke the leading front-matter run, stranding it and
+        # the specialty line in the body; both belong in the panel.
+        # The abstract carries no "Abstract" heading and directly follows a
+        # multi-superscript affiliation run that ends "…South Korea" with no
+        # terminal punctuation: the merge must not glue the abstract onto the
+        # affiliation (which, opening with "¹", would then hide both in the panel).
+        md = (
+            "# Discovery of a Methanol Dehydrogenase\n\n"
+            "**Jin-Young Lee¹ and Seung-Goo Lee\\***\n\n"
+            "¹ Synthetic Biology Research Center, KRIBB, Daejeon, South Korea,"
+            "² Department of Biosystems and Bioengineering, University of Science "
+            "and Technology, Daejeon, South Korea,³ School of Biological Sciences "
+            "and Technology, Chonnam National University, Gwangju, South Korea\n\n"
+            "Bioconversion of C1 chemicals such as methane and methanol into higher "
+            "carbon-chain chemicals has been widely studied in recent years.\n\n"
+            "**Keywords:** methanol dehydrogenase, methylotrophy\n\n"
+            "**Edited by:**\nDong-Yup Lee, Sungkyunkwan University, South Korea\n\n"
+            "**Citation:**\nLee J-Y (2020) Discovery. Front. Bioeng. Biotechnol. "
+            "8:67. doi: 10.3389/fbioe.2020.00067\n\n"
+            "## OPEN ACCESS\n\n"
+            "**Specialty section:**\nThis article was submitted to Synthetic "
+            "Biology, a section of the journal Frontiers in Bioengineering and "
+            "Biotechnology\n\n"
+            "## INTRODUCTION\n\n"
+            "In this regard, Mdh is a crucial enzyme for\n\n"
+            "**Abbreviations:** ACT, endogenous activator protein; Mdh, methanol "
+            "dehydrogenase; PQQ, pyrroloquinoline quinone.\n\n"
+            "bioconversion of valuable multi-carbon chemicals from C1 chemicals."
+        )
+        html = _run_lighton([md])
+        meta, body = _metadata(html), _body(html)
+        for fragment in (
+            "Synthetic Biology Research Center",
+            "OPEN ACCESS",
+            "Specialty section",
+            "submitted to Synthetic",
+            "endogenous activator protein",
+        ):
+            assert fragment in meta, fragment
+            assert fragment not in body, fragment
+        # The abstract stays in the body, not glued onto the affiliation and hidden.
+        assert "Bioconversion of C1 chemicals" in body
+        assert "Bioconversion of C1 chemicals" not in meta
+        # The glossary footnote is pulled out before the merge, so the paragraph it
+        # split rejoins as one block in the body.
+        assert (
+            "crucial enzyme for bioconversion of valuable multi-carbon chemicals"
+            in body
+        )
+
     def test_body_sentence_with_one_email_not_hidden(self) -> None:
         # The stray-metadata sweep must not hide a body sentence that merely embeds
         # a single address: one token is below the threshold.
@@ -835,6 +889,22 @@ class TestLightonAssembly:
             "<p><strong>Funding:</strong> "
             + "This work was generously supported by many sources. " * 12
             + "</p>"
+        )
+        # An inline glossary footnote ("Abbreviations:"/"Nomenclature:") the OCR
+        # drops mid-section is relocated on the label alone, regardless of how long
+        # the entry list runs, so the paragraph it split rejoins in the body.
+        assert _is_stray_metadata(
+            "<p><strong>Abbreviations:</strong> ACT, endogenous activator protein; "
+            "IMAC, immobilized metal affinity chromatography; Mdh, methanol "
+            "dehydrogenase; PQQ, pyrroloquinoline quinone.</p>"
+        )
+        assert _is_stray_metadata(
+            "<p><strong>Nomenclature:</strong> k, rate constant; T, temperature.</p>"
+        )
+        # "Keywords:" is excluded — it sits after the abstract and does not split
+        # prose, so it stays where it is rather than being swept into the panel.
+        assert not _is_stray_metadata(
+            "<p><strong>Keywords:</strong> methanol dehydrogenase, methylotrophy</p>"
         )
         # A bold label-colon that is *not* a publishing-process label is ordinary
         # body emphasis, not metadata, and must not be relocated on the shape alone.
@@ -2592,6 +2662,7 @@ class TestParseFigurePlaceholder:
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
 _PLOS_PDF = Path(__file__).parent / "fixtures" / "32639976.pdf"
+_FRONTIERS_PDF = Path(__file__).parent / "fixtures" / "32117944.pdf"
 _OUTPUT_DIR = Path(__file__).parent.parent / "spike_results"
 
 
@@ -3464,3 +3535,63 @@ class TestPlosTableFormatting:
             in text
         )
         assert "&lt;sup&gt;" not in plos_html
+
+
+@pytest.fixture(scope="session")
+def frontiers_html(ocr_model: object) -> str:
+    """Full pipeline HTML for the Frontiers 32117944.pdf fixture; skip if the model
+    is absent.  Writes spike_results/32117944.html for visual inspection."""
+    if not _FRONTIERS_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_FRONTIERS_PDF}")
+    return _run_pipeline_to_file(_FRONTIERS_PDF, ocr_model)
+
+
+@pytest.mark.integration
+class TestFrontiersSidebarMetadata:
+    """32117944.pdf (Frontiers in Bioengineering and Biotechnology) prints a
+    first-page sidebar headed by an "OPEN ACCESS" banner, carrying Edited by /
+    Reviewed by / Correspondence / Citation entries plus a "Specialty section:"
+    routing line.  The banner heading and specialty line must land in the Metadata
+    panel — and the abstract (which has no "Abstract" heading and directly follows
+    the multi-superscript affiliation run) must stay in the body, not be glued onto
+    the affiliation and hidden in the panel with it."""
+
+    def test_open_access_sidebar_in_panel_not_body(self, frontiers_html: str) -> None:
+        panel, body = _metadata(frontiers_html), _body(frontiers_html)
+        for fragment in (
+            "OPEN ACCESS",
+            "Specialty section",
+            "submitted to Synthetic Biology",
+            "Synthetic Biology and Bioengineering Research Center",
+        ):
+            assert fragment in panel, f"{fragment!r} missing from metadata panel"
+            assert fragment not in body, f"{fragment!r} leaked into body"
+
+    def test_abstract_in_body_not_hidden_in_panel(self, frontiers_html: str) -> None:
+        # The affiliation run ends "…South Korea" with no terminal punctuation; the
+        # merge must not absorb the abstract that follows it (which, opening with the
+        # affiliation's "¹", would otherwise be hidden in the collapsed panel).
+        panel, body = _metadata(frontiers_html), _body(frontiers_html)
+        abstract = (
+            "Bioconversion of C1 chemicals such as methane and methanol into higher"
+        )
+        assert abstract in body
+        assert abstract not in panel
+
+    def test_abbreviations_footnote_does_not_split_introduction(
+        self, frontiers_html: str
+    ) -> None:
+        # The Introduction's first paragraph is split across a column by the
+        # "Abbreviations:" glossary footnote; relocating the glossary to the panel
+        # lets the two halves rejoin as one body paragraph.
+        panel, body = _metadata(frontiers_html), _body(frontiers_html)
+        assert (
+            "crucial enzyme for bioconversion of valuable multi-carbon chemicals"
+            in body
+        )
+        # The glossary footnote itself is in the panel; the bare phrase "endogenous
+        # activator protein" also appears in body prose ("…enhanced by an endogenous
+        # activator protein (ACT)"), so key on the glossary's bold label, not the
+        # entry text.
+        assert "<strong>Abbreviations:</strong>" in panel
+        assert "<strong>Abbreviations:</strong>" not in body

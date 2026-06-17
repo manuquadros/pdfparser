@@ -337,9 +337,21 @@ _PUBLICATION_METADATA_LABELS = frozenset(
         "conflict of interest",
         "conflicts of interest",
         "provenance and peer review",
+        # Frontiers prints an "OPEN ACCESS" banner heading atop its first-page
+        # sidebar, with a "Specialty section:" routing line among the Edited
+        # by / Reviewed by / Correspondence / Citation entries — sidebar
+        # furniture, not body text.
+        "open access",
+        "specialty section",
     }
 )
 _BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
+# A glossary the journal prints as a column-bottom footnote on the first page —
+# "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
+# mid-section, where it splits the surrounding paragraph in two; relocated to the
+# panel (like the leading-run glossary heading) so the prose rejoins.  Keywords is
+# excluded: it sits cleanly after the abstract and does not interrupt prose.
+_GLOSSARY_METADATA_LABELS = frozenset({"abbreviations", "nomenclature"})
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
 # section is recognised by length + a sentence ending, and breaks the run.
@@ -893,6 +905,15 @@ def _is_publication_metadata_label(inner: str) -> bool:
     return m is not None and m.group(1).strip().lower() in _PUBLICATION_METADATA_LABELS
 
 
+def _is_glossary_metadata_label(inner: str) -> bool:
+    """True when a ``<p>`` opens with an inline glossary bold label
+    ("**Abbreviations:**", "**Nomenclature:**") — see
+    ``_GLOSSARY_METADATA_LABELS``.  The label is decisive evidence regardless of
+    the entry list's length, so it is matched before the stray-metadata length cap."""
+    m = _BOLD_LABEL_CAPTURE_RE.match(inner)
+    return m is not None and m.group(1).strip().lower() in _GLOSSARY_METADATA_LABELS
+
+
 def _is_stray_metadata(part: str) -> bool:
     """A self-contained footer-metadata line OCR'd into the body (see
     ``_STRAY_METADATA_MAX_LEN``).  Unlike ``_is_frontmatter_text`` it is judged
@@ -902,7 +923,7 @@ def _is_stray_metadata(part: str) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
         return False
-    if _is_publication_metadata_label(inner):
+    if _is_publication_metadata_label(inner) or _is_glossary_metadata_label(inner):
         return True
     plain = _visible_text(inner)
     # An affiliation is front matter wherever it sits — relocate it even when the

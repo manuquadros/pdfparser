@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from pdfparser.pipeline.classify import _is_stray_metadata
+from pdfparser.pipeline.classify import _LEADING_SUP_RE, _is_stray_metadata
 from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
@@ -154,6 +154,12 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                 # punctuation, so it must not be absorbed as a fragment with the
                 # following body prose glued on.  Backstops the page-0 stray sweep.
                 and not _is_stray_metadata(part)
+                # An affiliation/footnote line opening with a leading superscript
+                # marker ("¹ Department of …, South Korea") is self-contained front
+                # matter even without terminal punctuation; a multi-affiliation run
+                # overruns _is_stray_metadata's length cap, so guard it directly or
+                # the abstract that follows is glued on and hidden with it.
+                and not _LEADING_SUP_RE.match(visible.lstrip())
             ):
                 j = i + 1
                 floats: list[str] = []
