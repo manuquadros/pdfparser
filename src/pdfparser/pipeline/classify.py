@@ -345,6 +345,13 @@ _PUBLICATION_METADATA_LABELS = frozenset(
         "specialty section",
     }
 )
+# Publication-metadata headings that are bare banners, not label:value pairs:
+# "OPEN ACCESS" carries no value paragraph (unlike "Citation"/"Editor"/…).  The
+# value-capture clause in _extract_named_metadata_sections grabs the paragraph
+# *directly* under any other label heading; for a banner it would swallow whatever
+# body prose happens to follow, so a banner relocates on its own and never claims a
+# trailing paragraph.
+_PUBLICATION_BANNER_LABELS = frozenset({"open access"})
 _BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
 # A glossary the journal prints as a column-bottom footnote on the first page —
 # "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
@@ -691,6 +698,21 @@ def _is_publication_metadata_heading(part: str) -> bool:
     return title in _PUBLICATION_METADATA_LABELS
 
 
+def _is_publication_value_heading(part: str) -> bool:
+    """A publication-metadata heading that takes a value paragraph ("Citation",
+    "Editor", …), as opposed to a bare banner ("OPEN ACCESS").  Only such a heading
+    owns the paragraph directly beneath it; a banner does not (see
+    ``_PUBLICATION_BANNER_LABELS``)."""
+    heading = _heading_inner(part)
+    if heading is None:
+        return False
+    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+    return (
+        title in _PUBLICATION_METADATA_LABELS
+        and title not in _PUBLICATION_BANNER_LABELS
+    )
+
+
 def _has_place_like_tail(plain: str) -> bool:
     """True when the last comma-segment looks like a place name — a short run of
     capitalised words, opening on a capital (see ``_PLACE_TAIL_MAX_WORDS``)."""
@@ -867,10 +889,12 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
         if _is_publication_metadata_heading(part):
             # A sidebar label heading owns the <p> value(s) directly under it, and
             # the sidebar is a contiguous run of such headings.  Pull label headings
-            # and their values — but a <p> that neither directly follows a label
-            # heading nor is itself recognised front matter ends the run, so trailing
-            # body prose is never swept into the hidden panel (a valueless label like
-            # a bare "Editor" still relocates via the heading clause).
+            # and their values — but a <p> that neither directly follows a *value*
+            # label heading nor is itself recognised front matter ends the run, so
+            # trailing body prose is never swept into the hidden panel.  A bare banner
+            # ("OPEN ACCESS") owns no value paragraph, so it does not claim the <p>
+            # under it — only an independently-recognised front-matter <p> follows it
+            # into the panel.
             j = i + 1
             while j < len(parts):
                 nxt = parts[j]
@@ -881,7 +905,7 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
                     _heading_inner(nxt) is None
                     and _plain_p_text(nxt) is not None
                     and (
-                        _is_publication_metadata_heading(parts[j - 1])
+                        _is_publication_value_heading(parts[j - 1])
                         or _is_frontmatter_text(nxt, strict=False)
                     )
                 ):

@@ -785,6 +785,30 @@ class TestLightonAssembly:
         assert "Polyols have a role" in body
         assert "<hr" not in body
 
+    def test_open_access_banner_does_not_swallow_following_body_prose(self) -> None:
+        # "OPEN ACCESS" is a bare banner heading, not a label:value pair like
+        # "Citation"/"Editor": it must relocate on its own and must NOT claim the
+        # paragraph directly under it.  A body paragraph stranded right after a
+        # mislaid banner stays visible in the body, never hidden in the panel.
+        md = (
+            "# A Real Article Title\n\n"
+            "**Jane Doe¹**\n\n"
+            "¹ Department of Biology, Some University, Seoul, South Korea\n\n"
+            "## Abstract\n\nThe abstract sentence is here.\n\n"
+            "## Introduction\n\n"
+            "The first introduction paragraph establishes the study's background.\n\n"
+            "## OPEN ACCESS\n\n"
+            "This is genuine body prose that follows the stranded banner and must "
+            "remain visible in the body, not vanish into the collapsed panel.\n\n"
+            "## Methods\n\nMethod text."
+        )
+        meta, body = _metadata(_run_lighton([md])), _body(_run_lighton([md]))
+        assert "genuine body prose" in body
+        assert "genuine body prose" not in meta
+        # The banner itself is still relocated, not left as a body heading.
+        assert "OPEN ACCESS" in meta
+        assert "OPEN ACCESS" not in body
+
     def test_frontiers_open_access_sidebar_pulled_into_panel(self) -> None:
         # 32117944 (Frontiers) page 0: the first-page sidebar opens with an
         # "OPEN ACCESS" banner heading and carries a "Specialty section:" routing
