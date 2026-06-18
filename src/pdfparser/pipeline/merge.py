@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import re
 
-from pdfparser.pipeline.classify import _LEADING_SUP_RE, _is_stray_metadata
+from pdfparser.pipeline.classify import (
+    _LEADING_SUP_RE,
+    _REF_SECTION_RE,
+    _is_stray_metadata,
+)
 from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
@@ -132,7 +136,18 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     Headings, footnote paragraphs, enumeration items, and figure/table
     captions act as merge barriers and are never absorbed into an adjacent
     paragraph.
+
+    Inside the references section the rule tightens: a bibliography entry rarely
+    ends in terminal punctuation (it trails off in a DOI — "…1997.00426.x"), so
+    the generic "no period ⇒ fragment" test would chain the whole list into one
+    paragraph.  There a new entry always opens with a capitalised author surname
+    while a genuinely wrapped entry resumes lowercase ("…quaternary structure" /
+    "and possible subunit cooperativity"), so a capital-led continuation is taken
+    as the next entry and left as its own block.
     """
+    ref_start = next(
+        (k for k, p in enumerate(parts) if _REF_SECTION_RE.match(p)), len(parts)
+    )
     out: list[str] = []
     i = 0
     while i < len(parts):
@@ -172,6 +187,7 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                     j += 1
                 if j < len(parts):
                     cont = _plain_p_text(parts[j])
+                    cont_head = _visible_text(cont).lstrip() if cont is not None else ""
                     if (
                         cont is not None
                         and not _ENUM_RE.match(cont)
@@ -181,6 +197,11 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                             _FUNCTION_WORD_END_RE.search(visible)
                             and cont[:1].isupper()
                             and not _MIDSENTENCE_HEAD_RE.match(cont)
+                        )
+                        and not (
+                            i >= ref_start
+                            and cont_head[:1].isupper()
+                            and not _MIDSENTENCE_HEAD_RE.match(cont_head)
                         )
                     ):
                         joined = _dehyphenate_join(stripped, cont)

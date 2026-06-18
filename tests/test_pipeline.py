@@ -1760,6 +1760,45 @@ class TestCrossPageMerge:
         assert _merge_split_paragraphs(parts) == parts
 
 
+class TestReferenceListMerge:
+    """Inside the references section each entry is its own block: a DOI-terminated
+    entry (no terminal punctuation) must not absorb the next entry, but a genuinely
+    wrapped entry (lowercase continuation) still rejoins."""
+
+    def test_doi_terminated_entries_stay_separate(self) -> None:
+        # Each reference trails off in a DOI with no terminal punctuation; the
+        # next entry opens with a capitalised surname, so it stays its own block
+        # instead of being glued into one giant paragraph.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\nBody text.\n\n"
+            "## References\n\n"
+            "Arfman, N. (1997). Properties of a dehydrogenase. "
+            "doi: 10.1111/j.1432-1033.1997.00426.x\n\n"
+            "Bradford, M. M. (1976). A rapid method for protein. "
+            "doi: 10.1016/0003-2697(76)90527-3\n\n"
+            "Cahn, J. K. (2016). Mutations in adenine pockets. "
+            "doi: 10.1093/protein/gzv057"
+        )
+        body = _body(_run_lighton([md]))
+        for entry in ("Arfman, N.", "Bradford, M. M.", "Cahn, J. K."):
+            assert f"<p>{entry}" in body
+        assert "00426.x Bradford" not in body
+        assert "90527-3 Cahn" not in body
+
+    def test_wrapped_reference_entry_still_rejoins(self) -> None:
+        # A single entry split mid-sentence by a column/page break resumes
+        # lowercase, so the two halves still merge into one reference.
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\nBody text.\n\n"
+            "## References\n\n"
+            "Marcal, D. (2009). 1,3-Propanediol dehydrogenase: decameric "
+            "quaternary structure\n\n"
+            "and possible subunit cooperativity. doi: 10.1128/JB.01077-08"
+        )
+        body = _body(_run_lighton([md]))
+        assert "quaternary structure and possible subunit cooperativity" in body
+
+
 class TestCaptionMergeBarrier:
     """A figure/table caption is never absorbed as a paragraph continuation,
     even across intervening floats and even when wrapped in <strong>."""
@@ -3841,3 +3880,25 @@ class TestFrontiersSidewaysTable:
         html = frontiers_html
         assert "<caption>TABLE 2 | Kinetic parameters" in html
         assert "<figcaption>TABLE 2" not in html
+
+
+@pytest.mark.integration
+class TestFrontiersReferenceList:
+    """32117944.pdf's references trail off in DOIs (no terminal punctuation), so
+    the cross-column paragraph merge used to chain the whole list into one <p>.
+    Each entry must render as its own block, while an entry wrapped across the
+    column break still rejoins."""
+
+    def test_each_reference_is_its_own_paragraph(self, frontiers_html: str) -> None:
+        html = frontiers_html
+        for entry in ("Arfman, N.,", "Bradford, M. M.", "Cahn, J. K.,"):
+            assert f"<p>{entry}" in html, f"{entry} not at the head of its own <p>"
+        # The DOI of one entry must not be glued to the surname of the next.
+        assert "00426.x Bradford" not in html
+
+    def test_wrapped_reference_entry_rejoined(self, frontiers_html: str) -> None:
+        # Marcal's entry breaks across the column; the lowercase continuation
+        # rejoins instead of standing as a stray fragment.
+        assert (
+            "quaternary structure and possible subunit cooperativity" in frontiers_html
+        )
