@@ -401,6 +401,26 @@ class TestByline:
 
         assert _is_byline("Jane Doe") is False
 
+    def test_single_author_with_initial_is_byline(self) -> None:
+        # A lone author with a mid-name initial ("Daniel D. Clark") carries a
+        # positive name signal a subtitle never has, so it is promoted.
+        from pdfparser.pipeline.classify import _is_byline
+
+        assert _is_byline("Daniel D. Clark") is True
+        # A title fragment / subtitle of capitalised words is still refused.
+        assert _is_byline("A Case Study in Kinetics") is False
+        assert _is_byline("Enzyme Kinetics") is False
+
+    def test_single_author_byline_promoted_end_to_end(self) -> None:
+        md = (
+            "# Article\n\n## The Real Title Here\n\nDaniel D. Clark\n\n"
+            "### Abstract\n\nThe abstract paragraph.\n\n## Introduction\n\nProse."
+        )
+        html = _run_lighton([md])
+        header = html[html.find("<header>") : html.find("</header>")]
+        assert "Daniel D. Clark" in header
+        assert "Daniel D. Clark" not in _body(html)
+
     def test_metadata_after_title_goes_to_metadata_panel(self) -> None:
         # A date line under the title is metadata: it must not be promoted into
         # the header (and must not be lost) — it belongs in the Metadata panel.
@@ -1981,6 +2001,21 @@ class TestTableCaptionColocation:
         assert out == [
             "<table><caption>Table 2. Results.</caption>"
             "<tbody><tr><td>1</td></tr></tbody></table>"
+        ]
+
+    def test_heading_form_caption_folded(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        # The model sometimes promotes a whole table caption to a section heading
+        # ("## TABLE 2 …"); it must still fold into the table, not stay an <h2>.
+        parts = [
+            "<h2>TABLE 2 Comparison between various tropinone reductases</h2>",
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == [
+            "<table><caption>TABLE 2 Comparison between various tropinone "
+            "reductases</caption><tbody><tr><td>1</td></tr></tbody></table>"
         ]
 
     def test_caption_separated_by_figure_folded(self) -> None:
@@ -3723,8 +3758,8 @@ class TestHpcdhTableContent:
 
 @pytest.mark.integration
 class TestTropinoneTableContent:
-    """31051047.pdf has two kinetics tables (TABLE 1 and an uncaptioned homolog
-    comparison).  Needles confirmed in the PDF text layer (ground truth)."""
+    """31051047.pdf has two kinetics tables (TABLE 1 and a homolog comparison).
+    Needles confirmed in the PDF text layer (ground truth)."""
 
     def test_kinetics_table_content(self, ad_prefix_html: str) -> None:
         cells = _tables_text(ad_prefix_html)
@@ -3738,6 +3773,35 @@ class TestTropinoneTableContent:
         cells = _tables_text(ad_prefix_html)
         assert "Przewalskia tangutica" in cells
         assert "In this study" in cells
+
+    def test_homolog_table_caption_folded_not_heading(
+        self, ad_prefix_html: str
+    ) -> None:
+        # The model promotes TABLE 2's caption to an <h2>; it must fold into the
+        # table as a <caption>, not stay a stray section heading.
+        html = ad_prefix_html
+        assert "<caption>TABLE 2 Comparison between various tropinone" in html
+        assert "<h2>TABLE 2" not in html
+
+
+@pytest.mark.integration
+class TestHpcdhSingleAuthorByline:
+    """30592559.pdf has a lone author ("Daniel D. Clark") with no affiliation
+    marker; the mid-name initial promotes it to the header byline rather than
+    leaving it stranded at the top of the body."""
+
+    def test_author_in_header_not_body(self, article_html: str) -> None:
+        header = article_html[
+            article_html.find("<header>") : article_html.find("</header>")
+        ]
+        assert "Daniel D. Clark" in header
+        assert "Daniel D. Clark" not in _body(article_html)
+
+    def test_keywords_in_metadata_panel(self, article_html: str) -> None:
+        # With the byline removed from the body top, the keyword line is once
+        # again the leading front-matter block and lands in the panel.
+        assert "Biochemistry education" in _metadata(article_html)
+        assert "Biochemistry education" not in _body(article_html)
 
 
 class TestUnclosedTableClosing:

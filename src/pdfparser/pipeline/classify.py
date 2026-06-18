@@ -417,6 +417,15 @@ _AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰-ⁿ*†‡§]")
 # A comma / "and" / ";"-separated author segment: a short, capitalized,
 # digit-free name.
 _NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")
+# A single word of a personal name: a capitalised word or an initial ("D.",
+# "D.D.").  A lone-author byline ("Daniel D. Clark") has no comma to split on and
+# no affiliation marker, so it is recognised as a short run of these.  An *initial*
+# is required as the positive author signal: a bare two-word name ("Jane Doe") is
+# left ambiguous (it could be a subtitle) and stays in the body, but a title
+# fragment / subtitle never carries a mid-name initial.
+_PERSONAL_NAME_INITIAL_RE = re.compile(r"^(?:[A-Z]\.){1,3}$")
+_PERSONAL_NAME_WORD_RE = re.compile(r"^(?:[A-Z]\.?|[A-Z][a-z’'-]+|(?:[A-Z]\.){2,})$")
+_PERSONAL_NAME_MAX_WORDS = 5
 
 
 # Text-normalization for the furniture key (the only consumer): drop punctuation
@@ -572,6 +581,17 @@ def _looks_like_name_list(plain: str) -> bool:
     )
 
 
+def _looks_like_personal_name(plain: str) -> bool:
+    """A lone personal name ("Daniel D. Clark") — a short run of capitalised
+    words including at least one initial, with no lowercase connective."""
+    words = plain.split()
+    return (
+        2 <= len(words) <= _PERSONAL_NAME_MAX_WORDS
+        and all(_PERSONAL_NAME_WORD_RE.match(w) for w in words)
+        and any(_PERSONAL_NAME_INITIAL_RE.match(w) for w in words)
+    )
+
+
 def _byline_text(inner: str) -> str:
     return _visible_text(re.sub(r"<br\s*/?>", "; ", inner)).strip()
 
@@ -586,7 +606,11 @@ def _is_byline(inner: str) -> bool:
         return False
     if _BOLD_LABEL_RE.match(inner):
         return False
-    return bool(_AUTHOR_MARKER_RE.search(inner)) or _looks_like_name_list(plain)
+    return (
+        bool(_AUTHOR_MARKER_RE.search(inner))
+        or _looks_like_name_list(plain)
+        or _looks_like_personal_name(plain)
+    )
 
 
 def _is_article_page_md(md: str) -> bool:

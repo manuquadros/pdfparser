@@ -233,12 +233,26 @@ def _merge_split_paragraphs_stable(parts: list[str]) -> list[str]:
         parts = merged
 
 
-def _is_table_caption(part: str) -> bool:
-    """True when a block is a stand-alone ``<p>`` table caption ("Table 1 …")."""
+def _table_caption_inner(part: str) -> str | None:
+    """The inner HTML of a free-standing table caption ("TABLE 2 Comparison …"),
+    whether the OCR left it a plain ``<p>`` or promoted the whole caption to a
+    heading (``<h2>TABLE 2 …</h2>``).  ``None`` when the block isn't a table
+    caption.
+
+    The heading form must be recognised too: otherwise a caption the model
+    levelled as a section heading is left stranded in the heading hierarchy while
+    its table renders captionless beneath it."""
     inner = _plain_p_text(part)
-    return inner is not None and bool(
-        _TABLE_CAPTION_RE.match(_visible_text(inner).lstrip())
-    )
+    if inner is None and (heading := _heading_inner(part)) is not None:
+        inner = heading[1]
+    if inner is not None and _TABLE_CAPTION_RE.match(_visible_text(inner).lstrip()):
+        return inner
+    return None
+
+
+def _is_table_caption(part: str) -> bool:
+    """True when a block is a stand-alone table caption ("Table 1 …")."""
+    return _table_caption_inner(part) is not None
 
 
 def _inject_table_caption(table_html: str, caption_part: str) -> str:
@@ -246,7 +260,7 @@ def _inject_table_caption(table_html: str, caption_part: str) -> str:
 
     A lambda replacement keeps any backslash in the caption text (e.g. a literal
     ``\\frac``) from being read as a regex backreference."""
-    inner = _plain_p_text(caption_part)
+    inner = _table_caption_inner(caption_part)
     if inner is None:
         return table_html
     # Insert after the *whole* opening tag so attributes ("<table class=…>")
