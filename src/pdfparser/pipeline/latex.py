@@ -68,6 +68,16 @@ _SUPERSCRIPT_MAP = {
 # longer one ("\to" vs "\top", "\sim" vs "\simeq").
 _LATEX_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
 _L2T = LatexNodes2Text()
+# pylatexenc returns "" for a few common symbol macros (version-dependent), which
+# would leak the raw "\ddagger"/"\S" into author/affiliation footnote markers.
+# Supplied as a whole-token fallback so "\S" can never corrupt "\Section".  "\|"
+# (non-alphabetic, so never matched by _LATEX_COMMAND_RE) is handled separately.
+_LATEX_SYMBOL_FALLBACK = {
+    r"\ddagger": "‡",
+    r"\S": "§",
+    r"\P": "¶",
+}
+_LATEX_VERT_RE = re.compile(r"\\\|")
 
 # The degree idiom is the one place we override pylatexenc: "^\circ" means
 # *degrees* ("°"), but \circ on its own is the ring operator ("∘"), which is
@@ -93,7 +103,7 @@ def _latex_command_to_unicode(command: str) -> str:
     except Exception:
         return command
     if not text or "%" in text:
-        return command
+        return _LATEX_SYMBOL_FALLBACK.get(command, command)
     return text
 
 
@@ -150,6 +160,7 @@ def _latex_span_to_html(content: str) -> str:
     """Convert the inside of a ``$…$`` span: sub/superscripts to HTML, then drop
     residual TeX syntax.  Full math is out of scope (a later MathJax option)."""
     content = _LATEX_WRAP_RE.sub(r"\1", content)
+    content = _LATEX_VERT_RE.sub("‖", content)
     content = _LATEX_DEGREE_RE.sub("°", content)
     content = _LATEX_COMMAND_RE.sub(
         lambda m: _latex_command_to_unicode(m.group(0)), content
