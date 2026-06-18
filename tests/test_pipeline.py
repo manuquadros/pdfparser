@@ -1309,39 +1309,39 @@ class TestFigureBottomGrowth:
         return img
 
     def test_tight_box_grows_to_figure_bottom(self) -> None:
-        from pdfparser.pipeline.figures import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_bottom_to_content(self._image(), 50, 350, 250) == 300
+        assert _extend_edge(self._image(), (50, 100, 350, 250), "bottom") == 300
 
     def test_box_at_bottom_does_not_grow(self) -> None:
-        from pdfparser.pipeline.figures import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_bottom_to_content(self._image(), 50, 350, 300) == 300
+        assert _extend_edge(self._image(), (50, 100, 350, 300), "bottom") == 300
 
     def test_no_growth_when_ink_runs_without_gap(self) -> None:
         # Ink continues past the search window with no whitespace gap (caption /
         # body text below a correct box) → ambiguous → leave the box unchanged.
-        from pdfparser.pipeline.figures import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (400, 800), "white")
         img.paste(Image.new("RGB", (300, 300), "black"), (50, 100))
-        assert _extend_bottom_to_content(img, 50, 350, 250) == 250
+        assert _extend_edge(img, (50, 100, 350, 250), "bottom") == 250
 
     def test_narrow_content_below_box_is_not_read_as_gap(self) -> None:
         # A figure tail narrower than the box (here 3 px of a 300 px-wide box,
         # ~1% ink) must count as content, not be mistaken for the whitespace gap
         # — otherwise the clipped bottom is dropped.
-        from pdfparser.pipeline.figures import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (400, 800), "white")
         img.paste(Image.new("RGB", (300, 150), "black"), (50, 100))  # y[100,250)
         img.paste(Image.new("RGB", (3, 40), "black"), (198, 250))  # narrow tail
-        assert _extend_bottom_to_content(img, 50, 350, 270) == 290
+        assert _extend_edge(img, (50, 100, 350, 270), "bottom") == 290
 
     def test_growth_stops_before_caption(self) -> None:
-        from pdfparser.pipeline.figures import _extend_bottom_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_bottom_to_content(self._image(), 50, 350, 250) < 360
+        assert _extend_edge(self._image(), (50, 100, 350, 250), "bottom") < 360
 
     def test_safe_crop_excludes_caption(self) -> None:
         from pdfparser.pipeline.figures import _safe_crop
@@ -1366,44 +1366,44 @@ class TestFigureRightGrowth:
         return img
 
     def test_tight_box_grows_to_figure_right(self) -> None:
-        from pdfparser.pipeline.figures import _extend_right_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_right_to_content(self._image(), 50, 350, 250) == 300
+        assert _extend_edge(self._image(), (100, 50, 250, 350), "right") == 300
 
     def test_box_at_right_does_not_grow(self) -> None:
-        from pdfparser.pipeline.figures import _extend_right_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_right_to_content(self._image(), 50, 350, 300) == 300
+        assert _extend_edge(self._image(), (100, 50, 300, 350), "right") == 300
 
     def test_no_growth_when_ink_runs_without_gap(self) -> None:
         # Ink continues past the search window with no whitespace gap (a column
         # abutting a correct box) → ambiguous → leave the box unchanged.
-        from pdfparser.pipeline.figures import _extend_right_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (800, 400), "white")
         img.paste(Image.new("RGB", (300, 300), "black"), (100, 50))
-        assert _extend_right_to_content(img, 50, 350, 250) == 250
+        assert _extend_edge(img, (100, 50, 250, 350), "right") == 250
 
     def test_narrow_content_right_of_box_is_not_read_as_gap(self) -> None:
         # A figure tail narrower than the box (here 3 px of a 300 px-tall box,
         # ~1% ink) must count as content, not be mistaken for the whitespace gap.
-        from pdfparser.pipeline.figures import _extend_right_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (800, 400), "white")
         img.paste(Image.new("RGB", (150, 300), "black"), (100, 50))  # x[100,250)
         img.paste(Image.new("RGB", (40, 3), "black"), (250, 198))  # narrow tail
-        assert _extend_right_to_content(img, 50, 350, 270) == 290
+        assert _extend_edge(img, (100, 50, 270, 350), "right") == 290
 
     def test_gutter_stops_growth_before_next_column(self) -> None:
         # Left-column figure, a whitespace gutter, then right-column text: growth
         # recovers the clipped figure edge but stops at the gutter, never reaching
         # the next column.
-        from pdfparser.pipeline.figures import _extend_right_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (800, 400), "white")
         img.paste(Image.new("RGB", (200, 300), "black"), (50, 50))  # x[50,250)
         img.paste(Image.new("RGB", (200, 300), "black"), (310, 50))  # right column
-        assert _extend_right_to_content(img, 50, 350, 200) == 250
+        assert _extend_edge(img, (50, 50, 200, 350), "right") == 250
 
     def test_safe_crop_excludes_neighbour_column(self) -> None:
         from pdfparser.pipeline.figures import _safe_crop
@@ -1428,35 +1428,35 @@ class TestFigureLeftGrowth:
         return img
 
     def test_tight_box_grows_to_figure_left(self) -> None:
-        from pdfparser.pipeline.figures import _extend_left_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         # box left clipped 50 px into the figure → grows back out to x=100
-        assert _extend_left_to_content(self._image(), 50, 350, 150) == 100
+        assert _extend_edge(self._image(), (150, 50, 300, 350), "left") == 100
 
     def test_box_at_left_does_not_grow(self) -> None:
-        from pdfparser.pipeline.figures import _extend_left_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
-        assert _extend_left_to_content(self._image(), 50, 350, 100) == 100
+        assert _extend_edge(self._image(), (100, 50, 300, 350), "left") == 100
 
     def test_no_growth_when_ink_runs_without_gap(self) -> None:
         # Ink continues left past the search window with no gap (a column abutting a
         # correct box) → ambiguous → leave the box unchanged.
-        from pdfparser.pipeline.figures import _extend_left_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (800, 400), "white")
         img.paste(Image.new("RGB", (300, 300), "black"), (100, 50))  # x[100,400)
-        assert _extend_left_to_content(img, 50, 350, 350) == 350
+        assert _extend_edge(img, (350, 50, 400, 350), "left") == 350
 
     def test_gutter_stops_growth_before_previous_column(self) -> None:
         # Right-column figure, a whitespace gutter, then left-column text: growth
         # recovers the clipped figure edge but stops at the gutter, never reaching
         # the previous column.
-        from pdfparser.pipeline.figures import _extend_left_to_content
+        from pdfparser.pipeline.figures import _extend_edge
 
         img = Image.new("RGB", (800, 400), "white")
         img.paste(Image.new("RGB", (200, 300), "black"), (50, 50))  # left column
         img.paste(Image.new("RGB", (200, 300), "black"), (360, 50))  # x[360,560)
-        assert _extend_left_to_content(img, 50, 350, 410) == 360
+        assert _extend_edge(img, (410, 50, 560, 350), "left") == 360
 
     def test_safe_crop_recovers_clipped_left_edge(self) -> None:
         from pdfparser.pipeline.figures import _safe_crop
@@ -1464,6 +1464,57 @@ class TestFigureLeftGrowth:
         # box left clipped to x=150; the crop grows back out to the figure's x=100.
         crop = _safe_crop(self._image(), (150, 50, 300, 350))
         assert crop is not None and crop.size == (200, 300)
+
+
+class TestFigureTopGrowth:
+    """The crop grows up over contiguous ink to the figure's true top edge and
+    stops at the whitespace before the preceding paragraph or a caption; a box
+    already ending in whitespace grows nothing, so text above is never pulled in.
+    Vertical mirror of :class:`TestFigureLeftGrowth` — motivated by Figure 5 of the
+    32117944 fixture, whose box clipped the top panel labels (A/B) and frame line."""
+
+    @staticmethod
+    def _image() -> Image.Image:
+        # White page: a text strip at y[20,40) (the preceding paragraph), a 60 px
+        # gap, then the figure block y[100,300).
+        img = Image.new("RGB", (400, 800), "white")
+        img.paste(Image.new("RGB", (300, 20), "black"), (50, 20))
+        img.paste(Image.new("RGB", (300, 200), "black"), (50, 100))
+        return img
+
+    def test_tight_box_grows_to_figure_top(self) -> None:
+        from pdfparser.pipeline.figures import _extend_edge
+
+        # box top clipped 50 px into the figure → grows back out to y=100
+        assert _extend_edge(self._image(), (50, 150, 350, 300), "top") == 100
+
+    def test_box_at_top_does_not_grow(self) -> None:
+        from pdfparser.pipeline.figures import _extend_edge
+
+        assert _extend_edge(self._image(), (50, 100, 350, 300), "top") == 100
+
+    def test_no_growth_when_ink_runs_without_gap(self) -> None:
+        # Ink continues up past the search window with no gap (content abutting a
+        # correct box) → ambiguous → leave the box unchanged.
+        from pdfparser.pipeline.figures import _extend_edge
+
+        img = Image.new("RGB", (400, 800), "white")
+        img.paste(Image.new("RGB", (300, 300), "black"), (50, 100))  # y[100,400)
+        assert _extend_edge(img, (50, 350, 350, 400), "top") == 350
+
+    def test_gap_above_box_stops_growth_before_paragraph(self) -> None:
+        # A correct box already ending in whitespace: the paragraph above is
+        # separated by a leading gap, so growth is declined, not pulled in.
+        from pdfparser.pipeline.figures import _extend_edge
+
+        assert _extend_edge(self._image(), (50, 100, 350, 300), "top") == 100
+
+    def test_safe_crop_recovers_clipped_top_edge(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        # box top clipped to y=150; the crop grows back out to the figure's y=100.
+        crop = _safe_crop(self._image(), (50, 150, 350, 300))
+        assert crop is not None and crop.size == (300, 200)
 
 
 class TestSwallowedCaptionTrim:
@@ -3060,7 +3111,7 @@ class TestPlosFigureCrops:
     """Figure crops on 32639976.pdf (PLOS ONE).  The model's bbox clips the right
     edge of the wide Fig 5 alignment, and for several figures sits low enough that
     the bottom-growth would bake the caption into the crop.  The right edge is
-    recovered by ``_extend_right_to_content``; ``_trim_swallowed_caption`` drops a
+    recovered by ``_extend_edge``; ``_trim_swallowed_caption`` drops a
     recovered band that reads as the caption when the OCR also emitted that caption
     as its own text block."""
 

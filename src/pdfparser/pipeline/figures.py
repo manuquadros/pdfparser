@@ -7,9 +7,9 @@ Pure image-processing, no GPU.  All boxes are LightOnOCR's ``[0, 1000]``-normali
 Design bias: a clipped figure loses image the reader never recovers, while a crop
 that runs into surrounding margin is merely cosmetic, so when the model's box and
 the real figure disagree this module leans toward **including too much rather than
-too little** — it grows a clipped box out to the figure's true bottom and right
-edges (``_extend_bottom_to_content``, ``_extend_right_to_content``) and unions
-over-segmented stacked boxes back into one (``_cluster_figure_boxes``).  The one
+too little** — it grows a clipped box out to the figure's true edges on all four
+sides (``_extend_edge``) and unions over-segmented stacked boxes back into one
+(``_cluster_figure_boxes``).  The one
 check on that bias is ambiguity: growth stops (rather than guessing) when the
 figure's end isn't marked by a clear whitespace gap, so a correct box is never
 extended blindly into caption, body text, or a neighbouring column.  See the
@@ -277,58 +277,62 @@ def _grow_edge_offset(
     return _grow_edge(profile, dim, gap_frac)
 
 
-def _extend_bottom_to_content(
-    image: Image.Image, x0: int, x1: int, y1: int, gap_frac: float = _FIGURE_GAP_FRAC
+# Per-edge parameters for _extend_edge: the box-coordinate index the edge moves
+# (x0,y0,x1,y1), the array axis to reduce when building the ink profile (0 = over
+# rows → a per-column profile for the vertical left/right edges; 1 = over columns →
+# a per-row profile for the horizontal top/bottom edges), and whether the edge
+# grows toward 0 (top/left, which also reverse the profile so the scan runs outward
+# from the edge) or away from it (bottom/right).
+_EDGE_PARAMS: dict[str, tuple[int, int, bool]] = {
+    "left": (0, 0, True),
+    "right": (2, 0, False),
+    "top": (1, 1, True),
+    "bottom": (3, 1, False),
+}
+
+
+def _extend_edge(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    edge: str,
+    gap_frac: float = _FIGURE_GAP_FRAC,
 ) -> int:
-    """Grow ``y1`` downward to recover a figure bottom the box clipped.
+    """Grow one edge of ``box`` outward over figure ink and return its new
+    coordinate, or the edge unchanged when growth is declined.
 
-    Grows over figure ink directly below ``y1`` and stops at the whitespace gap
-    that follows it (the space before the caption).  Leaves the box unchanged when
-    the ink runs to the search cap with no gap (ambiguous), or when a leading gap
-    separates the box from what is below (the box already ends at the figure
-    bottom and a caption — not clipped figure — follows), so no text is pulled in.
-    ``gap_frac`` is tightened by the caller when a caption follows, so growth halts
-    at the figure↔caption gap rather than leaping past the caption.
+    ``edge`` selects which side moves (``left``/``right``/``top``/``bottom``).
+    Growth recovers a figure edge the model's box clipped — a clipped bottom, a
+    wide figure's right edge, a plot's left axis line, a top panel label or frame
+    line — and stops at the whitespace gap beyond it: the space before a caption
+    below, the page margin, or the inter-column gutter (so a column figure never
+    reaches its neighbour).  It is declined (edge unchanged) when the ink runs to
+    the search cap with no trailing gap (ambiguous) or a leading gap already
+    separates the box from what lies beyond (a caption / adjacent column / prose
+    above), so no text is pulled in.  Growth is capped at ``_FIGURE_MAX_GROW_FRAC``
+    of the page dimension; the caller tightens ``gap_frac`` for a bottom edge with a
+    caption below so growth halts at the figure↔caption gap rather than stepping
+    past it.
     """
-    h = image.size[1]
-    limit = min(h, y1 + round(_FIGURE_MAX_GROW_FRAC * h))
-    if y1 >= limit:
-        return y1
-    return y1 + _grow_edge_offset(
-        image, (x0, y1, x1, limit), h, axis=1, reverse=False, gap_frac=gap_frac
+    coord_i, axis, toward_zero = _EDGE_PARAMS[edge]
+    coord = box[coord_i]
+    dim = image.size[axis]
+    grow_max = round(_FIGURE_MAX_GROW_FRAC * dim)
+    if toward_zero:
+        limit = max(0, coord - grow_max)
+        if coord <= limit:
+            return coord
+        lo, hi = limit, coord
+    else:
+        limit = min(dim, coord + grow_max)
+        if coord >= limit:
+            return coord
+        lo, hi = coord, limit
+    x0, y0, x1, y1 = box
+    strip = (lo, y0, hi, y1) if axis == 0 else (x0, lo, x1, hi)
+    offset = _grow_edge_offset(
+        image, strip, dim, axis=axis, reverse=toward_zero, gap_frac=gap_frac
     )
-
-
-def _extend_right_to_content(image: Image.Image, y0: int, y1: int, x1: int) -> int:
-    """Grow ``x1`` rightward to recover a figure right edge the box clipped.
-
-    The horizontal mirror of :func:`_extend_bottom_to_content`: only grows when
-    the ink right of ``x1`` ends in a clear whitespace gap.  In a multi-column
-    layout that gap is the inter-column gutter, so growth of a left-column figure
-    stops at the gutter and never reaches the next column's text; if the ink runs
-    to the cap with no gap the box is left unchanged.
-    """
-    w = image.size[0]
-    limit = min(w, x1 + round(_FIGURE_MAX_GROW_FRAC * w))
-    if x1 >= limit:
-        return x1
-    return x1 + _grow_edge_offset(image, (x1, y0, limit, y1), w, axis=0, reverse=False)
-
-
-def _extend_left_to_content(image: Image.Image, y0: int, y1: int, x0: int) -> int:
-    """Grow ``x0`` leftward to recover a figure left edge the box clipped.
-
-    The mirror of :func:`_extend_right_to_content`: only grows when the ink left of
-    ``x0`` ends in a clear whitespace gap.  The column profile is reversed so growth
-    proceeds outward from ``x0``, so a right-column figure stops at the inter-column
-    gutter and never reaches the previous column; if the ink runs to the cap with no
-    gap the box is left unchanged.
-    """
-    w = image.size[0]
-    limit = max(0, x0 - round(_FIGURE_MAX_GROW_FRAC * w))
-    if x0 <= limit:
-        return x0
-    return x0 - _grow_edge_offset(image, (limit, y0, x0, y1), w, axis=0, reverse=True)
+    return coord - offset if toward_zero else coord + offset
 
 
 def _mean_norm_run_length(mask: np.ndarray) -> float:
@@ -513,7 +517,8 @@ def _safe_crop(
     ocr_region: Callable[[Image.Image], str] | None = None,
 ) -> Image.Image | None:
     """Crop a pixel-space ``bbox`` from ``image``, clamped to bounds and grown
-    out to the figure's true right and bottom edges; ``None`` if degenerate.
+    out to the figure's true top, left, right and bottom edges; ``None`` if
+    degenerate.
 
     ``caption_text`` (the caption block the OCR emitted for this figure) enables
     trimming the caption back out of the crop: cheaply when it was a band growth
@@ -526,23 +531,25 @@ def _safe_crop(
     y1 = max(0, min(bbox[3], h))
     if x1 - x0 < _MIN_FIGURE_HEIGHT or y1 - y0 < _MIN_FIGURE_HEIGHT:
         return None
-    x0 = _extend_left_to_content(image, y0, y1, x0)
-    x1 = _extend_right_to_content(image, y0, y1, x1)
+    x0 = _extend_edge(image, (x0, y0, x1, y1), "left")
+    x1 = _extend_edge(image, (x0, y0, x1, y1), "right")
+    box_y0 = y0  # the model's box top, kept for the caption-trim keep-ratio guard
+    y0 = _extend_edge(image, (x0, y0, x1, y1), "top")
     # With a caption below, halt bottom growth at the figure↔caption gap (the
     # smaller block gap) so it recovers the clipped tail without leaping into the
     # caption; without one, the larger gap steps over inter-row gaps as before.
     has_caption = caption_text is not None
     bottom_gap = _FIGURE_BLOCK_GAP_FRAC if has_caption else _FIGURE_GAP_FRAC
-    grown_y1 = _extend_bottom_to_content(image, x0, x1, y1, bottom_gap)
+    grown_y1 = _extend_edge(image, (x0, y0, x1, y1), "bottom", bottom_gap)
     if caption_text is not None:
         untrimmed_y1 = grown_y1
         grown_y1 = _trim_caption_band(
             image, x0, x1, y0, y1, grown_y1, caption_text, ocr_region
         )
-        # Measured against the model's box (y0..y1), not the grown bottom, so a
-        # legitimately swallowed caption pulled in by _extend_bottom_to_content can
-        # still be trimmed off a short figure without tripping the guard.
-        if grown_y1 - y0 < _FIGURE_CAPTION_MIN_KEEP_FRAC * (y1 - y0):
+        # Measured against the model's box (box_y0..y1), not the grown top/bottom,
+        # so a legitimately swallowed caption pulled in by _extend_bottom_to_content
+        # can still be trimmed off a short figure without tripping the guard.
+        if grown_y1 - box_y0 < _FIGURE_CAPTION_MIN_KEEP_FRAC * (y1 - box_y0):
             grown_y1 = untrimmed_y1  # trim ran away on a text-bodied figure
     if grown_y1 - y0 < _MIN_FIGURE_HEIGHT:  # a trim left too little to be a figure
         return None

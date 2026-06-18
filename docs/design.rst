@@ -81,25 +81,27 @@ whitespace is cosmetic.  So when the model's crop box and the actual figure
 disagree, the code leans toward **including too much rather than too little**, and
 that bias is intentional.  It shows up in three places:
 
-* **Bottom, left and right recovery**
-  (:func:`~pdfparser.pipeline.figures._extend_bottom_to_content`,
-  :func:`~pdfparser.pipeline.figures._extend_right_to_content`,
-  :func:`~pdfparser.pipeline.figures._extend_left_to_content`).
+* **Four-edge recovery**
+  (:func:`~pdfparser.pipeline.figures._extend_edge`).
   The model's box routinely clips a figure's edges — most often the bottom, but
-  either side too (a wide figure's right edge, a plot's left axis line).  Rather
-  than trust the box, the crop grows over figure content and stops at the
-  whitespace gap beyond it (the space before the caption below, or the page margin
-  / inter-column gutter to either side).  All three edges share one body
-  (:func:`~pdfparser.pipeline.figures._grow_edge_offset`); the left edge reverses
-  the ink profile so the scan always runs outward from the edge.  The **top** edge
-  is deliberately *not* grown — the model does not clip tops in practice, and a
-  top-grown crop would reach up into the title/prose above the figure.  The "is
-  this line blank?" threshold (``_FIGURE_BLANK_LINE_FRAC``) is kept near-empty on
-  purpose: a sparse figure line — a thin axis, content narrower than the box —
-  must count as *content* so growth doesn't stop early and behead the figure.
-  When a caption follows the figure, bottom growth tightens its stop gap to the
-  smaller ``_FIGURE_BLOCK_GAP_FRAC`` so it halts at the figure↔caption gap rather
-  than stepping over it into the caption.
+  any side too (a wide figure's right edge, a plot's left axis line, a top panel
+  label or frame line the box cuts straight through).  Rather than trust the box,
+  the crop grows over figure content and stops at the whitespace gap beyond it (the
+  space before the caption below, or the page margin / inter-column gutter / prose
+  above).  All four edges share one body, parameterized by ``_EDGE_PARAMS``: the
+  axis to reduce when building the ink profile, and whether the edge grows toward
+  zero (top/left, which also reverse the profile so the scan runs outward from the
+  edge) or away from it (bottom/right).  The top edge is grown like the others but
+  leans on the **leading-gap guard** to stay honest: it grows only when the box
+  cuts straight through figure ink at the top and declines when a whitespace gap
+  already separates the box from what is above (a caption or the preceding
+  paragraph), so it recovers a clipped panel label without reaching up into the
+  prose.  The "is this line blank?" threshold (``_FIGURE_BLANK_LINE_FRAC``) is kept
+  near-empty on purpose: a sparse figure line — a thin axis, content narrower than
+  the box — must count as *content* so growth doesn't stop early and behead the
+  figure.  When a caption follows the figure, bottom growth tightens its stop gap
+  to the smaller ``_FIGURE_BLOCK_GAP_FRAC`` so it halts at the figure↔caption gap
+  rather than stepping over it into the caption.
 
 * **Over-segmentation merge**
   (:func:`~pdfparser.pipeline.figures._cluster_figure_boxes`,
