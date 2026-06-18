@@ -520,12 +520,17 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
     """Drop short, recurring header/footer lines (page-number-insensitive) and
     standalone page-number blocks.
 
-    A heading form only counts as furniture when the same line also appears as a
-    plain paragraph somewhere: a running header/footer is body text the OCR
-    promotes to a heading on sparse pages, so it shows up in both forms.  A line
-    that recurs *only* as a heading is a genuine section heading that the article
-    legitimately repeats (e.g. "Purification of X" under both Methods and
-    Results), not furniture, and must be kept.
+    A heading form normally counts as furniture only when the same line also
+    appears as a plain paragraph somewhere: a running header/footer is body text
+    the OCR promotes to a heading on sparse pages, so it shows up in both forms.  A
+    line that recurs *only* as a heading is usually a genuine section heading the
+    article legitimately repeats (e.g. "Purification of X" under both Methods and
+    Results), not furniture, and must be kept.  The exception is a heading that
+    carried *digits* ("Bioscience Reports (2019) 39 BSR20190715"): a journal
+    citation / folio running head, whose paragraph form may differ (it also carries
+    a DOI line, so its key never matches the bare-heading key) — a real section
+    heading does not carry volume/article-id numbers, and the 12-char digit-free key
+    floor keeps short numbered labels ("Fig 1") from qualifying.
 
     A sentence-terminated line is treated as real prose unless it recurs often
     enough (``_SENTENCE_LIKE_FURNITURE_MIN_REPEAT``) to be a running head whose
@@ -533,6 +538,7 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
     counts: Counter[str] = Counter()
     as_paragraph: set[str] = set()
     not_sentence_like: set[str] = set()
+    digit_bearing: set[str] = set()
     for part in parts:
         key = _is_furniture_candidate(part)
         if key is None:
@@ -542,11 +548,14 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
             as_paragraph.add(key)
         if not _ends_like_sentence(part):
             not_sentence_like.add(key)
+        inner = _furniture_inner(part)
+        if inner is not None and _DIGITS_RE.search(_visible_text(inner)):
+            digit_bearing.add(key)
     repeated = {
         key
         for key, n in counts.items()
         if n > 1
-        and key in as_paragraph
+        and (key in as_paragraph or key in digit_bearing)
         and (key in not_sentence_like or n >= _SENTENCE_LIKE_FURNITURE_MIN_REPEAT)
     }
     return [
