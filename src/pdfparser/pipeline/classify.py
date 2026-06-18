@@ -35,7 +35,7 @@ _SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
 # whitespace or non-uppercase content.  It shares its leading class with affiliation
 # lines ("¹ Department of …"), so it is only consulted in the body — see
 # ``seen_body_heading`` in ``_classify_parts`` — never on the first-page affiliations.
-_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰-⁹]{1,3}(?![¹²³⁰-⁹])(?:\s+|(?![A-Z]))\S")
+_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰⁴-⁹]{1,3}(?![¹²³⁰⁴-⁹])(?:\s+|(?![A-Z]))\S")
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
         "abstract",
@@ -54,6 +54,17 @@ _DOCUMENT_TYPE_LABELS = frozenset(
 # <h\d[^>]*> tolerates class/id attributes the model may inject.
 _REF_SECTION_RE = re.compile(
     r"^(?:<h\d[^>]*>\s*References\s*</h\d>|<p>\[1\])", re.IGNORECASE
+)
+# The references *heading* alone (no "<p>[1]" branch), tolerant of a leading
+# section number ("7. References") and the common synonyms.  Used where a body
+# block that merely opens "[1] …" (a numbered list, an inline citation) must not be
+# mistaken for the start of the bibliography — e.g. the paragraph-merge's
+# references guard, which only ever applies to author–year (un-numbered) entries;
+# numbered "[n]" entries are already kept apart as enumeration items.
+_REF_HEADING_RE = re.compile(
+    r"^<h\d[^>]*>\s*(?:\d+\.?\s+)?"
+    r"(?:references|bibliography|literature\s+cited|works\s+cited)\b",
+    re.IGNORECASE,
 )
 
 # The article starts at the first page carrying an "Abstract"/"Introduction"
@@ -422,12 +433,17 @@ _AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰-ⁿ*†‡§]")
 # A comma / "and" / ";"-separated author segment: a short, capitalized,
 # digit-free name.
 _NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")
-# A single word of a personal name: a capitalised word or an initial ("D.",
-# "D.D.").  A lone-author byline ("Daniel D. Clark") has no comma to split on and
-# no affiliation marker, so it is recognised as a short run of these.  An *initial*
-# is required as the positive author signal: a bare two-word name ("Jane Doe") is
-# left ambiguous (it could be a subtitle) and stays in the body, but a title
-# fragment / subtitle never carries a mid-name initial.
+# A lone-author byline ("Daniel D. Clark") has no comma to split on and no
+# affiliation marker, so it is recognised as a "given-name … surname" frame: an
+# alphabetic capitalised word at each end (``_NAME_ALPHA_WORD_RE``) with a *mid-name*
+# initial between them (``_PERSONAL_NAME_INITIAL_RE``).  The mid-name initial is the
+# positive author signal: a bare two-word name ("Jane Doe") is left ambiguous (it
+# could be a subtitle) and stays in the body, and anchoring alphabetic words at both
+# ends rejects an initialism-led phrase ("U.S. Army Corps").  Residual ambiguity
+# remains for a Title-Case phrase that happens to share the exact frame ("Vitamin D.
+# Levels") — only a lexicon could tell those apart — but such a block standing alone
+# right after the title is rare.
+_NAME_ALPHA_WORD_RE = re.compile(r"^[A-Z][a-z’'-]+$")
 _PERSONAL_NAME_INITIAL_RE = re.compile(r"^(?:[A-Z]\.){1,3}$")
 _PERSONAL_NAME_WORD_RE = re.compile(r"^(?:[A-Z]\.?|[A-Z][a-z’'-]+|(?:[A-Z]\.){2,})$")
 _PERSONAL_NAME_MAX_WORDS = 5
@@ -587,13 +603,15 @@ def _looks_like_name_list(plain: str) -> bool:
 
 
 def _looks_like_personal_name(plain: str) -> bool:
-    """A lone personal name ("Daniel D. Clark") — a short run of capitalised
-    words including at least one initial, with no lowercase connective."""
+    """A lone personal name ("Daniel D. Clark") — capitalised words framed by an
+    alphabetic given name and surname with a mid-name initial between them."""
     words = plain.split()
     return (
         2 <= len(words) <= _PERSONAL_NAME_MAX_WORDS
         and all(_PERSONAL_NAME_WORD_RE.match(w) for w in words)
-        and any(_PERSONAL_NAME_INITIAL_RE.match(w) for w in words)
+        and bool(_NAME_ALPHA_WORD_RE.match(words[0]))
+        and bool(_NAME_ALPHA_WORD_RE.match(words[-1]))
+        and any(_PERSONAL_NAME_INITIAL_RE.match(w) for w in words[1:-1])
     )
 
 
@@ -706,7 +724,14 @@ def _classify_parts(parts: list[str]) -> _Meta:
             in_abstract = False
         if inner_p is not None and (
             _SUP_MARKER_RE.match(inner_p)
-            or (seen_body_heading and _UNICODE_SUP_MARKER_RE.match(inner_p))
+            or (
+                seen_body_heading
+                and _UNICODE_SUP_MARKER_RE.match(inner_p)
+                # A "¹ Department of …, Country" affiliation shares the leading-marker
+                # shape; it is front matter for the panel, never an article footnote,
+                # even when OCR ordering drops it after the first body heading.
+                and not _is_affiliation_line(_visible_text(inner_p).strip())
+            )
         ):
             footnotes.append(f'<p class="footnote">{inner_p}</p>')
             continue
@@ -991,35 +1016,37 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
     return metadata, rest
 
 
-def _is_publication_metadata_label(inner: str) -> bool:
-    """True when a ``<p>`` opens with a recognised journal-metadata bold label
-    ("**Citation:**", "**Competing interests:**" …) — see
-    ``_PUBLICATION_METADATA_LABELS``.  (When the OCR emits the sidebar as label
-    *headings* instead, ``_extract_named_metadata_sections`` relocates it.)"""
+def _bold_label_in(inner: str, labels: frozenset[str]) -> bool:
+    """True when ``inner`` opens with a ``**Label:**`` bold label whose name is in
+    ``labels`` — the shared shape of the metadata-label checks below."""
     m = _BOLD_LABEL_CAPTURE_RE.match(inner)
-    return m is not None and m.group(1).strip().lower() in _PUBLICATION_METADATA_LABELS
+    return m is not None and m.group(1).strip().lower() in labels
+
+
+def _is_publication_metadata_label(inner: str) -> bool:
+    """A journal-metadata bold label ("**Citation:**", "**Competing interests:**" …
+    — see ``_PUBLICATION_METADATA_LABELS``).  (When the OCR emits the sidebar as label
+    *headings* instead, ``_extract_named_metadata_sections`` relocates it.)"""
+    return _bold_label_in(inner, _PUBLICATION_METADATA_LABELS)
 
 
 def _is_glossary_metadata_label(inner: str) -> bool:
-    """True when a ``<p>`` opens with an inline glossary bold label
-    ("**Abbreviations:**", "**Nomenclature:**") — see ``_GLOSSARY_METADATA_LABELS``.
-    The label is decisive evidence regardless of the entry list's length, so it is
-    matched before the stray-metadata length cap."""
-    m = _BOLD_LABEL_CAPTURE_RE.match(inner)
-    return m is not None and m.group(1).strip().lower() in _GLOSSARY_METADATA_LABELS
+    """An inline glossary bold label ("**Abbreviations:**", "**Nomenclature:**" —
+    see ``_GLOSSARY_METADATA_LABELS``).  Decisive regardless of the entry list's
+    length, so it is matched before the stray-metadata length cap."""
+    return _bold_label_in(inner, _GLOSSARY_METADATA_LABELS)
 
 
 def _is_inline_frontmatter_label(inner: str) -> bool:
-    """True when a ``<p>`` opens with an inline bold label naming a front-matter
-    section ("**Abbreviations:**", "**Keywords:**", "**Nomenclature:**") — the same
-    labels recognised as headings (``_FRONTMATTER_HEADING_LABELS``).
+    """An inline bold label naming any front-matter section ("**Abbreviations:**",
+    "**Keywords:**", "**Nomenclature:**") — the same labels recognised as headings
+    (``_FRONTMATTER_HEADING_LABELS``).
 
-    Broader than ``_is_glossary_metadata_label`` (it also matches keywords); used
-    by ``_extract_front_matter`` *after* classify to relocate a labelled front-matter
+    Broader than ``_is_glossary_metadata_label`` (it also matches keywords); used by
+    ``_extract_front_matter`` *after* classify to relocate a labelled front-matter
     line that survived past the leading run, so it never displaces the keyword line's
     pre-classify role as the abstract terminator."""
-    m = _BOLD_LABEL_CAPTURE_RE.match(inner)
-    return m is not None and m.group(1).strip().lower() in _FRONTMATTER_HEADING_LABELS
+    return _bold_label_in(inner, _FRONTMATTER_HEADING_LABELS)
 
 
 def _is_stray_metadata(part: str) -> bool:

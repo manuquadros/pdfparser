@@ -10,7 +10,7 @@ import re
 
 from pdfparser.pipeline.classify import (
     _LEADING_SUP_RE,
-    _REF_SECTION_RE,
+    _REF_HEADING_RE,
     _UNICODE_SUP_MARKER_RE,
     _is_stray_metadata,
 )
@@ -79,6 +79,13 @@ _BARE_TABLE_LABEL_RE = re.compile(
     r"\w+"
     r"\s*[.:]?\s*\*{0,2}\s*$"
 )
+# A table label whose identifier is *number-like* — a digit, a roman numeral, or a
+# supplement letter+digit ("TABLE 2", "Table IV", "Table S1") — rather than a word.
+# Used to gate promoting a *heading* to a table caption: "Table of Contents" matches
+# the looser _TABLE_CAPTION_RE but is a real section heading, not a caption.
+_TABLE_LABEL_HEADING_RE = re.compile(
+    r"^\*{0,2}\s*(?i:supp(?:l(?:ementary)?)?\.?\s+)?(?i:table)\b\s*[0-9A-Z(]"
+)
 
 
 def _bare_table_label_inner(part: str) -> str | None:
@@ -146,8 +153,12 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     "and possible subunit cooperativity"), so a capital-led continuation is taken
     as the next entry and left as its own block.
     """
+    # Keyed on the references *heading*, not "<p>[1]": a body block opening "[1] …"
+    # (a numbered list, an inline citation) must not switch the guard on early and
+    # suppress legitimate body-prose merges.  Recomputed each pass because merges
+    # shift indices.
     ref_start = next(
-        (k for k, p in enumerate(parts) if _REF_SECTION_RE.match(p)), len(parts)
+        (k for k, p in enumerate(parts) if _REF_HEADING_RE.match(p)), len(parts)
     )
     out: list[str] = []
     i = 0
@@ -247,13 +258,22 @@ def _table_caption_inner(part: str) -> str | None:
 
     The heading form must be recognised too: otherwise a caption the model
     levelled as a section heading is left stranded in the heading hierarchy while
-    its table renders captionless beneath it."""
+    its table renders captionless beneath it.  A heading is promoted only when its
+    identifier is number-like (``_TABLE_LABEL_HEADING_RE``), so a "Table of Contents"
+    section heading is not mistaken for a caption."""
     inner = _plain_p_text(part)
+    from_heading = False
     if inner is None and (heading := _heading_inner(part)) is not None:
         inner = heading[1]
-    if inner is not None and _TABLE_CAPTION_RE.match(_visible_text(inner).lstrip()):
-        return inner
-    return None
+        from_heading = True
+    if inner is None:
+        return None
+    text = _visible_text(inner).lstrip()
+    if not _TABLE_CAPTION_RE.match(text):
+        return None
+    if from_heading and not _TABLE_LABEL_HEADING_RE.match(text):
+        return None
+    return inner
 
 
 def _is_table_caption(part: str) -> bool:

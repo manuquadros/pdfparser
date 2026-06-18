@@ -410,6 +410,10 @@ class TestByline:
         # A title fragment / subtitle of capitalised words is still refused.
         assert _is_byline("A Case Study in Kinetics") is False
         assert _is_byline("Enzyme Kinetics") is False
+        # An initialism-led phrase and an edge-only initial are not the given-name +
+        # surname frame, so they stay in the body.
+        assert _is_byline("U.S. Army Corps") is False
+        assert _is_byline("D. Clark") is False
 
     def test_single_author_byline_promoted_end_to_end(self) -> None:
         md = (
@@ -566,6 +570,24 @@ class TestLightonAssembly:
             html = _run_lighton([md])
             assert opener in _body(html), opener
             assert f'<p class="footnote">{opener}' not in html
+
+    def test_superscript_affiliation_after_body_heading_not_a_footnote(self) -> None:
+        # A "¹ Department of …, Country" affiliation shares the leading-marker shape
+        # but is front matter, not an article footnote — even when OCR ordering drops
+        # it after the first body heading (so seen_body_heading is already set).
+        from pdfparser.pipeline.classify import _classify_parts
+
+        meta = _classify_parts(
+            [
+                "<h1>T</h1>",
+                "<p>A. Author</p>",
+                "<h2>Introduction</h2>",
+                "<p>¹ Department of Chemistry, Example University, Daejeon, "
+                "South Korea</p>",
+            ]
+        )
+        assert any("Department of Chemistry" in b for b in meta.body)
+        assert not any("Department of Chemistry" in f for f in meta.footnotes)
 
     def test_frontmatter_moved_to_metadata_panel_after_abstract(self) -> None:
         # Affiliations, keywords and abbreviations are OCR'd between the abstract
@@ -1953,6 +1975,20 @@ class TestReferenceListMerge:
         assert len(out) == 3
         assert not any("00426.x McKenzie" in p for p in out)
 
+    def test_body_bracket_one_does_not_trigger_references_guard(self) -> None:
+        # The references guard keys on a References *heading*, not a "[1]"-led block:
+        # a numbered list item in the body must not switch it on and suppress a
+        # legitimate capital-led body-prose merge that follows.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs_stable
+
+        parts = [
+            "<p>[1] to define the pathway in the organism studied here</p>",
+            "<p>We characterized the recombinant enzyme isolate designated</p>",
+            "<p>Sphingomonas cells grown on ribitol were the source.</p>",
+        ]
+        out = _merge_split_paragraphs_stable(parts)
+        assert any("designated Sphingomonas cells grown" in p for p in out)
+
 
 class TestCaptionMergeBarrier:
     """A figure/table caption is never absorbed as a paragraph continuation,
@@ -2108,6 +2144,19 @@ class TestTableCaptionColocation:
             "<table><caption>TABLE 2 Comparison between various tropinone "
             "reductases</caption><tbody><tr><td>1</td></tr></tbody></table>"
         ]
+
+    def test_word_identifier_heading_not_promoted_to_caption(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        # A real section heading whose identifier is a word ("Table of Contents")
+        # must not be folded into an adjacent table; only number-like identifiers
+        # ("TABLE 2", "Table IV") are promoted from a heading.
+        parts = [
+            "<h2>Table of Contents</h2>",
+            "<table><tbody><tr><td>1</td></tr></tbody></table>",
+        ]
+        out = _colocate_table_captions(parts)
+        assert out == parts  # unchanged: heading stays, table stays captionless
 
     def test_caption_separated_by_figure_folded(self) -> None:
         from pdfparser.pipeline.merge import _colocate_table_captions
