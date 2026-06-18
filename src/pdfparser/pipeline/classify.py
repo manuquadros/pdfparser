@@ -25,6 +25,15 @@ from pdfparser.pipeline.text import (
 # Bounding the marker length stops a body paragraph that merely opens with a
 # reconstructed multi-character superscript from being mistaken for a footnote.
 _SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
+# A numbered page footnote emitted as raw unicode superscripts instead of a <sup>
+# tag ("¹http://…/home.htm" — a footnote the model didn't wrap).  Restricted to
+# superscript *digits*: an asterisk/dagger marker (``*†‡§``) is the shape a table
+# note takes ("*Each value represents the mean …"), which belongs under its table,
+# not in the article footnote run.  Trailing content is required so a lone marker
+# isn't matched.  It shares its leading class with affiliation lines ("¹ Department
+# of …"), so it is only consulted in the body — see ``seen_body_heading`` in
+# ``_classify_parts`` — never on the first-page affiliation run.
+_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰-⁹]{1,3}\s*\S")
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
         "abstract",
@@ -618,11 +627,17 @@ def _classify_parts(parts: list[str]) -> _Meta:
     # window closes at the next block so a body sentence is never mistaken for it.
     expect_byline = False
     in_abstract = False
+    # The article title is the only legitimate <h1>; a body section heading the
+    # model mis-levelled as <h1> ("# Molecular Mass Determination of Lxmdh"
+    # mid-Methods) is demoted to <h2> once the title is claimed, so the document
+    # carries a single top-level heading.  ``seen_body_heading`` also gates the
+    # unicode-superscript footnote sweep below to the body proper.
+    seen_body_heading = False
 
     for idx, part in enumerate(parts):
         heading = _heading_inner(part)
         if heading is not None:
-            _, inner = heading
+            level, inner = heading
             if not title_html:
                 # A masthead / running head ("PLOS ONE", which may sit above a
                 # "RESEARCH ARTICLE" doc-type label) is dropped only when the real
@@ -641,7 +656,12 @@ def _classify_parts(parts: list[str]) -> _Meta:
             if _visible_text_folded(inner) in _DOCUMENT_TYPE_LABELS:
                 continue
             in_abstract = False
-            body.append(part)
+            if not (
+                _is_named_metadata_heading(part)
+                or _is_publication_metadata_heading(part)
+            ):
+                seen_body_heading = True
+            body.append(f"<h2>{inner}</h2>" if level == 1 and title_html else part)
             continue
 
         inner_p = _plain_p_text(part)
@@ -655,7 +675,10 @@ def _classify_parts(parts: list[str]) -> _Meta:
                 abstract.append(part)
                 continue
             in_abstract = False
-        if inner_p is not None and _SUP_MARKER_RE.match(inner_p):
+        if inner_p is not None and (
+            _SUP_MARKER_RE.match(inner_p)
+            or (seen_body_heading and _UNICODE_SUP_MARKER_RE.match(inner_p))
+        ):
             footnotes.append(f'<p class="footnote">{inner_p}</p>')
             continue
         if inner_p is not None and _is_degenerate_repetition(inner_p):

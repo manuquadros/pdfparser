@@ -193,6 +193,10 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and not _ENUM_RE.match(cont)
                         and not _BOLD_LABEL_RE.match(cont)
                         and not _opens_with_caption_label(cont)
+                        # A continuation opening with a footnote marker ("¹http://…")
+                        # is a page footnote the classifier left in place, not prose;
+                        # gluing it in splices the footnote mid-sentence.
+                        and not _LEADING_SUP_RE.match(cont_head)
                         and not (
                             _FUNCTION_WORD_END_RE.search(visible)
                             and cont[:1].isupper()

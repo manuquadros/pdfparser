@@ -488,6 +488,50 @@ class TestLightonAssembly:
         assert 0 < fn < ref
         assert 'class="footnote"' in html
 
+    def test_body_h1_demoted_to_h2(self) -> None:
+        # Only the title is a legitimate <h1>; a body section heading the model
+        # mis-levelled as <h1> is demoted so the document has one top-level head.
+        md = (
+            "# The Real Title\n\nA. U.\n\n## Abstract\n\nAbstract.\n\n"
+            "## Introduction\n\nProse.\n\n"
+            "# Molecular Mass Determination\n\nMore prose."
+        )
+        html = _run_lighton([md])
+        assert "<h1>The Real Title</h1>" in html
+        assert "<h2>Molecular Mass Determination</h2>" in _body(html)
+        assert "<h1>Molecular Mass Determination</h1>" not in html
+
+    def test_unicode_superscript_footnote_routed_and_not_glued(self) -> None:
+        # A page footnote the model emits as a raw unicode superscript ("¹http://…")
+        # mid-body is routed to the footnote run, not glued into the split sentence
+        # it interrupts; the two prose halves merge cleanly.
+        md = (
+            "# T\n\n## Abstract\n\nAbstract.\n\n## Introduction\n\n"
+            "The native enzyme was determined by gel filtration\n\n"
+            "¹http://example.org/tool/home.htm\n\n"
+            "chromatography using a Sephacryl column.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        assert "gel filtration chromatography using a Sephacryl column." in _body(html)
+        fn = html.find("example.org/tool")
+        ref = html.find("[1] A reference")
+        assert 0 < fn < ref
+        assert '<p class="footnote">¹http://example.org/tool/home.htm</p>' in html
+
+    def test_unicode_superscript_table_note_stays_in_body(self) -> None:
+        # An asterisk-marked table note is not a numbered page footnote; it must
+        # stay with its table, not get pulled into the article footnote run.
+        md = (
+            "# T\n\n## Abstract\n\nAbstract.\n\n## Results\n\n"
+            "<table><tbody><tr><td>Mg</td><td>3.0</td></tr></tbody></table>\n\n"
+            "*Each value represents the mean of three measurements.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        assert "Each value represents the mean" in _body(html)
+        assert 'class="footnote"' not in html
+
     def test_frontmatter_moved_to_metadata_panel_after_abstract(self) -> None:
         # Affiliations, keywords and abbreviations are OCR'd between the abstract
         # and the body's first section; they are pulled into the collapsible
@@ -3902,3 +3946,25 @@ class TestFrontiersReferenceList:
         assert (
             "quaternary structure and possible subunit cooperativity" in frontiers_html
         )
+
+
+@pytest.mark.integration
+class TestFrontiersHeadingAndFootnote:
+    """32117944.pdf mis-levels a Methods subsection as <h1> ("Molecular Mass
+    Determination of Lxmdh") and prints a column-bottom URL footnote as a raw
+    unicode superscript ("¹http://…/home.htm") that interrupts a paragraph split
+    across the column break."""
+
+    def test_body_section_h1_demoted(self, frontiers_html: str) -> None:
+        # The article title is the only <h1>; the mis-levelled body heading is h2.
+        assert frontiers_html.count("<h1>") == 1
+        assert "<h2>Molecular Mass Determination of Lxmdh</h2>" in frontiers_html
+
+    def test_unicode_footnote_routed_not_glued(self, frontiers_html: str) -> None:
+        html = frontiers_html
+        # The footnote is pulled out of the prose; the split sentence rejoins.
+        assert "gel filtration chromatography" in html
+        assert "gel filtration ¹http" not in html
+        # ...and lands in the footnote run before the references.
+        fn = html.find('<p class="footnote">¹http://schwarz')
+        assert 0 < fn < html.find("<h2>REFERENCES</h2>")
