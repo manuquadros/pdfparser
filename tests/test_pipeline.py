@@ -3052,13 +3052,15 @@ _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "30592559.pdf"
 _AD_PREFIX_PDF = Path(__file__).parent / "fixtures" / "31051047.pdf"
 _PLOS_PDF = Path(__file__).parent / "fixtures" / "32639976.pdf"
 _FRONTIERS_PDF = Path(__file__).parent / "fixtures" / "32117944.pdf"
-_OUTPUT_DIR = Path(__file__).parent.parent / "spike_results"
+_BSR_PDF = Path(__file__).parent / "fixtures" / "31123167.pdf"
+_JAFC_PDF = Path(__file__).parent / "fixtures" / "31298526.pdf"
+_OUTPUT_DIR = Path(__file__).parent / "fixtures"
 
 
 def _run_pipeline_to_file(pdf: Path, ocr: object) -> str:
     """Run the full pipeline on ``pdf`` and save the HTML for visual inspection.
 
-    The output lands at ``spike_results/<pdf-stem>.html`` so every integration
+    The output lands at ``tests/fixtures/<pdf-stem>.html`` so every integration
     run leaves an on-disk copy of each fixture's rendering to open in a browser.
     """
     from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
@@ -3087,7 +3089,7 @@ def ocr_model() -> object:
 def article_html(ocr_model: object) -> str:
     """Run the full pipeline on the no-ad fixture; skip if the model is absent.
 
-    Writes the result to spike_results/30592559.html so the file stays current
+    Writes the result to tests/fixtures/30592559.html so the file stays current
     after each integration run.
     """
     if not _FIXTURE_PDF.exists():
@@ -3107,7 +3109,7 @@ class TestPipeline:
     """Integration tests: run the full LightOnOCR pipeline on the fixture PDF.
 
     Skipped when the model is not available (no GPU, weights not downloaded).
-    Each run also refreshes spike_results/30592559.html.
+    Each run also refreshes tests/fixtures/30592559.html.
     """
 
     def test_abstract_no_column_break(self, article_html: str) -> None:
@@ -3214,7 +3216,7 @@ class TestPipeline:
 def ad_prefix_html(ocr_model: object) -> str:
     """Full pipeline output for the ad-prefixed 31051047.pdf fixture.
 
-    Writes the result to spike_results/31051047.html for visual inspection.
+    Writes the result to tests/fixtures/31051047.html for visual inspection.
     """
     if not _AD_PREFIX_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
@@ -3297,7 +3299,7 @@ def plos_run(ocr_model: object) -> object:
     ``ocr_regions`` call, and ``_region_fully_captured`` to count how many regions
     the coverage gate actually skipped.  Returns the HTML plus that spy data;
     ``plos_html`` derives from it, so the whole fixture costs a single pipeline run.
-    Writes spike_results/32639976.html too.
+    Writes tests/fixtures/32639976.html too.
     """
     if not _PLOS_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_PLOS_PDF}")
@@ -4040,7 +4042,7 @@ class TestPlosTableFormatting:
 @pytest.fixture(scope="session")
 def frontiers_html(ocr_model: object) -> str:
     """Full pipeline HTML for the Frontiers 32117944.pdf fixture; skip if the model
-    is absent.  Writes spike_results/32117944.html for visual inspection."""
+    is absent.  Writes tests/fixtures/32117944.html for visual inspection."""
     if not _FRONTIERS_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_FRONTIERS_PDF}")
     return _run_pipeline_to_file(_FRONTIERS_PDF, ocr_model)
@@ -4182,3 +4184,75 @@ class TestFrontiersHeadingAndFootnote:
         # ...and lands in the footnote run before the references.
         fn = html.find('<p class="footnote">¹http://schwarz')
         assert 0 < fn < html.find("<h2>REFERENCES</h2>")
+
+
+@pytest.fixture(scope="session")
+def bsr_html(ocr_model: object) -> str:
+    """Full pipeline HTML for the Bioscience Reports 31123167.pdf fixture; skip if
+    the model is absent.  Writes tests/fixtures/31123167.html for visual inspection."""
+    if not _BSR_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_BSR_PDF}")
+    return _run_pipeline_to_file(_BSR_PDF, ocr_model)
+
+
+@pytest.mark.integration
+class TestBioscienceReportsRunningHeader:
+    """31123167.pdf (Bioscience Reports) repeats a per-page running-header journal
+    citation ("Bioscience Reports (2019) 39 BSR20190715"), which LightOnOCR emits as
+    a markdown heading; it must be stripped as running furniture, not promoted to a
+    body <h2> on every page.  The first-page "OPEN ACCESS" banner must likewise not
+    glue onto the front of the abstract."""
+
+    _CITATION = "Bioscience Reports (2019) 39 BSR20190715"
+
+    def test_running_header_citation_not_a_body_heading(self, bsr_html: str) -> None:
+        assert f"<h2>{self._CITATION}</h2>" not in bsr_html
+        # the repeated header is stripped, not scattered through the body
+        assert _body(bsr_html).count(self._CITATION) == 0
+
+    def test_open_access_banner_not_glued_to_abstract(self, bsr_html: str) -> None:
+        # the abstract is visible in the body, without the OPEN ACCESS banner prefix
+        # the model bolds onto its front (<strong>OPEN ACCESS</strong> Hydroxy…)
+        assert "Hydroxyethylsulfonate" in _body(bsr_html)
+        assert "<strong>OPEN ACCESS</strong>" not in bsr_html
+
+    def test_title_and_references_intact(self, bsr_html: str) -> None:
+        header = bsr_html[bsr_html.find("<header>") : bsr_html.find("</header>")]
+        assert "sulfoacetaldehyde reductase" in header
+        # author–year references, each its own <p>, not glued into one block
+        refs = bsr_html[bsr_html.find("<h2>References</h2>") :]
+        assert refs.count("<p>") >= 8
+
+
+@pytest.fixture(scope="session")
+def jafc_html(ocr_model: object) -> str:
+    """Full pipeline HTML for the J. Agric. Food Chem. 31298526.pdf fixture; skip if
+    the model is absent.  Writes tests/fixtures/31298526.html for visual inspection."""
+    if not _JAFC_PDF.exists():
+        pytest.skip(f"Fixture PDF not found: {_JAFC_PDF}")
+    return _run_pipeline_to_file(_JAFC_PDF, ocr_model)
+
+
+@pytest.mark.integration
+class TestJafcAbstractAndByline:
+    """31298526.pdf (J. Agric. Food Chem., ACS) prints the abstract as an inline
+    "ABSTRACT: …" bold label (no heading), and tags authors with LaTeX footnote
+    symbols (\\ddagger, \\S).  The abstract must stay visible in the abstract section
+    (not swept into the Metadata panel as front matter), and the LaTeX must render as
+    the ‡/§ glyphs, not leak raw into the byline/affiliations."""
+
+    _ABSTRACT = "L-Valine belongs to the branched-chain amino acids"
+
+    def test_abstract_in_section_not_panel(self, jafc_html: str) -> None:
+        assert self._ABSTRACT not in _metadata(jafc_html)
+        sec = jafc_html.find("<section class='abstract'>")
+        assert sec >= 0
+        assert self._ABSTRACT in jafc_html[sec : jafc_html.find("</section>", sec)]
+
+    def test_no_raw_latex_in_byline_or_affiliations(self, jafc_html: str) -> None:
+        assert "\\ddagger" not in jafc_html
+        assert "\\S" not in jafc_html
+
+    def test_title_in_header(self, jafc_html: str) -> None:
+        header = jafc_html[jafc_html.find("<header>") : jafc_html.find("</header>")]
+        assert "Ketol-Acid Reductoisomerase" in header
