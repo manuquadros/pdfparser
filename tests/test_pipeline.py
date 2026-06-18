@@ -552,6 +552,21 @@ class TestLightonAssembly:
         assert "Each value represents the mean" in _body(html)
         assert 'class="footnote"' not in html
 
+    def test_isotope_led_body_paragraph_not_routed_to_footnotes(self) -> None:
+        # A body paragraph opening with an isotope/mass-number superscript ("²H NMR",
+        # "³⁵S-labeled") is prose, not a footnote marker, so it stays in the body.
+        for opener in (
+            "²H NMR spectroscopy revealed a singlet at 4 ppm.",
+            "³⁵S-labeled methionine was added to the medium.",
+        ):
+            md = (
+                "# T\n\n## Abstract\n\nAbstract.\n\n## Introduction\n\n"
+                f"{opener}\n\n## References\n\n[1] A reference."
+            )
+            html = _run_lighton([md])
+            assert opener in _body(html), opener
+            assert f'<p class="footnote">{opener}' not in html
+
     def test_frontmatter_moved_to_metadata_panel_after_abstract(self) -> None:
         # Affiliations, keywords and abbreviations are OCR'd between the abstract
         # and the body's first section; they are pulled into the collapsible
@@ -628,6 +643,22 @@ class TestLightonAssembly:
         assert front == ["<p><strong>Keywords:</strong> alpha, beta</p>"]
         assert rest[0].startswith("<p>A long abstract")
         assert "<h2>Introduction</h2>" in rest
+
+    def test_back_matter_glossary_label_not_relocated(self) -> None:
+        # The trailing relocation is scoped to the leading region before the first
+        # section heading; a back-matter "**Abbreviations:**" glossary stays in the
+        # body with its own heading rather than being yanked to the front panel.
+        from pdfparser.pipeline.classify import _extract_front_matter
+
+        body = [
+            "<h2>Introduction</h2>",
+            "<p>Real body prose paragraph.</p>",
+            "<h2>Abbreviations</h2>",
+            "<p><strong>Abbreviations:</strong> ACT, x; PQQ, y</p>",
+        ]
+        front, rest = _extract_front_matter(body)
+        assert front == []
+        assert any("<strong>Abbreviations:</strong>" in r for r in rest)
 
     def test_frontmatter_unchanged_when_body_opens_with_section(self) -> None:
         # First block is already a body section heading → nothing precedes it →
@@ -1828,6 +1859,21 @@ class TestCrossPageMerge:
         assert "This suggests that TRI and TRII compete for the same substrate" in html
         assert "This suggests that TRI and</p>" not in html
 
+    def test_isotope_led_continuation_still_merges(self) -> None:
+        # The footnote-marker continuation guard must match a footnote shape, not any
+        # leading superscript: an isotope-led continuation ("³⁵S methionine …") is
+        # prose and must still rejoin its fragment.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs_stable
+
+        out = _merge_split_paragraphs_stable(
+            [
+                "<p>The radiolabel was incorporated using</p>",
+                "<p>³⁵S methionine in all growth media.</p>",
+            ]
+        )
+        assert len(out) == 1
+        assert "using ³⁵S methionine in all growth media." in out[0]
+
     def test_mixed_case_identifier_continuation_after_the(self) -> None:
         from pdfparser.pipeline.merge import _merge_split_paragraphs
 
@@ -1891,6 +1937,21 @@ class TestReferenceListMerge:
         )
         body = _body(_run_lighton([md]))
         assert "quaternary structure and possible subunit cooperativity" in body
+
+    def test_mixed_case_surname_entry_stays_separate(self) -> None:
+        # A new entry whose surname carries an internal capital ("McKenzie") must
+        # not be glued onto the prior DOI-terminated entry: capital-led = new entry,
+        # with no mid-sentence-acronym exception inside the references section.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs_stable
+
+        parts = [
+            "<h2>References</h2>",
+            "<p>Smith J, Doe A (2015). A title. doi:10.1000/abc.00426.x</p>",
+            "<p>McKenzie EF, Jones AB (2019). Another title. doi:10.1000/xyz</p>",
+        ]
+        out = _merge_split_paragraphs_stable(parts)
+        assert len(out) == 3
+        assert not any("00426.x McKenzie" in p for p in out)
 
 
 class TestCaptionMergeBarrier:

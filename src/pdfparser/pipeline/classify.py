@@ -29,11 +29,13 @@ _SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
 # tag ("¹http://…/home.htm" — a footnote the model didn't wrap).  Restricted to
 # superscript *digits*: an asterisk/dagger marker (``*†‡§``) is the shape a table
 # note takes ("*Each value represents the mean …"), which belongs under its table,
-# not in the article footnote run.  Trailing content is required so a lone marker
-# isn't matched.  It shares its leading class with affiliation lines ("¹ Department
-# of …"), so it is only consulted in the body — see ``seen_body_heading`` in
-# ``_classify_parts`` — never on the first-page affiliation run.
-_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰-⁹]{1,3}\s*\S")
+# not in the article footnote run.  A digit run *immediately* (no space) followed by
+# an uppercase letter is an isotope/mass-number — "²H NMR", "³⁵S-labeled", "¹⁸O" —
+# i.e. body prose, not a marker, so it is excluded; a marker is instead followed by
+# whitespace or non-uppercase content.  It shares its leading class with affiliation
+# lines ("¹ Department of …"), so it is only consulted in the body — see
+# ``seen_body_heading`` in ``_classify_parts`` — never on the first-page affiliations.
+_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰-⁹]{1,3}(?![¹²³⁰-⁹])(?:\s+|(?![A-Z]))\S")
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
         "abstract",
@@ -906,13 +908,21 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
     # body — a keyword line stranded after a *headingless* abstract that stayed in
     # the body, so the run never started — is unambiguous front matter, so relocate
     # it too.  Pulled here, after classify, not in the pre-classify stray sweep,
-    # because the keyword label doubles as the abstract terminator there.
+    # because the keyword label doubles as the abstract terminator there.  Scoped to
+    # the leading run *before the first section heading*: past that we are in the
+    # body proper, where a labelled line is a back-matter glossary ("Abbreviations"
+    # at the article end) that belongs with its own heading, not yanked to the panel.
     trailing: list[str] = []
     kept: list[str] = []
+    in_lead = True
     for part in body[n:]:
+        if in_lead and _heading_inner(part) is not None:
+            in_lead = False
         inner = _plain_p_text(part)
-        target = trailing if inner and _is_inline_frontmatter_label(inner) else kept
-        target.append(part)
+        if in_lead and inner and _is_inline_frontmatter_label(inner):
+            trailing.append(part)
+        else:
+            kept.append(part)
     return list(body[:n]) + trailing, kept
 
 

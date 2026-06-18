@@ -11,6 +11,7 @@ import re
 from pdfparser.pipeline.classify import (
     _LEADING_SUP_RE,
     _REF_SECTION_RE,
+    _UNICODE_SUP_MARKER_RE,
     _is_stray_metadata,
 )
 from pdfparser.pipeline.dehyphenate import _dehyphenate_join
@@ -193,20 +194,25 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and not _ENUM_RE.match(cont)
                         and not _BOLD_LABEL_RE.match(cont)
                         and not _opens_with_caption_label(cont)
-                        # A continuation opening with a footnote marker ("¹http://…")
-                        # is a page footnote the classifier left in place, not prose;
-                        # gluing it in splices the footnote mid-sentence.
-                        and not _LEADING_SUP_RE.match(cont_head)
+                        # A continuation opening with a footnote marker ("¹http://…"
+                        # or a "*"/"†" note) is a page footnote the classifier left in
+                        # place, not prose; gluing it in splices the footnote
+                        # mid-sentence.  Matched by footnote shape, not by any leading
+                        # superscript, so an isotope-led continuation ("³⁵S methionine
+                        # …") still merges.
+                        and not _UNICODE_SUP_MARKER_RE.match(cont_head)
+                        and cont_head[:1] not in _FOOTNOTE_SYMBOLS
                         and not (
                             _FUNCTION_WORD_END_RE.search(visible)
                             and cont[:1].isupper()
                             and not _MIDSENTENCE_HEAD_RE.match(cont)
                         )
-                        and not (
-                            i >= ref_start
-                            and cont_head[:1].isupper()
-                            and not _MIDSENTENCE_HEAD_RE.match(cont_head)
-                        )
+                        # In the references section a capital-led continuation is the
+                        # next bibliography entry (author surname), even one with an
+                        # internal capital ("McKenzie", "DeForest"); only a lowercase
+                        # continuation is a genuinely wrapped entry, so no mid-sentence
+                        # exception applies here.
+                        and not (i >= ref_start and cont_head[:1].isupper())
                     ):
                         joined = _dehyphenate_join(stripped, cont)
                         out.append(f"<p>{joined}</p>")
