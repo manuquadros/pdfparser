@@ -364,9 +364,12 @@ _PUBLICATION_BANNER_LABELS = frozenset({"open access"})
 _BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
 # A glossary the journal prints as a column-bottom footnote on the first page —
 # "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
-# mid-section, where it splits the surrounding paragraph in two; relocated to the
-# panel (like the leading-run glossary heading) so the prose rejoins.  Keywords is
-# excluded: it sits cleanly after the abstract and does not interrupt prose.
+# mid-section, where it splits the surrounding paragraph in two; the pre-classify
+# stray sweep relocates it (before the paragraph merge) so the prose rejoins.
+# Keywords is excluded *here*: it doubles as the abstract terminator the classifier
+# reads, so removing it pre-classify leaks the following prose into the abstract;
+# a stranded keyword line is instead relocated post-classify in
+# ``_extract_front_matter`` (see ``_is_inline_frontmatter_label``).
 _GLOSSARY_METADATA_LABELS = frozenset({"abbreviations", "nomenclature"})
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
@@ -899,7 +902,18 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
     # detection failure, not a metadata-only document.
     if n >= len(body):
         return [], body
-    return body[:n], body[n:]
+    # Beyond the leading run, an inline front-matter label that survived into the
+    # body — a keyword line stranded after a *headingless* abstract that stayed in
+    # the body, so the run never started — is unambiguous front matter, so relocate
+    # it too.  Pulled here, after classify, not in the pre-classify stray sweep,
+    # because the keyword label doubles as the abstract terminator there.
+    trailing: list[str] = []
+    kept: list[str] = []
+    for part in body[n:]:
+        inner = _plain_p_text(part)
+        target = trailing if inner and _is_inline_frontmatter_label(inner) else kept
+        target.append(part)
+    return list(body[:n]) + trailing, kept
 
 
 def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[str]]:
@@ -978,11 +992,24 @@ def _is_publication_metadata_label(inner: str) -> bool:
 
 def _is_glossary_metadata_label(inner: str) -> bool:
     """True when a ``<p>`` opens with an inline glossary bold label
-    ("**Abbreviations:**", "**Nomenclature:**") — see
-    ``_GLOSSARY_METADATA_LABELS``.  The label is decisive evidence regardless of
-    the entry list's length, so it is matched before the stray-metadata length cap."""
+    ("**Abbreviations:**", "**Nomenclature:**") — see ``_GLOSSARY_METADATA_LABELS``.
+    The label is decisive evidence regardless of the entry list's length, so it is
+    matched before the stray-metadata length cap."""
     m = _BOLD_LABEL_CAPTURE_RE.match(inner)
     return m is not None and m.group(1).strip().lower() in _GLOSSARY_METADATA_LABELS
+
+
+def _is_inline_frontmatter_label(inner: str) -> bool:
+    """True when a ``<p>`` opens with an inline bold label naming a front-matter
+    section ("**Abbreviations:**", "**Keywords:**", "**Nomenclature:**") — the same
+    labels recognised as headings (``_FRONTMATTER_HEADING_LABELS``).
+
+    Broader than ``_is_glossary_metadata_label`` (it also matches keywords); used
+    by ``_extract_front_matter`` *after* classify to relocate a labelled front-matter
+    line that survived past the leading run, so it never displaces the keyword line's
+    pre-classify role as the abstract terminator."""
+    m = _BOLD_LABEL_CAPTURE_RE.match(inner)
+    return m is not None and m.group(1).strip().lower() in _FRONTMATTER_HEADING_LABELS
 
 
 def _is_stray_metadata(part: str) -> bool:

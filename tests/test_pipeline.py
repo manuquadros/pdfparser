@@ -599,6 +599,36 @@ class TestLightonAssembly:
         assert "Keywords:" not in _body(html)
         assert "<h2>Background</h2>" in _body(html)
 
+    def test_keywords_after_headingless_abstract_relocated(self) -> None:
+        # When the abstract has no "Abstract" heading it stays in the body and heads
+        # it, so the leading front-matter run never starts; the keyword line right
+        # after it is still relocated to the panel (post-classify), while the
+        # abstract prose stays visible in the body.
+        md = (
+            "# T\n\nWe report the discovery of an enzyme, described in this "
+            "abstract which carries no heading and so remains in the body.\n\n"
+            "**Keywords:** alpha, beta, gamma\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        assert "Keywords:" in _metadata(html)
+        assert "Keywords:" not in _body(html)
+        assert "We report the discovery of an enzyme" in _body(html)
+
+    def test_extract_front_matter_relocates_trailing_label(self) -> None:
+        from pdfparser.pipeline.classify import _extract_front_matter
+
+        body = [
+            "<p>A long abstract prose paragraph that stays in the body proper.</p>",
+            "<p><strong>Keywords:</strong> alpha, beta</p>",
+            "<h2>Introduction</h2>",
+            "<p>Body prose.</p>",
+        ]
+        front, rest = _extract_front_matter(body)
+        assert front == ["<p><strong>Keywords:</strong> alpha, beta</p>"]
+        assert rest[0].startswith("<p>A long abstract")
+        assert "<h2>Introduction</h2>" in rest
+
     def test_frontmatter_unchanged_when_body_opens_with_section(self) -> None:
         # First block is already a body section heading → nothing precedes it →
         # order left intact.
@@ -3937,6 +3967,16 @@ class TestFrontiersSidebarMetadata:
         )
         assert abstract in body
         assert abstract not in panel
+
+    def test_keywords_relocated_to_panel_after_headingless_abstract(
+        self, frontiers_html: str
+    ) -> None:
+        # The headingless abstract stays in the body and heads it, so the leading
+        # front-matter run never starts; the keyword line right after it is still
+        # relocated to the panel (post-classify), not stranded in the body.
+        panel, body = _metadata(frontiers_html), _body(frontiers_html)
+        assert "<strong>Keywords:</strong>" in panel
+        assert "<strong>Keywords:</strong>" not in body
 
     def test_abbreviations_footnote_does_not_split_introduction(
         self, frontiers_html: str
