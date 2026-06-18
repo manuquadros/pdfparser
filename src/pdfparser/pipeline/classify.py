@@ -374,6 +374,17 @@ _PUBLICATION_METADATA_LABELS = frozenset(
 # body prose happens to follow, so a banner relocates on its own and never claims a
 # trailing paragraph.
 _PUBLICATION_BANNER_LABELS = frozenset({"open access"})
+# A publication banner the OCR bolds at the very start of a paragraph
+# ("**OPEN ACCESS**" — sometimes its own block, sometimes glued onto the front of
+# the abstract beneath it).  It carries no content (unlike the Frontiers heading
+# form, which heads a sidebar of metadata), so it is stripped; any text after it on
+# the same paragraph (the abstract) is kept.
+_LEADING_BANNER_RE = re.compile(
+    r"^<strong>\s*(?:"
+    + "|".join(re.escape(b) for b in _PUBLICATION_BANNER_LABELS)
+    + r")\s*</strong>\s*",
+    re.IGNORECASE,
+)
 _BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
 # A glossary the journal prints as a column-bottom footnote on the first page —
 # "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
@@ -729,6 +740,14 @@ def _classify_parts(parts: list[str]) -> _Meta:
             continue
 
         inner_p = _plain_p_text(part)
+        # Strip a leading publication banner ("**OPEN ACCESS**") the OCR bolded onto
+        # a paragraph: drop the block if that is all it was, else keep the remainder
+        # (the abstract it was glued to) and reprocess it as a normal paragraph.
+        if inner_p is not None and (m := _LEADING_BANNER_RE.match(inner_p)):
+            inner_p = inner_p[m.end() :].lstrip()
+            if not inner_p:
+                continue
+            part = f"<p>{inner_p}</p>"
         if expect_byline:
             expect_byline = False
             if inner_p is not None and _is_byline(inner_p):
