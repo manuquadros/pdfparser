@@ -395,6 +395,14 @@ _METADATA_PROSE_MIN_LEN = 80
 _LIST_LIKE_MIN_SEMICOLONS = 2
 
 _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
+# Some journals (ACS) print the abstract with no heading, as a bold inline label
+# on the paragraph itself ("**ABSTRACT**: …").  OCR places the colon inside or
+# outside the bold (`<strong>ABSTRACT:</strong>` vs `<strong>ABSTRACT</strong>:`);
+# match either and capture the label's end so it can be stripped.  Without this the
+# paragraph reads as a bold-label front-matter line and is swept into the panel.
+_INLINE_ABSTRACT_RE = re.compile(
+    r"^<strong>\s*abstract\s*:?\s*</strong>\s*:?\s*", re.IGNORECASE
+)
 # Running header/footer: a short, terminal-punctuation-free line that recurs
 # across pages.  Page numbers vary per page, so they are stripped before the
 # recurrence is counted (e.g. "Biotechnology … 601" / "… 602" share a key).
@@ -717,6 +725,12 @@ def _classify_parts(parts: list[str]) -> _Meta:
             if inner_p is not None and _is_byline(inner_p):
                 byline_html = _byline_text(inner_p)
                 continue
+        # A headingless abstract carried as an inline "ABSTRACT: …" bold label: strip
+        # the label and route the paragraph to the abstract section, before it can be
+        # mistaken for a bold-label front-matter line and swept into the panel.
+        if inner_p is not None and (m := _INLINE_ABSTRACT_RE.match(inner_p)):
+            abstract.append(f"<p>{inner_p[m.end() :].lstrip()}</p>")
+            continue
         if in_abstract:
             if inner_p is not None and not _BOLD_LABEL_RE.match(inner_p):
                 abstract.append(part)
