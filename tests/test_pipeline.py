@@ -356,6 +356,34 @@ class TestRunningFurniture:
         ]
         assert _strip_running_furniture(parts) == parts
 
+    def test_verbatim_digit_citation_heading_removed(self) -> None:
+        # A journal-citation running head ("… (2019) … BSR20190715") the OCR emits
+        # only as a heading on several pages — its paragraph form differs (it also
+        # carries a DOI line), so keys never match — is stripped because its
+        # *verbatim* text recurs and carries digits.
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        cit = "<h2>Bioscience Reports (2019) 39 BSR20190715</h2>"
+        parts = [cit, "<p>Body one.</p>", cit, "<p>Body two.</p>", cit]
+        assert _strip_running_furniture(parts) == [
+            "<p>Body one.</p>",
+            "<p>Body two.</p>",
+        ]
+
+    def test_distinct_numbered_headings_kept(self) -> None:
+        # Two distinct numbered headings ("Step 1: …" / "Step 2: …") collapse to one
+        # digit-stripped key but their verbatim texts differ, so neither is a running
+        # head; both must survive (they only appear as headings, never paragraphs).
+        from pdfparser.pipeline.classify import _strip_running_furniture
+
+        parts = [
+            "<h2>Step 1: Purification of Xylanase</h2>",
+            "<p>Body one.</p>",
+            "<h2>Step 2: Purification of Xylanase</h2>",
+            "<p>Body two.</p>",
+        ]
+        assert _strip_running_furniture(parts) == parts
+
     def test_standalone_page_number_removed(self) -> None:
         # OCR sometimes isolates the folio into its own block, away from the
         # journal line, so digit-stripped recurrence can't catch it; a number-only
@@ -681,6 +709,52 @@ class TestLightonAssembly:
         front, rest = _extract_front_matter(body)
         assert front == []
         assert any("<strong>Abbreviations:</strong>" in r for r in rest)
+
+    def test_banner_hidden_publication_label_relocated(self) -> None:
+        # A "**Citation:**" line the pre-classify sweep missed because a banner hid it
+        # behind the leading <strong> anchor is relocated to the panel post-classify
+        # (here it follows a headingless abstract, so it is not in the leading run).
+        from pdfparser.pipeline.classify import _extract_front_matter
+
+        body = [
+            "<p>A long headingless abstract paragraph that stays in the body here.</p>",
+            "<p><strong>Citation:</strong> Doe J (2020) Title. Journal 1:1</p>",
+            "<h2>Introduction</h2>",
+            "<p>Body prose.</p>",
+        ]
+        front, rest = _extract_front_matter(body)
+        assert any("<strong>Citation:</strong>" in f for f in front)
+        assert not any("<strong>Citation:</strong>" in r for r in rest)
+
+    def test_inline_abstract_requires_colon(self) -> None:
+        # A body paragraph merely opening with a bold word "Abstract" (no colon) must
+        # not be captured as the abstract; both colon forms of a real label are.
+        from pdfparser.pipeline.classify import _INLINE_ABSTRACT_RE
+
+        assert not _INLINE_ABSTRACT_RE.match("<strong>Abstract</strong> reasoning here")
+        assert _INLINE_ABSTRACT_RE.match("<strong>ABSTRACT:</strong> text")
+        assert _INLINE_ABSTRACT_RE.match("<strong>ABSTRACT</strong>: text")
+
+    def test_inline_abstract_captures_multiple_paragraphs(self) -> None:
+        # An inline-labelled abstract spanning two paragraphs is fully captured; a
+        # following bold label (colon inside or outside) ends it rather than being
+        # absorbed as abstract prose.
+        from pdfparser.pipeline.classify import _classify_parts
+
+        meta = _classify_parts(
+            [
+                "<h1>T</h1>",
+                "<h2>X</h2>",
+                "<p><strong>ABSTRACT</strong>: First abstract paragraph.</p>",
+                "<p>Second abstract paragraph continues here.</p>",
+                "<p><strong>KEYWORDS</strong>: alpha, beta</p>",
+                "<h2>Introduction</h2>",
+                "<p>Body.</p>",
+            ]
+        )
+        assert len(meta.abstract) == 2
+        assert not any("KEYWORDS" in a for a in meta.abstract)
+        assert any("KEYWORDS" in b for b in meta.body)
 
     def test_frontmatter_unchanged_when_body_opens_with_section(self) -> None:
         # First block is already a body section heading → nothing precedes it →

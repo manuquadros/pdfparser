@@ -409,10 +409,18 @@ _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
 # Some journals (ACS) print the abstract with no heading, as a bold inline label
 # on the paragraph itself ("**ABSTRACT**: …").  OCR places the colon inside or
 # outside the bold (`<strong>ABSTRACT:</strong>` vs `<strong>ABSTRACT</strong>:`);
-# match either and capture the label's end so it can be stripped.  Without this the
-# paragraph reads as a bold-label front-matter line and is swept into the panel.
+# match either and capture the label's end so it can be stripped.  The colon is
+# *required* (in one position or the other) so a body paragraph merely opening with
+# an emphasised word "Abstract" — no colon — is not mistaken for the abstract.
 _INLINE_ABSTRACT_RE = re.compile(
-    r"^<strong>\s*abstract\s*:?\s*</strong>\s*:?\s*", re.IGNORECASE
+    r"^<strong>\s*abstract\s*(?::\s*</strong>|</strong>\s*:)\s*", re.IGNORECASE
+)
+# A paragraph opening with a bold label, with the colon inside or outside the bold
+# ("<strong>Keywords:</strong>" / "<strong>KEYWORDS</strong>:").  Broader than
+# text._BOLD_LABEL_RE (colon-inside only); used to end the abstract so a
+# colon-outside label following an inline abstract is not absorbed as abstract prose.
+_BOLD_LABEL_EITHER_COLON_RE = re.compile(
+    r"^<strong>[^<]+:</strong>|^<strong>[^<]+</strong>\s*:"
 )
 # Running header/footer: a short, terminal-punctuation-free line that recurs
 # across pages.  Page numbers vary per page, so they are stripped before the
@@ -537,11 +545,13 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
     line that recurs *only* as a heading is usually a genuine section heading the
     article legitimately repeats (e.g. "Purification of X" under both Methods and
     Results), not furniture, and must be kept.  The exception is a heading that
-    carried *digits* ("Bioscience Reports (2019) 39 BSR20190715"): a journal
-    citation / folio running head, whose paragraph form may differ (it also carries
-    a DOI line, so its key never matches the bare-heading key) — a real section
-    heading does not carry volume/article-id numbers, and the 12-char digit-free key
-    floor keeps short numbered labels ("Fig 1") from qualifying.
+    carried *digits* whose *verbatim* text recurs ("Bioscience Reports (2019) 39
+    BSR20190715" on every page): a journal citation / folio running head, constant
+    across pages, whose paragraph form may differ (it also carries a DOI line, so
+    its digit-stripped key never matches the bare-heading key).  Requiring the
+    verbatim text — not just the digit-stripped key — to recur keeps distinct
+    numbered headings that merely collide after digit-stripping ("Step 1: X" /
+    "Step 2: X") from being mistaken for one running head and deleted.
 
     A sentence-terminated line is treated as real prose unless it recurs often
     enough (``_SENTENCE_LIKE_FURNITURE_MIN_REPEAT``) to be a running head whose
@@ -549,7 +559,12 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
     counts: Counter[str] = Counter()
     as_paragraph: set[str] = set()
     not_sentence_like: set[str] = set()
-    digit_bearing: set[str] = set()
+    verbatim_counts: Counter[str] = Counter()
+    # (key, verbatim text) for each digit-bearing candidate — used to find a heading
+    # whose *exact* text recurs (a journal citation / folio constant across pages),
+    # which qualifies for the heading-only relaxation; distinct numbered headings
+    # ("Step 1: X" / "Step 2: X") only share a digit-stripped key, not verbatim text.
+    digit_bearing: list[tuple[str, str]] = []
     for part in parts:
         key = _is_furniture_candidate(part)
         if key is None:
@@ -560,13 +575,16 @@ def _strip_running_furniture(parts: list[str]) -> list[str]:
         if not _ends_like_sentence(part):
             not_sentence_like.add(key)
         inner = _furniture_inner(part)
-        if inner is not None and _DIGITS_RE.search(_visible_text(inner)):
-            digit_bearing.add(key)
+        text = _visible_text(inner).strip() if inner is not None else ""
+        verbatim_counts[text] += 1
+        if _DIGITS_RE.search(text):
+            digit_bearing.append((key, text))
+    digit_citation = {key for key, text in digit_bearing if verbatim_counts[text] > 1}
     repeated = {
         key
         for key, n in counts.items()
         if n > 1
-        and (key in as_paragraph or key in digit_bearing)
+        and (key in as_paragraph or key in digit_citation)
         and (key in not_sentence_like or n >= _SENTENCE_LIKE_FURNITURE_MIN_REPEAT)
     }
     return [
@@ -755,12 +773,15 @@ def _classify_parts(parts: list[str]) -> _Meta:
                 continue
         # A headingless abstract carried as an inline "ABSTRACT: …" bold label: strip
         # the label and route the paragraph to the abstract section, before it can be
-        # mistaken for a bold-label front-matter line and swept into the panel.
+        # mistaken for a bold-label front-matter line and swept into the panel.  Open
+        # the abstract window (like the heading path) so a multi-paragraph abstract's
+        # continuation is captured too, closing at the next bold label / heading.
         if inner_p is not None and (m := _INLINE_ABSTRACT_RE.match(inner_p)):
             abstract.append(f"<p>{inner_p[m.end() :].lstrip()}</p>")
+            in_abstract = True
             continue
         if in_abstract:
-            if inner_p is not None and not _BOLD_LABEL_RE.match(inner_p):
+            if inner_p is not None and not _BOLD_LABEL_EITHER_COLON_RE.match(inner_p):
                 abstract.append(part)
                 continue
             in_abstract = False
@@ -971,14 +992,16 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
     # detection failure, not a metadata-only document.
     if n >= len(body):
         return [], body
-    # Beyond the leading run, an inline front-matter label that survived into the
+    # Beyond the leading run, a labelled front-matter line that survived into the
     # body — a keyword line stranded after a *headingless* abstract that stayed in
-    # the body, so the run never started — is unambiguous front matter, so relocate
-    # it too.  Pulled here, after classify, not in the pre-classify stray sweep,
-    # because the keyword label doubles as the abstract terminator there.  Scoped to
-    # the leading run *before the first section heading*: past that we are in the
-    # body proper, where a labelled line is a back-matter glossary ("Abbreviations"
-    # at the article end) that belongs with its own heading, not yanked to the panel.
+    # the body, or a publication-metadata label ("Citation:", "Editor:") the
+    # pre-classify sweep missed because a stripped banner had hidden it behind the
+    # leading <strong> anchor — is unambiguous front matter, so relocate it too.
+    # Pulled here, after classify, not in the pre-classify stray sweep, because the
+    # keyword label doubles as the abstract terminator there.  Scoped to the leading
+    # run *before the first section heading*: past that we are in the body proper,
+    # where a labelled line is a back-matter glossary ("Abbreviations" at the article
+    # end) that belongs with its own heading, not yanked to the panel.
     trailing: list[str] = []
     kept: list[str] = []
     in_lead = True
@@ -986,7 +1009,14 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
         if in_lead and _heading_inner(part) is not None:
             in_lead = False
         inner = _plain_p_text(part)
-        if in_lead and inner and _is_inline_frontmatter_label(inner):
+        if (
+            in_lead
+            and inner
+            and (
+                _is_inline_frontmatter_label(inner)
+                or _is_publication_metadata_label(inner)
+            )
+        ):
             trailing.append(part)
         else:
             kept.append(part)
