@@ -22,13 +22,16 @@ Leaf module: touches the PDF (render + text layer) and the GPU (via the injected
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtime
 
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.markdown import _render_inline
@@ -87,6 +90,10 @@ _MIN_SCALE = 200 / 72
 _MAX_SCALE = 600 / 72
 
 _Box = tuple[float, float, float, float]  # PDF points: left, bottom, right, top
+
+# Quarter-turn rotations whose text reads along the *vertical* page axis — a table
+# at either is "sideways" and localized along that axis; 0°/180° keep horizontal rows.
+_SIDEWAYS_ROTATIONS = frozenset({90, 270})
 
 
 def _close_unclosed_tables(md: str) -> str:
@@ -162,20 +169,26 @@ def _union(boxes: list[_Box]) -> _Box:
     return (min(ls), min(bs), max(rs), max(ts))
 
 
-def _group_lines(char_boxes: list[_Box | None]) -> list[_Box]:
-    """Cluster glyph boxes into text lines, top of page first.
+def _group_lines(char_boxes: list[_Box | None], vertical: bool = False) -> list[_Box]:
+    """Cluster glyph boxes into text lines, in reading order.
 
-    Boxes whose vertical intervals overlap are the same line; a clean vertical gap
-    starts a new one.  Each returned box is one line's bounds (PDF points)."""
-    boxes = sorted((b for b in char_boxes if b is not None), key=lambda b: -b[3])
+    Boxes whose cross-flow intervals overlap are the same line; a clean gap starts a
+    new one.  Each returned box is one line's bounds (PDF points).  For upright text
+    a line is a horizontal run (boxes sharing a vertical interval), ordered top of
+    page first.  For a sideways table (text at 90°/270°) the reading lines run
+    *vertically* — a line is a column-strip of glyphs sharing a horizontal interval —
+    so clustering and ordering switch to the x-axis (left of page first)."""
+    lo_i, hi_i = (0, 2) if vertical else (1, 3)
+    key = (lambda b: b[0]) if vertical else (lambda b: -b[3])
+    boxes = sorted((b for b in char_boxes if b is not None), key=key)
     lines: list[list[float]] = []
-    for left, bottom, right, top in boxes:
-        if lines and bottom < lines[-1][3] and top > lines[-1][1]:  # overlaps line
+    for box in boxes:
+        if lines and box[lo_i] < lines[-1][hi_i] and box[hi_i] > lines[-1][lo_i]:
             ln = lines[-1]
-            ln[0], ln[1] = min(ln[0], left), min(ln[1], bottom)
-            ln[2], ln[3] = max(ln[2], right), max(ln[3], top)
+            ln[0], ln[1] = min(ln[0], box[0]), min(ln[1], box[1])
+            ln[2], ln[3] = max(ln[2], box[2]), max(ln[3], box[3])
         else:
-            lines.append([left, bottom, right, top])
+            lines.append(list(box))
     return [tuple(ln) for ln in lines]  # type: ignore[misc]
 
 
@@ -185,22 +198,43 @@ def _median(values: list[float]) -> float:
     return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
 
 
+def _seed_rotation(rotations: list[int]) -> int:
+    """The dominant quarter-turn among a region's seed glyphs (0 when none rotate).
+
+    A sideways table carries the same rotation on every glyph, so the mode of the
+    seed glyphs' rotations identifies it; ties and an empty input fall back to 0 (the
+    upright path), so a stray rotated glyph can never flip an upright table sideways."""
+    if not rotations:
+        return 0
+    counts = Counter(rotations)
+    best = max(counts.values())
+    return 0 if counts[0] == best else max(counts, key=lambda r: (counts[r], -r))
+
+
 def _locate_bbox(
     anchors: list[str],
     page_norm: str,
     idx_map: list[int],
     char_boxes: list[_Box | None],
+    char_rotations: list[int | None],
     page_size: tuple[float, float],
-) -> _Box | None:
-    """Bounding box (PDF points) of the table region, or ``None`` if unlocatable.
+) -> tuple[_Box, int] | None:
+    """Bounding box (PDF points) and rotation of the table region, or ``None``.
 
     Anchors that occur exactly once in the folded page text locate the table's
     lines (a repeated anchor is ambiguous — it may be prose — so it is skipped).
-    The line run is then grown up and down while the inter-line gap stays within
-    ``_GAP_FACTOR`` of the table's own spacing, so the box reaches rows no anchor
-    covered (e.g. trailing data rows) yet halts at the wider gap to body prose.
-    Horizontal extent is the union of the included lines."""
+    The line run is then grown along the reading axis while the inter-line gap stays
+    within ``_GAP_FACTOR`` of the table's own spacing, so the box reaches rows no
+    anchor covered (e.g. trailing data rows) yet halts at the wider gap to body
+    prose.  Cross-axis extent is the union of the included lines.
+
+    A sideways table (its anchor glyphs rotated 90°/270°) is localized along its
+    *true* reading axis: lines run vertically, growth runs left↔right, and only
+    glyphs sharing the table's rotation are clustered — so the box grows over the
+    table's columns and stops at the gutter to the upright body text beside it
+    instead of sweeping a neighbouring column's heading into the crop."""
     seeds: list[_Box] = []
+    seed_rotations: list[int] = []
     for anchor in anchors:
         first = page_norm.find(anchor)
         if first == -1 or page_norm.find(anchor, first + 1) != -1:
@@ -209,17 +243,43 @@ def _locate_bbox(
         spanned = [b for b in char_boxes[i0 : i1 + 1] if b is not None]
         if spanned:
             seeds.append(_union(spanned))
+            seed_rotations.extend(
+                r for r in char_rotations[i0 : i1 + 1] if r is not None
+            )
     if not seeds:
         return None
 
-    lines = _group_lines(char_boxes)
+    rot = _seed_rotation(seed_rotations)
+    vertical = rot in _SIDEWAYS_ROTATIONS
+    lo_i, hi_i = (0, 2) if vertical else (1, 3)
+    # For a sideways table, cluster only the sideways glyphs so the upright body text
+    # beside it can't bridge the column gutter into the box.  Keep *both* 90° and
+    # 270° (not just the modal rotation): a uniformly-rotated table can still have a
+    # cell glyph pdfium snaps to the opposite quarter-turn, and dropping it would
+    # clip that column from the crop.  Upright (0°) and inverted (180°) body text is
+    # still excluded.
+    boxes = (
+        [
+            b
+            for b, r in zip(char_boxes, char_rotations, strict=True)
+            if r in _SIDEWAYS_ROTATIONS
+        ]
+        if vertical
+        else char_boxes
+    )
+    lines = _group_lines(boxes, vertical)
     if not lines:
         return None
-    gaps = [lines[i][1] - lines[i + 1][3] for i in range(len(lines) - 1)]
+    if vertical:
+        gaps = [lines[i + 1][0] - lines[i][2] for i in range(len(lines) - 1)]
+    else:
+        gaps = [lines[i][1] - lines[i + 1][3] for i in range(len(lines) - 1)]
 
     seed_box = _union(seeds)
     touched = [
-        i for i, ln in enumerate(lines) if ln[1] < seed_box[3] and ln[3] > seed_box[1]
+        i
+        for i, ln in enumerate(lines)
+        if ln[lo_i] < seed_box[hi_i] and ln[hi_i] > seed_box[lo_i]
     ]
     if not touched:
         return None
@@ -240,10 +300,13 @@ def _locate_bbox(
     # one line below the body, set off by a gap a little wider than the row gaps —
     # past the body threshold but well short of the margin to prose.  Pull in that
     # single line so the crop re-OCR can recover a legend the page OCR truncated.
+    # Skipped for a sideways table: its legend is colocated as a separate caption,
+    # and the line-gap model that anchors it assumes upright rows.
     legend_threshold = spacing * _LEGEND_GAP_FACTOR
     added = 0
     while (
-        hi < len(lines) - 1
+        not vertical
+        and hi < len(lines) - 1
         and added < _MAX_LEGEND_LINES
         and gaps[hi] <= legend_threshold
     ):
@@ -252,12 +315,13 @@ def _locate_bbox(
 
     left, bottom, right, top = _union(list(lines[lo : hi + 1]))
     page_w, page_h = page_size
-    return (
+    bbox = (
         max(0.0, left - _PAD_PT),
         max(0.0, bottom - _PAD_PT),
         min(page_w, right + _PAD_PT),
         min(page_h, top + _PAD_PT),
     )
+    return bbox, rot
 
 
 def _table_columns(table_html: str) -> int:
@@ -362,19 +426,32 @@ def _splice_region(md: str, start: int, end: int, new_tables: list[str]) -> str:
     return md[:start] + "\n\n".join(new_tables) + md[end:]
 
 
+def _snap_rotation(angle_deg: float) -> int:
+    """Snap a glyph rotation to the nearest quarter turn (0/90/180/270)."""
+    return round(angle_deg / 90) % 4 * 90
+
+
 def _page_text_and_boxes(
     textpage: pdfium.PdfTextPage,
-) -> tuple[str, list[_Box | None]]:
-    """Page text paired with one glyph box per character, index-aligned.
+) -> tuple[str, list[_Box | None], list[int | None]]:
+    """Page text paired with one glyph box and rotation per character, index-aligned.
 
     Built char by char in the same index domain so that position *p* in the
-    returned text always indexes ``boxes[p]``.  ``get_text_range()`` (the text
-    view) and ``count_chars()`` (the char-array) disagree on real PDFs — pdfium
-    drops or inserts characters between the two — so deriving the text from one
-    and the boxes from the other would silently misalign every glyph past the
-    first dropped char, locating the table from the wrong region."""
+    returned text always indexes ``boxes[p]`` and ``rotations[p]``.
+    ``get_text_range()`` (the text view) and ``count_chars()`` (the char-array)
+    disagree on real PDFs — pdfium drops or inserts characters between the two — so
+    deriving the text from one and the boxes from the other would silently misalign
+    every glyph past the first dropped char, locating the table from the wrong
+    region.
+
+    The rotation (snapped to a quarter turn) is what lets a sideways table — laid
+    out at 90°/270° on the page — be localized along its true reading axis and the
+    crop turned upright before re-OCR; ``FPDFText_GetCharAngle`` returns the glyph's
+    counter-clockwise rotation in radians (a negative value signals an error)."""
     parts: list[str] = []
     boxes: list[_Box | None] = []
+    rotations: list[int | None] = []
+    raw = textpage.raw
     for i in range(textpage.count_chars()):
         ch = textpage.get_text_range(i, 1)
         try:
@@ -384,9 +461,12 @@ def _page_text_and_boxes(
             )
         except Exception:
             box = None
+        angle = pdfium_c.FPDFText_GetCharAngle(raw, i)
+        rot = _snap_rotation(math.degrees(angle)) if angle >= 0 else None
         parts.append(ch)
         boxes.extend([box] * len(ch))  # a glyph may decode to several text chars
-    return "".join(parts), boxes
+        rotations.extend([rot] * len(ch))
+    return "".join(parts), boxes, rotations
 
 
 def _glyph_centers(
@@ -512,7 +592,7 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
     if not regions:
         return md, []
 
-    page_text, char_boxes = _page_text_and_boxes(page.get_textpage())
+    page_text, char_boxes, char_rotations = _page_text_and_boxes(page.get_textpage())
     page_norm, idx_map = _normalize_with_map(page_text)
     centers = _glyph_centers(page_norm, idx_map, char_boxes)
     page_size = page.get_size()
@@ -520,16 +600,28 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
     plans: list[_RegionPlan] = []
     for start, end, tables in regions:
         cells = [c for tbl in tables for c in _cell_texts(tbl)]
-        bbox = _locate_bbox(
-            _anchor_texts(cells), page_norm, idx_map, char_boxes, page_size
+        located = _locate_bbox(
+            _anchor_texts(cells),
+            page_norm,
+            idx_map,
+            char_boxes,
+            char_rotations,
+            page_size,
         )
-        if bbox is None:
+        if located is None:
             continue
+        bbox, rot = located
         captured = {t for c in cells for t in _normalize(c).split()}
         captured |= _adjacent_para_tokens(md, start, end)
         if _region_fully_captured(bbox, page_norm, centers, captured):
             continue
         crop = _scaled_crop(page, bbox, page_size)
+        # Turn a sideways table upright before re-OCR: the model reads an upright
+        # table's column structure correctly, but mis-groups a rotated one (a 4-wide
+        # column header collapses to colspan=2).  rotate() is CCW and the glyph angle
+        # is the CCW rotation, so rotating by it cancels the page rotation.
+        if rot:
+            crop = crop.rotate(rot, expand=True)
         plans.append(_RegionPlan(start, end, tables, crop))
     return md, plans
 

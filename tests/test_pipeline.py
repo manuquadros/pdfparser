@@ -1200,6 +1200,62 @@ class TestFigureLabelPredicates:
         assert not _is_panel_label("A nice sentence.")
 
 
+class TestTableFigureDedup:
+    """A table the model boxed as a figure (placeholder + "TABLE N" caption) right
+    before the ``<table>`` it also transcribed is the table duplicated as an image:
+    the figure is dropped and its caption folded into the real table."""
+
+    def test_table_figure_is_dropped_and_caption_folded(self) -> None:
+        md = (
+            "![image](image_1.png)540,77,810,887\n"
+            "TABLE 2 | Kinetic parameters for Lxmdh mutants.\n\n"
+            "<table>\n<thead><tr><th>Substrate</th><th>Vmax</th></tr></thead>\n"
+            "<tbody><tr><td>WT</td><td>302.7</td></tr></tbody>\n</table>"
+        )
+        html = _run_lighton([md])
+        assert "<figure" not in html
+        assert "data:image" not in html
+        assert "<table><caption>TABLE 2 | Kinetic parameters for Lxmdh mutants." in html
+
+    def test_table_figure_with_standalone_caption_block_is_dropped(self) -> None:
+        # The model often emits the "TABLE N" caption as its own block (not baked
+        # onto the placeholder line); the figure still gets caption=None, so the
+        # dedup must look past a standalone caption block to the <table> and drop
+        # the duplicate image, leaving the caption block to fold into the table.
+        md = (
+            "![image](image_1.png)540,77,810,887\n\n"
+            "TABLE 2 | Kinetic parameters for Lxmdh mutants.\n\n"
+            "<table>\n<thead><tr><th>Substrate</th><th>Vmax</th></tr></thead>\n"
+            "<tbody><tr><td>WT</td><td>302.7</td></tr></tbody>\n</table>"
+        )
+        html = _run_lighton([md])
+        assert "<figure" not in html
+        assert "data:image" not in html
+        assert "<table><caption>TABLE 2 | Kinetic parameters for Lxmdh mutants." in html
+
+    def test_pipe_caption_requires_title_not_bare_pipe(self) -> None:
+        # A stray pipe-delimited prose line ("Table 1 | 2 | 3") is not a caption and
+        # must not trigger the dedup drop of a genuinely adjacent figure.
+        from pdfparser.pipeline.text import _opens_with_table_label
+
+        assert _opens_with_table_label("TABLE 2 | Kinetic parameters for mutants.")
+        assert not _opens_with_table_label("Table 1 | 2 | 3")
+        assert not _opens_with_table_label("Table 2 | see column three for details")
+
+    def test_real_figure_before_table_is_kept(self) -> None:
+        # A genuine figure (a "FIGURE N" caption) that merely precedes a table must
+        # not be mistaken for a boxed table — its crop is still emitted.
+        md = (
+            "![image](image_1.png)100,100,400,400\n"
+            "FIGURE 3 | Activity assay results.\n\n"
+            "<table>\n<thead><tr><th>Substrate</th><th>Vmax</th></tr></thead>\n"
+            "<tbody><tr><td>WT</td><td>302.7</td></tr></tbody>\n</table>"
+        )
+        html = _run_lighton([md])
+        assert "<figure" in html
+        assert "FIGURE 3 | Activity assay results." in html
+
+
 class TestFigureFileOutput:
     """With an image directory, crops are written as sidecar PNGs and referenced
     by a relative path instead of inlined as base64."""
@@ -3263,23 +3319,31 @@ class TestTableLocalization:
     @staticmethod
     def _layout(
         lines: list[tuple[str, float | int, float | int]],
-    ) -> tuple[str, list[tuple[float, float, float, float] | None]]:
+    ) -> tuple[
+        str,
+        list[tuple[float, float, float, float] | None],
+        list[int | None],
+    ]:
         # Lay each (text, y_top, x_left) line out as fixed 6×8 pt glyph boxes,
         # spaces and the inter-line newline carrying a degenerate (None) box —
-        # mirroring how pdfium reports them.
+        # mirroring how pdfium reports them.  Every glyph is upright (rotation 0);
+        # the rotations list is index-aligned with the boxes.
         text = ""
         boxes: list[tuple[float, float, float, float] | None] = []
+        rotations: list[int | None] = []
         for i, (s, y_top, x_left) in enumerate(lines):
             if i:
                 text += "\n"
                 boxes.append(None)
+                rotations.append(None)
             x = float(x_left)
             top = float(y_top)
             for ch in s:
                 text += ch
                 boxes.append(None if ch == " " else (x, top - 8, x + 6, top))
+                rotations.append(None if ch == " " else 0)
                 x += 6
-        return text, boxes
+        return text, boxes, rotations
 
     def test_bbox_covers_table_rows_excludes_prose(self) -> None:
         from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
@@ -3296,12 +3360,19 @@ class TestTableLocalization:
             ("Discussion text begins here now", 600, 50),
             ("and continues across the page", 588, 50),
         ]
-        text, boxes = self._layout(lines)
+        text, boxes, rotations = self._layout(lines)
         norm, idx_map = _normalize_with_map(text)
-        bbox = _locate_bbox(
-            ["effect of edta on activity"], norm, idx_map, boxes, (400.0, 800.0)
+        located = _locate_bbox(
+            ["effect of edta on activity"],
+            norm,
+            idx_map,
+            boxes,
+            rotations,
+            (400.0, 800.0),
         )
-        assert bbox is not None
+        assert located is not None
+        bbox, rot = located
+        assert rot == 0
         left, bottom, right, top = bbox
         assert top >= 700 and bottom <= 644  # spans heading down to the "12 34 56" row
         assert bottom > 600  # the Discussion prose is excluded
@@ -3311,20 +3382,87 @@ class TestTableLocalization:
     def test_returns_none_when_no_anchor_matches(self) -> None:
         from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
 
-        text, boxes = self._layout([("Effect of EDTA on activity", 700, 50)])
+        text, boxes, rotations = self._layout([("Effect of EDTA on activity", 700, 50)])
         norm, idx_map = _normalize_with_map(text)
-        assert _locate_bbox(["nowhere"], norm, idx_map, boxes, (400.0, 800.0)) is None
+        assert (
+            _locate_bbox(["nowhere"], norm, idx_map, boxes, rotations, (400.0, 800.0))
+            is None
+        )
 
     def test_repeated_anchor_is_ambiguous_and_skipped(self) -> None:
         from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
 
         # "alpha beta" occurs twice, so it cannot seed the box on its own.
-        text, boxes = self._layout(
+        text, boxes, rotations = self._layout(
             [("alpha beta", 700, 50), ("filler here", 660, 50), ("alpha beta", 300, 50)]
         )
         norm, idx_map = _normalize_with_map(text)
-        bbox = _locate_bbox(["alpha beta"], norm, idx_map, boxes, (400.0, 800.0))
-        assert bbox is None
+        assert (
+            _locate_bbox(
+                ["alpha beta"], norm, idx_map, boxes, rotations, (400.0, 800.0)
+            )
+            is None
+        )
+
+    @staticmethod
+    def _vlayout(
+        strips: list[tuple[str, float | int, float | int]],
+        rot: int,
+    ) -> tuple[
+        str,
+        list[tuple[float, float, float, float] | None],
+        list[int | None],
+    ]:
+        # A sideways table: each reading "line" is a vertical column-strip at a
+        # fixed x whose glyphs advance *downward* in y, all rotated by ``rot``.
+        text = ""
+        boxes: list[tuple[float, float, float, float] | None] = []
+        rotations: list[int | None] = []
+        for i, (s, x_left, y_top) in enumerate(strips):
+            if i:
+                text += "\n"
+                boxes.append(None)
+                rotations.append(None)
+            x = float(x_left)
+            y = float(y_top)
+            for ch in s:
+                text += ch
+                boxes.append(None if ch == " " else (x, y - 8, x + 8, y))
+                rotations.append(None if ch == " " else rot)
+                y -= 8
+        return text, boxes, rotations
+
+    def test_sideways_table_located_on_reading_axis_excludes_prose(self) -> None:
+        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+
+        # A 270°-rotated table occupies three vertical column-strips on the right;
+        # an upright body heading sits in the left column.  Localization must run
+        # along the table's reading axis (left↔right over the strips) and exclude
+        # the upright prose, rather than sweeping it in via the old y-axis growth.
+        table_text, table_boxes, table_rot = self._vlayout(
+            [
+                ("methanol column", 200, 600),
+                ("3231605 6521198", 220, 600),
+                ("7778 5091 wt s1", 240, 600),
+            ],
+            rot=270,
+        )
+        body_text, body_boxes, body_rot = self._layout(
+            [("CONCLUSION", 600, 40), ("Development of methylotrophy", 588, 40)]
+        )
+        text = table_text + "\n" + body_text
+        boxes = table_boxes + [None] + body_boxes
+        rotations = table_rot + [None] + body_rot
+        norm, idx_map = _normalize_with_map(text)
+        located = _locate_bbox(
+            ["methanol column"], norm, idx_map, boxes, rotations, (400.0, 800.0)
+        )
+        assert located is not None
+        bbox, rot = located
+        assert rot == 270
+        left, bottom, right, top = bbox
+        assert left > 180  # the upright body column (x≈40) is excluded
+        assert left <= 200 and right >= 248  # spans the three table strips
 
 
 class TestCoverageGate:
@@ -3337,7 +3475,7 @@ class TestCoverageGate:
     ) -> tuple[str, list[tuple[float, float] | None]]:
         from pdfparser.pipeline.tables import _glyph_centers, _normalize_with_map
 
-        text, boxes = TestTableLocalization._layout(lines)
+        text, boxes, _ = TestTableLocalization._layout(lines)
         norm, idx_map = _normalize_with_map(text)
         return norm, _glyph_centers(norm, idx_map, boxes)
 
@@ -3670,3 +3808,36 @@ class TestFrontiersSidebarMetadata:
         # entry text.
         assert "<strong>Abbreviations:</strong>" in panel
         assert "<strong>Abbreviations:</strong>" not in body
+
+
+@pytest.mark.integration
+class TestFrontiersSidewaysTable:
+    """32117944.pdf Table 2 is printed sideways (rotated 270°) on the page.  The
+    model boxes it as a figure *and* mis-OCRs its column structure (4-wide alcohol
+    groups collapse to colspan=2), and the localizer's upright line model swept the
+    neighbouring "CONCLUSION" heading into the crop.  Rotation-aware re-OCR turns the
+    crop upright (correct colspans, no stray heading) and the figure/table dedup
+    drops the duplicate image, folding its caption into the real table."""
+
+    def test_table2_columns_span_four_each(self, frontiers_html: str) -> None:
+        # Each alcohol group (Methanol/Ethanol/n-Propanol) heads four measurement
+        # columns; the sideways mis-OCR collapsed them to colspan=2.
+        html = frontiers_html
+        assert html.count('colspan="4"') >= 3
+        for alcohol in ("Methanol", "Ethanol", "n-Propanol"):
+            assert f'colspan="4">{alcohol}' in html, f"{alcohol} not a 4-wide group"
+        # The mutant rows survive intact (the variant column is recovered, not lost).
+        for variant in ("WT", "S101V", "T141S", "A164F"):
+            assert f"<td>{variant}</td>" in html
+
+    def test_conclusion_not_folded_into_table(self, frontiers_html: str) -> None:
+        # CONCLUSION is the section heading after Table 2, not a table header row.
+        assert "CONCLUSION</th>" not in frontiers_html
+        assert "<h2>CONCLUSION</h2>" in frontiers_html
+
+    def test_table2_not_duplicated_as_figure(self, frontiers_html: str) -> None:
+        # The boxed-table image is dropped; the "TABLE 2" caption rides the real
+        # table as its <caption>, never a <figcaption>.
+        html = frontiers_html
+        assert "<caption>TABLE 2 | Kinetic parameters" in html
+        assert "<figcaption>TABLE 2" not in html

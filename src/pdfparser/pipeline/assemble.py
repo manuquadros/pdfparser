@@ -43,6 +43,7 @@ from pdfparser.pipeline.figures import (
 from pdfparser.pipeline.latex import _inline_md_to_html, _latex_to_html
 from pdfparser.pipeline.markdown import _md_to_html_blocks
 from pdfparser.pipeline.merge import (
+    _TABLE_OPEN_RE,
     _colocate_table_captions,
     _colocate_table_footnotes,
     _join_split_table_caption_labels,
@@ -54,6 +55,7 @@ from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_t
 from pdfparser.pipeline.text import (
     _looks_like_figure_caption,
     _opens_with_caption_label,
+    _opens_with_table_label,
     _visible_text,
 )
 
@@ -178,6 +180,64 @@ def _parse_page_blocks(md: str) -> list[_Block]:
     return blocks
 
 
+def _is_table_md(block: _Block | None) -> bool:
+    return isinstance(block, _MdBlock) and _TABLE_OPEN_RE.match(block.text) is not None
+
+
+def _is_table_caption_md(block: _Block | None) -> bool:
+    """A markdown block that is a free-standing "TABLE N …" caption (not the table
+    itself) — the form the model emits when it doesn't bake the caption onto the
+    figure placeholder line."""
+    return (
+        isinstance(block, _MdBlock)
+        and not _is_table_md(block)
+        and _opens_with_table_label(block.text)
+    )
+
+
+def _dedup_table_figures(blocks: list[_Block]) -> list[_Block]:
+    """Drop a figure that is really a table boxed as an image.
+
+    A model whose bbox head reads a sideways or graphical table as a picture emits
+    *both* a figure placeholder and the ``<table>`` it also transcribed, so the table
+    renders twice — once as a cropped image, once as the real table.  The figure is
+    the duplicate when an actual ``<table>`` follows it, optionally with the table's
+    "TABLE N …" caption in between (the model emits that caption either baked onto the
+    placeholder line — held on the ``_FigBlock`` — or as its own following block).
+
+    The image is dropped; the caption is preserved as a standalone block so
+    :func:`_colocate_table_captions` folds it into the real table as its
+    ``<caption>``.  When the caption already stands as its own block it is left in
+    place; only when it rode on the placeholder is it re-emitted."""
+    out: list[_Block] = []
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+        if isinstance(block, _FigBlock):
+            j = i + 1
+            standalone_caption = _is_table_caption_md(
+                blocks[j] if j < len(blocks) else None
+            )
+            if standalone_caption:
+                j += 1
+            baked_caption = (
+                block.caption
+                if block.caption is not None and _opens_with_table_label(block.caption)
+                else None
+            )
+            table_follows = _is_table_md(blocks[j] if j < len(blocks) else None)
+            if table_follows and (standalone_caption or baked_caption is not None):
+                if baked_caption is not None:
+                    # The caption rode on the placeholder line, not as its own block;
+                    # re-emit it so _colocate_table_captions can fold it in.
+                    out.append(_MdBlock(baked_caption))
+                i += 1  # drop the figure image; keep the caption/table blocks after it
+                continue
+        out.append(block)
+        i += 1
+    return out
+
+
 def _resolve_figure_clusters(
     blocks: list[_Block], image: Image.Image
 ) -> tuple[dict[int, tuple[int, int, int, int]], dict[int, str | None], set[int]]:
@@ -229,7 +289,7 @@ def _page_to_html_parts(
     lets the crop trim a caption the model baked into a text-bodied figure box.
     ``encode_image`` turns each crop into its ``<img src>`` (inline data URI by
     default; a sidecar PNG path when a file writer is supplied)."""
-    blocks = _parse_page_blocks(md)
+    blocks = _dedup_table_figures(_parse_page_blocks(md))
     box_at, caption_at, drop = _resolve_figure_clusters(blocks, image)
 
     parts: list[str] = []

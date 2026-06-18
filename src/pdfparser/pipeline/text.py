@@ -29,14 +29,18 @@ _FIGURE_CAPTION_RE = re.compile(r"^\*{0,2}(?:fig(?:ure|\.|\b)|scheme)", re.IGNOR
 # the "Table <id>" label a true caption is followed by punctuation, a
 # capitalised title word, or nothing — *not* a lowercase word, which marks a
 # running reference sentence ("Table 1 summarizes …") that must stay in the body.
-# Only "table"/"supplementary" are case-folded (OCR casing is unreliable); the
+# A pipe ("TABLE 2 | Kinetic parameters …") is the Frontiers caption separator, but
+# only when a title follows it — "Table 1 | 2 | 3" is a stray prose row, not a
+# caption — so the pipe branch carries the same capitalised-title requirement as the
+# space-separated one rather than accepting any character after the pipe.  Only
+# "table"/"supplementary" are case-folded (OCR casing is unreliable); the
 # capitalised-title test stays case-sensitive, as that is the whole signal.
 _TABLE_CAPTION_RE = re.compile(
     r"^\*{0,2}\s*"
     r"(?i:supp(?:l(?:ementary)?)?\.?\s+)?"
     r"(?i:table)\b\s*"
     r"\w+"
-    r"(?:\s*[.:)–—-]|\s+[A-Z(]|\s*\*{0,2}\s*$)"
+    r"(?:\s*[.:)–—-]|\s*\|\s*[A-Z(]|\s+[A-Z(]|\s*\*{0,2}\s*$)"
 )
 
 
@@ -83,3 +87,9 @@ def _opens_with_caption_label(text: str) -> bool:
     label must be recognised through the ``<strong>`` the model often wraps it
     in, which a raw match of ``_CAPTION_RE`` against the markdown would miss."""
     return bool(_CAPTION_RE.match(_visible_text(text).lstrip()))
+
+
+def _opens_with_table_label(text: str) -> bool:
+    """True when text's visible content opens with a *table* caption label
+    ("Table 2 …", "TABLE 2 | …") — the figure-caption case excluded."""
+    return bool(_TABLE_CAPTION_RE.match(_visible_text(text).lstrip()))
