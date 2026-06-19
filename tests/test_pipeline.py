@@ -1434,6 +1434,36 @@ class TestSplitFigureCaption:
         body = _body(_run_lighton([md], image=img))
         assert "(i) first the substrate binds" in body
 
+    def test_headerless_figure_does_not_absorb_panel_enumeration(self) -> None:
+        # A figure with no caption header must not absorb a following "(A) …" block
+        # (a body enumeration, or the next figure's caption): the fold only runs
+        # when a header was actually found.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "(A) We first cloned the gene; (B) then expressed it."
+        )
+        html = _run_lighton([md], image=img)
+        assert "<figcaption>" not in html
+        assert "(A) We first cloned the gene" in _body(html)
+
+    def test_panel_block_merged_with_heading_not_folded_whole(self) -> None:
+        # When the OCR merges a "(A) …" panel line with a following heading into one
+        # block (no blank separator), folding it whole would swallow the section, so
+        # the block is left in the body instead.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "FIG. 5 Overview.\n\n"
+            "(A) Panel description line.\n## Results\n\nKey findings below."
+        )
+        html = _run_lighton([md], image=img)
+        assert "<figcaption>FIG. 5 Overview.</figcaption>" in html
+        figcap = html[html.find("<figcaption>") : html.find("</figcaption>")]
+        assert "Results" not in figcap
+
 
 class TestFigureLabelPredicates:
     def test_bare_figure_label(self) -> None:
@@ -1453,6 +1483,143 @@ class TestFigureLabelPredicates:
         assert _is_panel_label("C.")
         assert not _is_panel_label("AB")
         assert not _is_panel_label("A nice sentence.")
+
+
+class TestRecoverDroppedFigures:
+    """Pure helpers for recovering a figure LightOnOCR drops whole from a page.
+
+    The model occasionally emits neither the ``![image]`` placeholder nor the
+    "Figure N" caption for a figure (the BSR 31123167 Figure 4 case); the gap in
+    the caption numbering is detected, the figure band re-OCR'd, and the recovered
+    placeholder remapped to page coordinates and spliced back in."""
+
+    def test_caption_labels_detected_references_ignored(self) -> None:
+        from pdfparser.pipeline.recover_figures import _emitted_figure_numbers
+
+        md = (
+            "Figure 1. Gene clusters and pathways\n\n"
+            "FIG 3\n\n"
+            "FIGURE 5 | Sequence alignment of the enzyme\n\n"
+            "**Figure 6.** Active site residues\n\n"
+            "As shown in Fig. 2, it was predicted that the rate\n\n"
+            "The interface resembles FucO (Figure 4A) and is stable."
+        )
+        # captions counted; in-prose references ("Fig. 2,", "(Figure 4A)") are not
+        assert _emitted_figure_numbers([md]) == {1, 3, 5, 6}
+
+    def test_gap_in_emitted_numbering(self) -> None:
+        from pdfparser.pipeline.recover_figures import _emitted_figure_numbers
+
+        pages = ["Figure 1. A", "Figure 2. B", "Figure 3. C", "Figure 5. E"]
+        assert _emitted_figure_numbers(pages) == {1, 2, 3, 5}
+
+    def test_extract_recovered_figure_folds_caption_stops_at_body(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        crop_md = (
+            "![image](image_1.png)210,50,865,440\n\n"
+            "Figure 4. Crystal structures of *BkTauF*\n\n"
+            "(A) Quaternary structure. (B) Subunit structure.\n\n"
+            "## Crystal structure of *BkTauF*\n\n"
+            "Crystal structures of *BkTauF* were solved at 1.9 Å."
+        )
+        result = _extract_recovered_figure(crop_md, 4)
+        assert result is not None
+        bbox, caption = result
+        assert bbox == (210, 50, 865, 440)
+        # the caption header and its panel description are folded; the body heading
+        # and prose the generous crop also captured are left out
+        assert caption.startswith("Figure 4. Crystal structures")
+        assert "(A) Quaternary structure" in caption
+        assert "Crystal structure of" not in caption.replace("Crystal structures", "")
+        assert "were solved" not in caption
+
+    def test_extract_recovered_figure_none_without_placeholder(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # a crop that re-OCR'd to no figure box recovers nothing (fail-safe)
+        no_box = "Figure 4. Crystal structures\n\nprose"
+        assert _extract_recovered_figure(no_box, 4) is None
+
+    def test_remap_full_width_region_keeps_x_offsets_y_into_band(self) -> None:
+        from pdfparser.pipeline.recover_figures import _remap_bbox_to_page
+
+        # full-width crop spanning the page's top band [y 600..800] of an 800-pt page;
+        # x stays as-is (full width), y maps into the band measured from the page top.
+        page_size = (600.0, 800.0)
+        region = (0.0, 600.0, 600.0, 800.0)  # left, bottom, right, top (PDF points)
+        # crop-relative box: top-left quarter of the crop
+        bbox = _remap_bbox_to_page((0, 0, 500, 500), region, page_size)
+        # x unchanged (0..500); y: crop top is page-top (0 from top) down half the
+        # 200-pt band → 100 pt from top → 125/1000
+        assert bbox == (0, 0, 500, 125)
+
+    def test_splice_top_figure_prepended(self) -> None:
+        from pdfparser.pipeline.recover_figures import _splice_figures_into_page
+
+        # caption near the top of an 800-pt page (cap_top 750) → figure prepended
+        out = _splice_figures_into_page("body prose", [(750.0, "FIGBLOCK")], 800.0)
+        assert out == "FIGBLOCK\n\nbody prose"
+
+    def test_splice_bottom_figure_appended(self) -> None:
+        from pdfparser.pipeline.recover_figures import _splice_figures_into_page
+
+        # caption low on the page (cap_top 200) → figure appended after the prose
+        out = _splice_figures_into_page("body prose", [(200.0, "FIGBLOCK")], 800.0)
+        assert out == "body prose\n\nFIGBLOCK"
+
+    def test_two_top_figures_keep_on_page_order(self) -> None:
+        from pdfparser.pipeline.recover_figures import _splice_figures_into_page
+
+        # both captions in the top half; the higher one (cap_top 760) must precede
+        # the lower (cap_top 700), not be reversed by sequential prepends
+        out = _splice_figures_into_page(
+            "body", [(700.0, "LOWER"), (760.0, "HIGHER")], 800.0
+        )
+        assert out == "HIGHER\n\nLOWER\n\nbody"
+
+    def test_top_and_bottom_figures_bracket_the_page(self) -> None:
+        from pdfparser.pipeline.recover_figures import _splice_figures_into_page
+
+        # one figure high (prepended), one low (appended) — body stays between them
+        out = _splice_figures_into_page(
+            "body", [(720.0, "TOP"), (120.0, "BOTTOM")], 800.0
+        )
+        assert out == "TOP\n\nbody\n\nBOTTOM"
+
+    def test_caption_already_present_detected_through_separator_variation(self) -> None:
+        from pdfparser.pipeline.recover_figures import _caption_already_present
+
+        recovered = "Figure 4. Crystal structures of BkTauF"
+        # the page emitted the same caption with an em-dash the label regex misses;
+        # NFKD folding collapses the separator difference so it's recognised
+        page = "<p>Figure 4 — Crystal structures of BkTauF (A) Quaternary…</p>"
+        assert _caption_already_present(recovered, page)
+        # absent from the page → not a duplicate, splice the caption normally
+        assert not _caption_already_present(recovered, "<p>unrelated prose</p>")
+
+    def test_caption_present_check_ignores_bare_label(self) -> None:
+        from pdfparser.pipeline.recover_figures import _caption_already_present
+
+        # a bare "Figure 4" folds too short to match, so an in-text reference like
+        # "(Figure 4A)" in the body never suppresses the recovered caption
+        assert not _caption_already_present("Figure 4.", "<p>see Figure 4A here</p>")
+
+    def test_column_bounds_full_width_for_single_column(self) -> None:
+        from pdfparser.pipeline.recover_figures import _column_bounds
+
+        # a body line spanning the page centre → single column → full width
+        cap_box = (40.0, 100.0, 300.0, 110.0)
+        lines = [(40.0, 50.0, 560.0, 60.0)]  # crosses mid (300) of a 600-pt page
+        assert _column_bounds(lines, cap_box, 110.0, 600.0) == (0.0, 600.0)
+
+    def test_column_bounds_clamps_to_caption_half_for_two_columns(self) -> None:
+        from pdfparser.pipeline.recover_figures import _column_bounds
+
+        # no body line crosses the centre → two columns; caption on the right half
+        cap_box = (320.0, 100.0, 560.0, 110.0)
+        lines = [(40.0, 50.0, 280.0, 60.0), (320.0, 50.0, 560.0, 60.0)]
+        assert _column_bounds(lines, cap_box, 110.0, 600.0) == (300.0, 600.0)
 
 
 class TestTableFigureDedup:
@@ -4342,6 +4509,23 @@ class TestBioscienceReportsRunningHeader:
         )
         assert in_figcaption
         assert f"<p>{panel}" not in _body(bsr_html)
+
+    def test_dropped_figure_4_recovered(self, bsr_html: str) -> None:
+        # The model drops Figure 4 entirely from page 7 — no ![image] placeholder
+        # and no "Figure 4" caption — and reproduces the omission on a whole-page
+        # re-OCR.  _recover_dropped_figures spots the gap in the caption numbering
+        # (1,2,3,_,5,6,7) against the text layer, re-OCRs a tight crop of the figure
+        # band, and splices the recovered figure back in.
+        size = _figure_size_by_caption(bsr_html, "Crystal structures of", _OUTPUT_DIR)
+        assert size is not None, "Figure 4 not recovered into the document"
+        # a real two-panel structural figure, not a sliver
+        assert size[0] > 400 and size[1] > 100, f"Figure 4 crop too small: {size}"
+        # the recovered caption lives only in its figcaption, not duplicated as body
+        # prose (the spliced figure block carries the caption with it)
+        body_no_figures = re.sub(
+            r"<figure>.*?</figure>", "", _body(bsr_html), flags=re.DOTALL
+        )
+        assert "Figure 4. Crystal structures" not in body_no_figures
 
 
 @pytest.fixture(scope="session")

@@ -44,6 +44,17 @@ _TABLE_CAPTION_RE = re.compile(
 )
 
 
+_BLOCK_SPLIT_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _split_md_blocks(md: str) -> list[str]:
+    """Split markdown into blocks on blank lines (a run of whitespace-only lines).
+
+    The single definition of "block" shared by the page-block parser and the
+    figure-recovery crop parser, so both segment a page identically."""
+    return _BLOCK_SPLIT_RE.split(md.strip())
+
+
 def _visible_text(html: str) -> str:
     """The text a reader sees: ``html`` with every tag removed."""
     return _STRIP_TAGS_RE.sub("", html)

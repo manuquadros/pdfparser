@@ -11,7 +11,6 @@ wires in rendering and OCR around it.
 from __future__ import annotations
 
 import html as _html
-import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,12 +50,14 @@ from pdfparser.pipeline.merge import (
     _merge_split_paragraphs_stable,
 )
 from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_model
+from pdfparser.pipeline.recover_figures import _recover_dropped_figures
 from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
 from pdfparser.pipeline.text import (
     _looks_like_figure_caption,
     _opens_with_caption_label,
     _opens_with_table_label,
+    _split_md_blocks,
     _visible_text,
 )
 
@@ -124,14 +125,20 @@ def _starts_figure(block: str) -> bool:
 
 
 def _is_caption_continuation(block: str) -> bool:
-    """A block that continues a bare figure label's caption: running prose, not the
-    start of a new structural element (another float, a heading, a table)."""
+    """A block that continues a caption: running prose, not the start of a new
+    structural element (another float, a heading, a table).
+
+    Every line is checked, not just the first: when the OCR merges a caption
+    paragraph with a following heading/table (no blank-line separator) into one
+    block, folding it whole onto the caption would swallow that section — so a
+    block carrying any such boundary line is not a clean continuation."""
     block = block.strip()
     if not block:
         return False
-    first = block.splitlines()[0].lstrip()
-    if _starts_figure(block) or first.startswith(("#", "|")):
-        return False
+    for line in block.splitlines():
+        s = line.lstrip()
+        if s.startswith(("#", "|", "<table")) or _parse_figure_placeholder(s):
+            return False
     return not _opens_with_caption_label(block)
 
 
@@ -144,7 +151,7 @@ def _parse_page_blocks(md: str) -> list[_Block]:
     rejoined onto it.  Lone single-letter panel labels the model split out of a
     multi-panel figure are dropped when they abut a placeholder."""
     blocks: list[_Block] = []
-    raw_blocks = re.split(r"\n[ \t]*\n", md.strip())
+    raw_blocks = _split_md_blocks(md)
     k = 0
     while k < len(raw_blocks):
         block = raw_blocks[k].strip()
@@ -178,12 +185,19 @@ def _parse_page_blocks(md: str) -> list[_Block]:
             caption = f"{caption} {raw_blocks[k].strip()}"
         # Multi-panel sub-descriptions the model split into their own paragraph(s)
         # ("(A) … (B) … (C) …") are caption text the OCR detached from the caption
-        # header, not body prose — fold each onto the caption (starting one if the
-        # figure had no header block of its own).
-        while k + 1 < len(raw_blocks) and _opens_with_panel_label(raw_blocks[k + 1]):
+        # header, not body prose — fold each onto the caption.  Only when a caption
+        # header was actually found (caption is not None): otherwise a headerless
+        # figure would absorb a genuine body enumeration, or the next figure's
+        # caption.  _is_caption_continuation keeps a panel block that merged with a
+        # following heading/table from being folded whole.
+        while (
+            caption is not None
+            and k + 1 < len(raw_blocks)
+            and _opens_with_panel_label(raw_blocks[k + 1])
+            and _is_caption_continuation(raw_blocks[k + 1])
+        ):
             k += 1
-            panel = raw_blocks[k].strip()
-            caption = f"{caption} {panel}" if caption else panel
+            caption = f"{caption} {raw_blocks[k].strip()}"
         blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
         k += 1
     return blocks
@@ -474,6 +488,7 @@ def lightonocr_pdf_to_html(
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
         pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_regions)
+        pages_md = _recover_dropped_figures(pdf_path, pages_md, ocr_region)
         encode_image = (
             _file_image_writer(image_dir) if image_dir is not None else _base64_src
         )
