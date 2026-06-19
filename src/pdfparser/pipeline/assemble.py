@@ -36,6 +36,7 @@ from pdfparser.pipeline.figures import (
     _file_image_writer,
     _is_bare_figure_label,
     _is_panel_label,
+    _opens_with_panel_label,
     _parse_figure_placeholder,
     _safe_crop,
     _union_box,
@@ -175,6 +176,14 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         ):
             k += 1
             caption = f"{caption} {raw_blocks[k].strip()}"
+        # Multi-panel sub-descriptions the model split into their own paragraph(s)
+        # ("(A) … (B) … (C) …") are caption text the OCR detached from the caption
+        # header, not body prose — fold each onto the caption (starting one if the
+        # figure had no header block of its own).
+        while k + 1 < len(raw_blocks) and _opens_with_panel_label(raw_blocks[k + 1]):
+            k += 1
+            panel = raw_blocks[k].strip()
+            caption = f"{caption} {panel}" if caption else panel
         blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
         k += 1
     return blocks

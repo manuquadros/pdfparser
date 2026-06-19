@@ -1400,6 +1400,40 @@ class TestSplitFigureCaption:
         assert "<figcaption>FIG. 3 Phylogenetic tree analysis.</figcaption>" in html
         assert "next body paragraph, not part of the caption" in _body(html)
 
+    def test_split_panel_descriptions_folded_into_caption(self) -> None:
+        # The model splits a full caption header and its "(A) … (B) … (C) …" panel
+        # descriptions into separate paragraphs; the panel block belongs to the
+        # figcaption, not the body.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "**Figure 1. Gene clusters and metabolic pathways**\n\n"
+            "(A) Gene clusters containing IsfD. (B) Pathways relying on the"
+            " isozymes. (C) The dissimilation pathway.\n\n"
+            "In this pathway, taurine is imported by a transporter."
+        )
+        html = _run_lighton([md], image=img)
+        cap = re.search(r"<figcaption>(.*?)</figcaption>", html, re.DOTALL).group(1)
+        assert "(A) Gene clusters containing IsfD." in cap
+        assert "(C) The dissimilation pathway." in cap
+        assert "<p>(A) Gene clusters containing IsfD" not in _body(html)
+        # the genuine body sentence after the panels stays in the body
+        assert "taurine is imported by a transporter" in _body(html)
+
+    def test_lowercase_roman_enumeration_not_folded(self) -> None:
+        # A body paragraph after a caption that opens with a lowercase roman
+        # enumeration "(i) …" is not a panel block (capital-only) and stays in body.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "FIG. 4 Reaction scheme.\n\n"
+            "(i) first the substrate binds, then (ii) the product is released."
+        )
+        body = _body(_run_lighton([md], image=img))
+        assert "(i) first the substrate binds" in body
+
 
 class TestFigureLabelPredicates:
     def test_bare_figure_label(self) -> None:
@@ -4296,6 +4330,18 @@ class TestBioscienceReportsRunningHeader:
         # author–year references, each its own <p>, not glued into one block
         refs = bsr_html[bsr_html.find("<h2>References</h2>") :]
         assert refs.count("<p>") >= 8
+
+    def test_split_panel_caption_folded_into_figure(self, bsr_html: str) -> None:
+        # The model splits Figure 1's "(A) … (B) … (C) …" panel descriptions into a
+        # paragraph separate from the caption header; they belong to the figcaption,
+        # not the body.
+        panel = "(A) Gene clusters containing the sulfoacetaldehyde reductases IsfD"
+        in_figcaption = any(
+            panel in c
+            for c in re.findall(r"<figcaption>(.*?)</figcaption>", bsr_html, re.DOTALL)
+        )
+        assert in_figcaption
+        assert f"<p>{panel}" not in _body(bsr_html)
 
 
 @pytest.fixture(scope="session")

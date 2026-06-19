@@ -54,6 +54,12 @@ _BARE_FIGURE_LABEL_RE = re.compile(
 # multi-panel figure as its own text block.  It belongs to the figure (baked into
 # the crop), not the prose, so it is dropped when adjacent to a figure placeholder.
 _PANEL_LABEL_RE = re.compile(r"^\(?[A-Z]\)?[.:]?$")
+# A multi-panel caption continuation the model split into its own paragraph,
+# opening with a parenthesised panel label and its description ("(A) Gene clusters
+# … (B) … (C) …").  This is caption text the model detached from the "Figure N …"
+# header, not body prose — body prose effectively never opens "(A) ".  Capital-only
+# so a lowercase roman enumeration in prose ("(i) … (ii) …") is not mistaken for it.
+_PANEL_DESC_RE = re.compile(r"^\([A-Z]\)\s")
 
 _MIN_FIGURE_HEIGHT = 50  # pixels — gaps smaller than this are not figures
 # The model's box often clips a figure's bottom or right edge.  Rather than pad
@@ -150,6 +156,12 @@ def _is_bare_figure_label(block: str) -> bool:
 def _is_panel_label(block: str) -> bool:
     """True when ``block`` is a lone single-letter panel label ("A", "(B)")."""
     return bool(_PANEL_LABEL_RE.match(block.strip()))
+
+
+def _opens_with_panel_label(block: str) -> bool:
+    """True when ``block`` opens with a panel label and its description ("(A) …") —
+    a multi-panel caption continuation the model split off the "Figure N" header."""
+    return bool(_PANEL_DESC_RE.match(block.strip()))
 
 
 def _base64_src(crop: Image.Image) -> str:
