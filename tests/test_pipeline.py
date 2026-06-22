@@ -2265,6 +2265,59 @@ class TestReferenceListMerge:
         assert any("designated Sphingomonas cells grown" in p for p in out)
 
 
+class TestNumberedReferenceConsolidation:
+    """Period-less numbered bibliography entries the OCR emits as plain <p> blocks
+    (because it dropped the markdown list period: "9 Peck …" not "9. Peck") are
+    folded into one <ol> so a reference list split across pages renders uniformly."""
+
+    def test_period_less_entries_extend_preceding_ol(self) -> None:
+        from pdfparser.pipeline.assemble import _consolidate_numbered_references
+
+        parts = [
+            "<h2>References</h2>",
+            "<ol>\n<li>\n<p>Fellman, J.H. (1980) A. doi:10.1/a</p>\n</li>\n</ol>",
+            "<p>9 Peck, S.C. (2019) B. doi:10.2/b</p>",
+            "<p>10 Xing, M. (2019) C. doi:10.3/c</p>",
+        ]
+        out = _consolidate_numbered_references(parts)
+        # one list, the loose entries appended as <li> with their leading number
+        # (which the <ol> renders itself) dropped
+        assert len(out) == 2
+        ol = out[1]
+        assert ol.count("<li>") == 3
+        assert "<p>Peck, S.C. (2019) B." in ol
+        assert "<p>9 Peck" not in ol
+        assert "<p>10 Xing" not in ol
+
+    def test_free_standing_run_wrapped_with_start(self) -> None:
+        from pdfparser.pipeline.assemble import _consolidate_numbered_references
+
+        # No preceding <ol> (the perioded entries were on an earlier page now gone):
+        # the run is wrapped in a new <ol start=N> so it renders from its real number.
+        parts = [
+            "<h2>References</h2>",
+            "<p>9 Peck, S.C. (2019) B. doi:10.2/b</p>",
+            "<p>10 Xing, M. (2019) C. doi:10.3/c</p>",
+        ]
+        out = _consolidate_numbered_references(parts)
+        assert len(out) == 2
+        assert out[1].startswith('<ol start="9">')
+        assert out[1].count("<li>") == 2
+
+    def test_numbered_paragraph_before_references_untouched(self) -> None:
+        from pdfparser.pipeline.assemble import _consolidate_numbered_references
+
+        # A numbered <p> in the body (before the References heading) is not a
+        # bibliography entry and must be left alone.
+        parts = [
+            "<p>9 Samples were collected from Site A and analyzed.</p>",
+            "<h2>References</h2>",
+            "<p>9 Peck, S.C. (2019) B. doi:10.2/b</p>",
+        ]
+        out = _consolidate_numbered_references(parts)
+        assert out[0] == "<p>9 Samples were collected from Site A and analyzed.</p>"
+
+
 class TestCaptionMergeBarrier:
     """A figure/table caption is never absorbed as a paragraph continuation,
     even across intervening floats and even when wrapped in <strong>."""
@@ -4502,16 +4555,18 @@ class TestBioscienceReportsRunningHeader:
         # The references continue onto a second page where the OCR drops the
         # markdown-list period from each marker ("9 Peck, …" not "9. Peck"), so the
         # entries arrive as plain <p>s that — each trailing off in a DOI rather than
-        # terminal punctuation — were chained into one ~5 kB paragraph.  Each entry
-        # must stay its own block.
+        # terminal punctuation — were chained into one ~5 kB paragraph.  They must be
+        # folded into the bibliography list, each its own item.
         refs = bsr_html[bsr_html.find("<h2>References</h2>") :]
-        ref_paras = re.findall(r"<p>.*?</p>", refs, re.DOTALL)
-        # one bibliography entry is a few hundred chars; the bug produced a single
-        # multi-thousand-char blob, so no entry paragraph may be that large
-        assert ref_paras, "no reference paragraphs found"
-        assert max(len(p) for p in ref_paras) < 1500
-        # a late entry from the continuation page is present as its own block
-        assert re.search(r"<p>\s*\d+\s+Suzek, B\.E\.", refs)
+        # no entry is left as a loose, period-less numbered <p> (the bug symptom)
+        assert not re.search(r"<p>\s*\d+\s+[A-Z][a-z]+,", refs)
+        # the entries render as list items, each its own <li>, not one giant blob
+        items = re.findall(r"<li>.*?</li>", refs, re.DOTALL)
+        assert len(items) >= 20
+        assert max(len(it) for it in items) < 1500
+        # a late continuation-page entry is folded into the list with its redundant
+        # leading number dropped (the <ol> renders the number itself)
+        assert re.search(r"<li>\s*<p>Suzek, B\.E\.", refs)
 
     def test_copyright_footer_stripped_from_body(self, bsr_html: str) -> None:
         # The full-sentence open-access footer ("© 2019 The Author(s). … Portland

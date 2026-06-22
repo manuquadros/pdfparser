@@ -11,6 +11,7 @@ wires in rendering and OCR around it.
 from __future__ import annotations
 
 import html as _html
+import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,9 @@ from pathlib import Path
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.classify import (
+    _REF_HEADING_RE,
     _REF_SECTION_RE,
+    _UNICODE_SUP_MARKER_RE,
     _classify_parts,
     _extract_front_matter,
     _extract_named_metadata_sections,
@@ -28,6 +31,7 @@ from pdfparser.pipeline.classify import (
 )
 from pdfparser.pipeline.figures import (
     _FIGURE_MERGE_GAP_FRAC,
+    _FIGURE_NOTE_RE,
     _base64_src,
     _cluster_figure_boxes,
     _denormalize_bbox,
@@ -142,19 +146,46 @@ def _is_caption_continuation(block: str) -> bool:
     return not _opens_with_caption_label(block)
 
 
-_CAPTION_TITLE_TERMINATORS = (".", "!", "?")
-
-
 def _is_title_only_figure_caption(caption: str) -> bool:
     """True for a figure caption that is just a "Figure N. Title" header carrying no
-    legend sentence of its own — it ends on the title (no terminal sentence
-    punctuation; the dot in "Figure 7." is internal).  Such a header means a
-    following prose block is the descriptive legend the OCR split off the caption,
-    not body text — distinct from a caption that already states its legend
-    ("…(C) … homologs of BkTauF."), after which a prose block is the body
-    resuming."""
+    legend sentence of its own — its title trails off on a word ("… close homologs
+    of *BkTauF*"), so the caption ends on an alphanumeric character.  Such a header
+    means a following prose block is the descriptive legend the OCR split off, not
+    body text.  A caption ending in *any* punctuation is treated as complete: a
+    period/!/? closes a legend sentence the caption already states, and a ")"/":"/","
+    closes a parenthetical or list ("… (maximum likelihood)") rather than trailing
+    off — after either, a prose block is the body resuming, which must not be folded
+    in.  Requiring an alphanumeric end (not merely "no sentence terminator") is what
+    keeps those punctuation-closed captions from absorbing the next paragraph."""
     text = caption.strip().rstrip("*").rstrip()
-    return bool(text) and text[-1] not in _CAPTION_TITLE_TERMINATORS
+    return bool(text) and text[-1].isalnum()
+
+
+# Footnote-marker symbols that open a stranded note ("† Present address …", "‡ These
+# authors contributed equally").  '*' is excluded — a '*'-led block is an italicised
+# organism/gene name opening a legend ("*Bk*TauF is shown in …"), not a footnote —
+# and '#' is already rejected as a heading by _is_caption_continuation.
+_LEGEND_FOOTNOTE_MARKERS = "†‡§¶"
+
+
+def _is_legend_continuation(block: str) -> bool:
+    """A block safe to fold onto a title-only figure caption: caption-continuation
+    prose that is not a stranded footnote or footer-metadata line.
+
+    The cross-page paragraph merge applies the same exclusions before it stitches a
+    fragment to its continuation (``_merge_split_paragraphs`` guards against leading
+    superscript / footnote markers and DOI/URL footer lines); the caption fold needs
+    them too, or a footnote, a "Downloaded from http://…" stamp, or a DOI line the
+    OCR dropped right after a title-only caption is baked into the figcaption and
+    never reaches the footnote-section / running-furniture routing downstream."""
+    if not _is_caption_continuation(block):
+        return False
+    head = block.strip()
+    return not (
+        _UNICODE_SUP_MARKER_RE.match(head)
+        or head[:1] in _LEGEND_FOOTNOTE_MARKERS
+        or _FIGURE_NOTE_RE.search(head)
+    )
 
 
 def _parse_page_blocks(md: str) -> list[_Block]:
@@ -225,7 +256,7 @@ def _parse_page_blocks(md: str) -> list[_Block]:
             and _looks_like_figure_caption(caption)
             and _is_title_only_figure_caption(caption)
             and k + 1 < len(raw_blocks)
-            and _is_caption_continuation(raw_blocks[k + 1])
+            and _is_legend_continuation(raw_blocks[k + 1])
         ):
             k += 1
             caption = f"{caption} {raw_blocks[k].strip()}"
@@ -406,6 +437,52 @@ def _insert_footnotes_before_refs(body: list[str], footnotes: list[str]) -> list
     return body[:ref_idx] + footnotes + body[ref_idx:]
 
 
+# A bibliography entry the OCR emitted as a plain <p> because it dropped the period
+# the markdown list needs ("<p>9 Peck, …</p>" not a "9." list item): a leading 1–3
+# digit number, optional list delimiter, then a capitalised author surname.  The
+# number and the entry text are captured so the number (which the <ol> renders
+# itself) can be dropped when the entry is re-attached as an <li>.
+_NUMBERED_REF_P_RE = re.compile(r"^<p>\s*(\d{1,3})[.)\]]?\s+([A-Z].*)</p>$", re.DOTALL)
+_OL_BLOCK_RE = re.compile(r"^<ol\b[^>]*>.*</ol>$", re.IGNORECASE | re.DOTALL)
+
+
+def _consolidate_numbered_references(parts: list[str]) -> list[str]:
+    """Fold period-less numbered reference entries into one ``<ol>``.
+
+    Markdown turns "1. Author …" into ``<ol><li>`` but leaves "9 Author …" — the
+    period dropped by OCR on a continuation page — a plain ``<p>``.  The references
+    merge guard keeps each such entry its own block; this pass then re-attaches a run
+    of them as ``<li>`` items (dropping the now-redundant leading number the ``<ol>``
+    renders itself), either extending an immediately preceding ``<ol>`` so the list
+    continues its numbering, or wrapping a free-standing run in a new ``<ol start=N>``.
+    Without it a bibliography split across pages renders as an ``<ol>`` for the first
+    entries followed by loose numbered paragraphs for the rest.  Scoped to the
+    references section so a numbered ``<p>`` run elsewhere in the body is untouched."""
+    ref_start = next((i for i, p in enumerate(parts) if _REF_HEADING_RE.match(p)), None)
+    if ref_start is None:
+        return parts
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        m = _NUMBERED_REF_P_RE.match(parts[i])
+        if i > ref_start and m is not None:
+            first_num = m.group(1)
+            items: list[str] = []
+            while i < len(parts) and (m := _NUMBERED_REF_P_RE.match(parts[i])):
+                items.append(f"<li>\n<p>{m.group(2).strip()}</p>\n</li>")
+                i += 1
+            body = "\n".join(items)
+            if out and _OL_BLOCK_RE.match(out[-1]):
+                prev = out[-1]
+                out[-1] = prev[: prev.rfind("</ol>")] + body + "\n</ol>"
+            else:
+                out.append(f'<ol start="{first_num}">\n{body}\n</ol>')
+            continue
+        out.append(parts[i])
+        i += 1
+    return out
+
+
 def _document_shell(
     *, title_html: str, byline_html: str, abstract: str, metadata: str, body: str
 ) -> str:
@@ -474,6 +551,7 @@ def _assemble_html(
 
     abstract = _merge_split_paragraphs_stable(meta.abstract)
     body = _merge_split_paragraphs_stable(_strip_running_furniture(meta.body))
+    body = _consolidate_numbered_references(body)
     body = _insert_footnotes_before_refs(body, meta.footnotes)
     leading_metadata, body = _extract_front_matter(body)
     metadata = leading_metadata + named_metadata + stray_metadata
