@@ -487,7 +487,6 @@ def _document_shell(
     *, title_html: str, byline_html: str, abstract: str, metadata: str, body: str
 ) -> str:
     title_safe = _html.escape(_visible_text(title_html))
-    byline_safe = _html.escape(byline_html)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -498,7 +497,7 @@ def _document_shell(
 <body>
 <header>
   <h1>{title_html}</h1>
-  <p>{byline_safe}</p>
+  <p>{byline_html}</p>
 </header>
 {abstract}
 {metadata}

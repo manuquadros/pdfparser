@@ -107,6 +107,15 @@ def _latex_command_to_unicode(command: str) -> str:
     return text
 
 
+# A literal '*'/'_' surviving a converted math span (an author footnote marker
+# like "1,*", or a multiplication "a*b") would be re-read as Markdown emphasis by
+# the downstream inline parser, which pairs two such characters and italicises the
+# text between them.  The span's emitted HTML (<sup>/<sub> tags, Unicode command
+# glyphs) carries neither character, so escaping the whole converted span to HTML
+# entities neutralises every residual marker without touching the structure.
+_MD_EMPHASIS_ESCAPE = str.maketrans({"*": "&#42;", "_": "&#95;"})
+
+
 def _to_superscript(core: str) -> str:
     if all(ch in _SUPERSCRIPT_MAP or ch.isspace() for ch in core):
         return "".join(_SUPERSCRIPT_MAP.get(ch, ch) for ch in core)
@@ -173,7 +182,8 @@ def _latex_span_to_html(content: str) -> str:
         lambda m: f"<sub>{m.group(1) if m.group(1) is not None else m.group(2)}</sub>",
         content,
     )
-    return content.replace("\\,", " ").replace("{", "").replace("}", "")
+    content = content.replace("\\,", " ").replace("{", "").replace("}", "")
+    return content.translate(_MD_EMPHASIS_ESCAPE)
 
 
 def _latex_to_html(text: str) -> str:

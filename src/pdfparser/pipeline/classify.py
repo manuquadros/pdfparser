@@ -678,8 +678,15 @@ def _looks_like_personal_name(plain: str) -> bool:
     )
 
 
+def _byline_html(inner: str) -> str:
+    """Authors as inline HTML, ``<br>``-separated affiliation runs joined with
+    "; ".  Superscript/marker tags are kept (rendered as superscripts in the
+    header), unlike ``_byline_text`` which flattens them for the byline predicate."""
+    return re.sub(r"<br\s*/?>", "; ", inner).strip()
+
+
 def _byline_text(inner: str) -> str:
-    return _visible_text(re.sub(r"<br\s*/?>", "; ", inner)).strip()
+    return _visible_text(_byline_html(inner)).strip()
 
 
 def _is_byline(inner: str) -> bool:
@@ -786,7 +793,7 @@ def _classify_parts(parts: list[str]) -> _Meta:
         if expect_byline:
             expect_byline = False
             if inner_p is not None and _is_byline(inner_p):
-                byline_html = _byline_text(inner_p)
+                byline_html = _byline_html(inner_p)
                 continue
         # A headingless abstract carried as an inline "ABSTRACT: …" bold label: strip
         # the label and route the paragraph to the abstract section, before it can be

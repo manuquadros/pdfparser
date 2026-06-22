@@ -473,6 +473,23 @@ class TestByline:
         assert "Nianyang Wu" in header
         assert "Nianyang Wu" not in _body(html)
 
+    def test_byline_superscript_markers_rendered_not_flattened(self) -> None:
+        md = (
+            "# T\n\nYan Zhou$^{1,*}$, Yifeng Wei$^{2,*}$, Huimin Zhao$^{2,3}$\n\n"
+            "## Abstract\n\nA."
+        )
+        html = _run_lighton([md])
+        header = html[html.find("<header>") : html.find("</header>")]
+        # the '*' footnote markers survive (not eaten by the markdown emphasis
+        # parser pairing the two adjacent asterisks) and stay superscripts
+        assert "<sup>1,*</sup>" in header
+        assert "<sup>2,*</sup>" in header
+        # a multi-digit affiliation marker renders as a superscript, not flat text
+        assert "<sup>2,3</sup>" in header
+        # no stray emphasis injected, and no double-comma from a suppressed marker
+        assert "<em>" not in header
+        assert ",," not in header
+
 
 class TestDegenerateRepetition:
     """A figure the model fails to box can be OCRed into a repeated-token wall;
@@ -2993,6 +3010,22 @@ class TestLatexToHtml:
 
         assert _latex_to_html("pH$^{S}$") == "pH<sup>S</sup>"
 
+    def test_footnote_marker_asterisk_escaped_for_markdown(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A '*' inside an author superscript ("1,*") is emitted as an HTML entity
+        # so the downstream Markdown inline parser does not read it as emphasis and
+        # pair it with the next author's marker (eating both).
+        assert _latex_to_html("Zhou$^{1,*}$") == "Zhou<sup>1,&#42;</sup>"
+
+    def test_literal_asterisk_in_math_span_escaped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A '*' *outside* the sub/superscript but inside a converted span (a
+        # multiplication) is escaped too, so two of them are not paired into
+        # emphasis by the markdown parser ("a²<em>b</em>c²").
+        assert _latex_to_html("$a^2*b*c^2$") == "a²&#42;b&#42;c²"
+
     def test_ratio_of_kinetic_constants(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
@@ -4585,6 +4618,18 @@ class TestBioscienceReportsRunningHeader:
         # a late continuation-page entry is folded into the list with its redundant
         # leading number dropped (the <ol> renders the number itself)
         assert re.search(r"<li>\s*<p>Suzek, B\.E\.", refs)
+
+    def test_author_markers_rendered_as_superscripts_in_byline(
+        self, bsr_html: str
+    ) -> None:
+        # The author markers ("1,*", "2,3") render as superscripts in the byline,
+        # not flattened to inline text; the markdown emphasis parser must not eat
+        # the "*" markers (which corrupted "1,*" into "1,," — the bug symptom).
+        header = bsr_html[bsr_html.find("<header>") : bsr_html.find("</header>")]
+        byline = header[header.find("<p>") :]
+        assert "<sup>" in byline
+        assert "<em>" not in byline
+        assert ",," not in byline
 
     def test_author_contribution_footnote_in_metadata_panel(
         self, bsr_html: str
