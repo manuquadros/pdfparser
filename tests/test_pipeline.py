@@ -130,6 +130,38 @@ class TestOcrSeam:
         with pytest.raises(RuntimeError, match="unexpected OCR response"):
             _ocr_page(_fake_image(8, 8), ocr)
 
+    def test_ocr_page_null_choices_raises_runtime_error(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        # "choices": null is a null-valued key (None[0] -> TypeError), not a missing
+        # one; it must still surface as the clear "unexpected OCR response" error.
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"choices": None})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        with pytest.raises(RuntimeError, match="unexpected OCR response"):
+            _ocr_page(_fake_image(8, 8), ocr)
+
+    def test_ocr_page_non_string_content_raises(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        # Structured (non-null, non-string) content — e.g. OpenAI content parts —
+        # is a response the pipeline can't consume; fail loudly rather than silently
+        # transcribe the page as empty.
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {"choices": [{"message": {"content": [{"text": "x"}]}}]}
+            return httpx.Response(200, json=body)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        with pytest.raises(RuntimeError, match="unexpected OCR content type"):
+            _ocr_page(_fake_image(8, 8), ocr)
+
     def test_ocr_pages_preserves_order_under_concurrency(self) -> None:
         import json
 
@@ -155,6 +187,20 @@ class TestOcrSeam:
 
         assert result == [f"page-{w}" for w in range(10, 18)]
 
+    def test_ocr_pages_empty_input_returns_empty(self) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_pages
+
+        # No images → no requests, no thread pool; returns [] without touching the
+        # client (a handler that would fail the test if called).
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+            raise AssertionError("no request should be issued for empty input")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        assert _ocr_pages([], ocr) == []
+
     def test_ocr_pages_propagates_page_error(self) -> None:
         import httpx
 
@@ -178,6 +224,83 @@ class TestOcrSeam:
         with OcrModel(client=client, base_url="http://srv/v1", model="m") as ocr:
             assert not ocr.client.is_closed
         assert client.is_closed
+
+    @staticmethod
+    def _patch_client(monkeypatch: pytest.MonkeyPatch, handler: object) -> list[object]:
+        """Make ``model.load_ocr_model``'s internal ``httpx.Client(...)`` use a mock
+        transport; return the list of clients it builds so a test can assert on the
+        pool's lifecycle."""
+        import httpx
+
+        from pdfparser.pipeline import model
+
+        built: list[object] = []
+        real_client = httpx.Client
+
+        def fake_client(**kwargs: object) -> httpx.Client:
+            client = real_client(transport=httpx.MockTransport(handler), **kwargs)
+            built.append(client)
+            return client
+
+        monkeypatch.setattr(model.httpx, "Client", fake_client)
+        return built
+
+    def test_load_ocr_model_probes_models_and_strips_trailing_slash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json={"data": []})
+
+        self._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1/", model="m")
+        # the trailing slash is stripped and the reachability probe hits /models
+        assert seen["url"] == "http://srv/v1/models"
+        assert ocr.base_url == "http://srv/v1"
+        assert ocr.model == "m"
+        ocr.close()
+
+    def test_load_ocr_model_reads_env_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        monkeypatch.setenv("PDFPARSER_VLLM_URL", "http://envhost:9/v1")
+        monkeypatch.setenv("PDFPARSER_VLLM_MODEL", "envmodel")
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            return httpx.Response(200)
+
+        self._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model()
+        assert seen["url"] == "http://envhost:9/v1/models"
+        assert ocr.model == "envmodel"
+        ocr.close()
+
+    def test_load_ocr_model_closes_client_when_probe_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        built = self._patch_client(
+            monkeypatch, lambda request: httpx.Response(503, json={"error": "down"})
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            load_ocr_model(base_url="http://srv/v1")
+        # the probe failed, so the pool must be torn down rather than leaked
+        assert built and built[0].is_closed  # type: ignore[attr-defined]
 
 
 def _body(html: str) -> str:
@@ -233,6 +356,131 @@ def _metadata(html: str) -> str:
     start = html.find("<details class='metadata'>")
     assert start >= 0, "metadata panel not found"
     return html[start : html.find("</details>", start)]
+
+
+class TestOcrConcurrencyResolution:
+    """``PDFPARSER_OCR_CONCURRENCY`` parsing — defaulting, flooring, and the
+    misconfiguration warning — without spinning up the thread pool."""
+
+    def test_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_OCR_CONCURRENCY,
+            _resolve_ocr_concurrency,
+        )
+
+        monkeypatch.delenv("PDFPARSER_OCR_CONCURRENCY", raising=False)
+        assert _resolve_ocr_concurrency() == _DEFAULT_OCR_CONCURRENCY
+
+    def test_valid_integer_is_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline.model import _resolve_ocr_concurrency
+
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "7")
+        assert _resolve_ocr_concurrency() == 7
+
+    def test_floored_at_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline.model import _resolve_ocr_concurrency
+
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "0")
+        assert _resolve_ocr_concurrency() == 1
+
+    def test_non_integer_warns_and_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_OCR_CONCURRENCY,
+            _resolve_ocr_concurrency,
+        )
+
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "lots")
+        # a misconfigured deployment is surfaced, not silently defaulted
+        with pytest.warns(UserWarning, match="not an integer"):
+            assert _resolve_ocr_concurrency() == _DEFAULT_OCR_CONCURRENCY
+
+
+class TestCli:
+    """The ``python -m pdfparser`` entry point: output-path defaulting and option
+    forwarding, with the conversion itself stubbed (no model, no rendering)."""
+
+    @staticmethod
+    def _make_pdf(tmp_path: Path) -> Path:
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        return pdf
+
+    def test_default_output_path_derived_from_pdf_suffix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import pdfparser.__main__ as cli
+
+        pdf = self._make_pdf(tmp_path)
+        captured: dict[str, object] = {}
+
+        def fake_convert(p: Path, **kwargs: object) -> str:
+            captured["pdf"] = p
+            captured["kwargs"] = kwargs
+            return "<html>ok</html>"
+
+        monkeypatch.setattr(cli, "lightonocr_pdf_to_html", fake_convert)
+        assert cli.main([str(pdf)]) == 0
+        # default output is the input path with a .html suffix
+        out = (tmp_path / "paper.html").read_text(encoding="utf-8")
+        assert out == "<html>ok</html>"
+        assert captured["pdf"] == pdf
+        assert captured["kwargs"] == {
+            "base_url": None,
+            "model": None,
+            "image_dir": None,
+        }
+
+    def test_explicit_output_and_options_forwarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import pdfparser.__main__ as cli
+
+        pdf = self._make_pdf(tmp_path)
+        out = tmp_path / "custom.html"
+        image_dir = tmp_path / "imgs"
+        captured: dict[str, object] = {}
+
+        def fake_convert(p: Path, **kwargs: object) -> str:
+            captured.update(kwargs)
+            return "<html></html>"
+
+        monkeypatch.setattr(cli, "lightonocr_pdf_to_html", fake_convert)
+        rc = cli.main(
+            [
+                str(pdf),
+                str(out),
+                "--vllm-url",
+                "http://h/v1",
+                "--vllm-model",
+                "m",
+                "--image-dir",
+                str(image_dir),
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == "<html></html>"
+        assert captured["base_url"] == "http://h/v1"
+        assert captured["model"] == "m"
+        assert captured["image_dir"] == image_dir
+
+    def test_missing_pdf_errors_before_conversion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import pdfparser.__main__ as cli
+
+        called: list[int] = []
+        monkeypatch.setattr(
+            cli,
+            "lightonocr_pdf_to_html",
+            lambda *a, **k: called.append(1) or "",
+        )
+        # argparse's parser.error exits with code 2 and the convert is never reached
+        with pytest.raises(SystemExit) as exc:
+            cli.main([str(tmp_path / "absent.pdf")])
+        assert exc.value.code == 2
+        assert not called
 
 
 class TestArticlePageDetection:
@@ -1752,6 +2000,78 @@ class TestDenormalizeBbox:
             500,
             1000,
         )
+
+
+class TestDegenerateInputs:
+    """The OCR is non-deterministic and can emit malformed shapes (out-of-bounds /
+    inverted / zero-area figure boxes, empty pages); the render-free core must
+    degrade gracefully — clamp or drop the crop, never crash."""
+
+    def _assemble(self, md: str, w: int = 1190, h: int = 1540) -> str:
+        from pdfparser.pipeline.assemble import _assemble_html
+
+        return _assemble_html([md], [Image.new("RGB", (w, h))])
+
+    def test_empty_page_list_yields_shell(self) -> None:
+        from pdfparser.pipeline.assemble import _assemble_html
+
+        html = _assemble_html([], [])
+        assert html.startswith("<!DOCTYPE html>")
+        assert "<body>" in html
+
+    def test_blank_and_whitespace_pages_do_not_crash(self) -> None:
+        for md in ("", "   \n\n  \t"):
+            assert "<body>" in self._assemble(md)
+
+    def test_out_of_bounds_figure_box_is_clamped(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        crop = _safe_crop(_fake_image(100, 100), (0, 0, 5000, 5000))
+        assert crop is not None and crop.size == (100, 100)
+
+    def test_inverted_figure_box_is_dropped(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        # x1 < x0 / y1 < y0 -> negative area < the minimum, so no crop is produced.
+        assert _safe_crop(_fake_image(100, 100), (90, 90, 10, 10)) is None
+
+    def test_zero_area_figure_box_is_dropped(self) -> None:
+        from pdfparser.pipeline.figures import _safe_crop
+
+        assert _safe_crop(_fake_image(100, 100), (50, 50, 50, 50)) is None
+
+    def test_negative_coords_not_parsed_as_placeholder(self) -> None:
+        from pdfparser.pipeline.figures import _parse_figure_placeholder
+
+        # the bbox grammar is unsigned, so a negative coordinate is simply "not a
+        # figure placeholder" rather than a crash or a bogus negative box
+        assert _parse_figure_placeholder("![image](i.png)-5,0,100,100") is None
+
+    def test_out_of_bounds_placeholder_assembles_without_crash(self) -> None:
+        md = "# T\n\n![image](i.png)0,0,1500,1500\n\n## Abstract\n\nThe abstract."
+        html = self._assemble(md)
+        # the figure crop is produced (clamped) and no prose is lost
+        assert "<figure>" in html
+        assert "The abstract." in html
+
+    def test_figure_box_larger_than_tiny_image_does_not_crash(self) -> None:
+        from pdfparser.pipeline.assemble import _assemble_html
+
+        html = _assemble_html(
+            ["![image](i.png)0,0,1000,1000"], [Image.new("RGB", (3, 3))]
+        )
+        assert "<body>" in html
+
+    def test_unterminated_latex_span_passes_through(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # an unmatched "$" is left verbatim (no span conversion, no exception)
+        assert _latex_to_html("mass $^{1,*") == "mass $^{1,*"
+
+    def test_unclosed_table_html_does_not_crash(self) -> None:
+        from pdfparser.pipeline.markdown import _md_to_html_blocks
+
+        assert _md_to_html_blocks("<table><tr><td>x") == ["<table><tr><td>x"]
 
 
 class TestFigureBoxMerge:

@@ -124,12 +124,20 @@ def _ocr_page(
     payload = response.json()
     try:
         content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
+    except (KeyError, IndexError, TypeError) as exc:
+        # TypeError covers a null-valued key ("choices": null -> None[0]), not just
+        # a missing one, so a malformed shape always surfaces as this clear error.
         raise RuntimeError(f"unexpected OCR response shape: {payload}") from exc
-    # A degenerate page can yield null/empty content; return "" (as the former
-    # in-process decode did) rather than tripping the str return contract.
-    text: str = content or ""
-    return text
+    # A degenerate page yields null content; return "" (as the former in-process
+    # decode did) rather than tripping the str return contract.  A non-string,
+    # non-null content is a structurally different response (e.g. OpenAI content
+    # parts) the pipeline can't consume — fail loudly rather than silently drop the
+    # page's text as empty.
+    if content is None:
+        return ""
+    if not isinstance(content, str):
+        raise RuntimeError(f"unexpected OCR content type: {payload}")
+    return content
 
 
 def _resolve_ocr_concurrency() -> int:
