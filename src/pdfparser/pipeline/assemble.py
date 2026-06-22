@@ -142,6 +142,21 @@ def _is_caption_continuation(block: str) -> bool:
     return not _opens_with_caption_label(block)
 
 
+_CAPTION_TITLE_TERMINATORS = (".", "!", "?")
+
+
+def _is_title_only_figure_caption(caption: str) -> bool:
+    """True for a figure caption that is just a "Figure N. Title" header carrying no
+    legend sentence of its own — it ends on the title (no terminal sentence
+    punctuation; the dot in "Figure 7." is internal).  Such a header means a
+    following prose block is the descriptive legend the OCR split off the caption,
+    not body text — distinct from a caption that already states its legend
+    ("…(C) … homologs of BkTauF."), after which a prose block is the body
+    resuming."""
+    text = caption.strip().rstrip("*").rstrip()
+    return bool(text) and text[-1] not in _CAPTION_TITLE_TERMINATORS
+
+
 def _parse_page_blocks(md: str) -> list[_Block]:
     """Split a page's markdown into an ordered stream of prose and figure blocks.
 
@@ -194,6 +209,22 @@ def _parse_page_blocks(md: str) -> list[_Block]:
             caption is not None
             and k + 1 < len(raw_blocks)
             and _opens_with_panel_label(raw_blocks[k + 1])
+            and _is_caption_continuation(raw_blocks[k + 1])
+        ):
+            k += 1
+            caption = f"{caption} {raw_blocks[k].strip()}"
+        # A legend the OCR split after the "Figure N. Title" header — a plain
+        # descriptive sentence, not a "(A) …" panel run — is folded onto a
+        # title-only caption.  Stranded between its figure and the paragraph the
+        # figure interrupts, such a legend otherwise reads as body prose that the
+        # cross-page merge glues onto the previous column.  Gated on a title-only
+        # caption so a figure whose legend the caption already states does not also
+        # absorb the body resuming after it.
+        if (
+            caption is not None
+            and _looks_like_figure_caption(caption)
+            and _is_title_only_figure_caption(caption)
+            and k + 1 < len(raw_blocks)
             and _is_caption_continuation(raw_blocks[k + 1])
         ):
             k += 1

@@ -56,6 +56,16 @@ _FUNCTION_WORD_END_RE = re.compile(
 # first token (an ordinary sentence-opening word is capitalized only on its first
 # letter), which also subsumes the all-caps acronym case.
 _MIDSENTENCE_HEAD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*[A-Z]")
+# A numbered bibliography entry whose marker the OCR left *without* the trailing
+# period markdown needs to list-ify it ("9 Peck, S.C., …" not "9. Peck"): a small
+# leading integer (optionally with a list delimiter or brackets) followed by a
+# capitalised author surname.  Such an entry is a plain <p> that — like every
+# entry, trailing off in a DOI rather than terminal punctuation — would otherwise
+# be merged onto the previous one; in the references section it marks a new entry
+# just as a capital-led continuation does.  The required capital after the number
+# keeps a genuinely wrapped entry that resumes with a figure ("…, 2016, 12, …")
+# from matching.
+_NUMBERED_REF_HEAD_RE = re.compile(r"^\[?\d{1,3}[.)\]]?\s+[A-Z]")
 # A column/page break can strand a paragraph's continuation behind a whole float
 # cluster — observed as two figures plus a table between the two halves — so the
 # skip window must clear such a cluster.  The grammatical guards below (the
@@ -222,8 +232,16 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         # next bibliography entry (author surname), even one with an
                         # internal capital ("McKenzie", "DeForest"); only a lowercase
                         # continuation is a genuinely wrapped entry, so no mid-sentence
-                        # exception applies here.
-                        and not (i >= ref_start and cont_head[:1].isupper())
+                        # exception applies here.  A period-less numbered marker
+                        # ("9 Peck, …") opens a new entry too but leads with its digit,
+                        # not a capital, so it is matched explicitly.
+                        and not (
+                            i >= ref_start
+                            and (
+                                cont_head[:1].isupper()
+                                or _NUMBERED_REF_HEAD_RE.match(cont_head)
+                            )
+                        )
                     ):
                         joined = _dehyphenate_join(stripped, cont)
                         out.append(f"<p>{joined}</p>")

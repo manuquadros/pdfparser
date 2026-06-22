@@ -425,7 +425,15 @@ _BOLD_LABEL_EITHER_COLON_RE = re.compile(
 # Running header/footer: a short, terminal-punctuation-free line that recurs
 # across pages.  Page numbers vary per page, so they are stripped before the
 # recurrence is counted (e.g. "Biotechnology … 601" / "… 602" share a key).
-_FURNITURE_MAX_LEN = 120
+# The cap only bounds which lines are *considered*; the recurrence guards (a
+# candidate must repeat, a sentence-terminated one at least
+# _SENTENCE_LIKE_FURNITURE_MIN_REPEAT times) are what actually distinguish
+# furniture from prose.  It must clear a
+# full-sentence open-access/copyright footer ("© 2019 The Author(s). … (CC BY).",
+# ~200 chars) and a gutter download stamp ("Downloaded from http://…/…​.pdf by
+# guest on …"), both of which recur on every page and otherwise break the
+# cross-page paragraph merge by gluing onto the prose they interrupt.
+_FURNITURE_MAX_LEN = 256
 _DIGITS_RE = re.compile(r"\d+")
 # A footer/header is identified by its digit-stripped text recurring across
 # pages ("… 601" / "… 602" share a key).  When the line carries digits, require

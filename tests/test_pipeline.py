@@ -4498,6 +4498,55 @@ class TestBioscienceReportsRunningHeader:
         refs = bsr_html[bsr_html.find("<h2>References</h2>") :]
         assert refs.count("<p>") >= 8
 
+    def test_continuation_page_references_not_one_block(self, bsr_html: str) -> None:
+        # The references continue onto a second page where the OCR drops the
+        # markdown-list period from each marker ("9 Peck, …" not "9. Peck"), so the
+        # entries arrive as plain <p>s that — each trailing off in a DOI rather than
+        # terminal punctuation — were chained into one ~5 kB paragraph.  Each entry
+        # must stay its own block.
+        refs = bsr_html[bsr_html.find("<h2>References</h2>") :]
+        ref_paras = re.findall(r"<p>.*?</p>", refs, re.DOTALL)
+        # one bibliography entry is a few hundred chars; the bug produced a single
+        # multi-thousand-char blob, so no entry paragraph may be that large
+        assert ref_paras, "no reference paragraphs found"
+        assert max(len(p) for p in ref_paras) < 1500
+        # a late entry from the continuation page is present as its own block
+        assert re.search(r"<p>\s*\d+\s+Suzek, B\.E\.", refs)
+
+    def test_copyright_footer_stripped_from_body(self, bsr_html: str) -> None:
+        # The full-sentence open-access footer ("© 2019 The Author(s). … Portland
+        # Press Limited … (CC BY).") repeats on every page; the OCR emits it inline,
+        # where — lacking it as furniture — the cross-page merge glued it onto the
+        # prose it interrupts.  It must be stripped as running furniture, not appear
+        # in the body.
+        assert "Portland Press Limited" not in _body(bsr_html)
+
+    def test_download_gutter_stamp_stripped(self, bsr_html: str) -> None:
+        # The rotated "Downloaded from http://portlandpress.com/…​.pdf by guest on …"
+        # stamp running up the gutter likewise recurs (differing only in digits) and
+        # must not survive in the body breaking a paragraph.
+        assert "Downloaded from" not in _body(bsr_html)
+        assert "portlandpress.com/bioscience" not in _body(bsr_html)
+
+    def test_cross_page_paragraph_merges_past_figure_legend(
+        self, bsr_html: str
+    ) -> None:
+        # With the interrupting footer gone, the Discussion paragraph split across
+        # the page break ("… (only 28% identity)," / "and putative substrate-binding
+        # …") must rejoin — stepping over the two figures between its halves — rather
+        # than glue onto Figure 7's legend, which the OCR stranded as a loose <p>
+        # after the title-only "Figure 7. …" caption.
+        body = _body(bsr_html)
+        assert "(only 28% identity), and putative substrate-binding" in body
+        # the stranded legend belongs in the figcaption, not the body
+        legend = "Many of the close homologs of"
+        in_figcaption = any(
+            legend in c
+            for c in re.findall(r"<figcaption>(.*?)</figcaption>", bsr_html, re.DOTALL)
+        )
+        assert in_figcaption
+        assert f"<p>{legend}" not in body
+
     def test_split_panel_caption_folded_into_figure(self, bsr_html: str) -> None:
         # The model splits Figure 1's "(A) … (B) … (C) …" panel descriptions into a
         # paragraph separate from the caption header; they belong to the figcaption,
