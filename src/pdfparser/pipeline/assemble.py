@@ -55,6 +55,7 @@ from pdfparser.pipeline.merge import (
     _merge_split_paragraphs_stable,
 )
 from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_model
+from pdfparser.pipeline.reconcile import _reconcile_text_layer
 from pdfparser.pipeline.recover_figures import _recover_dropped_figures
 from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
@@ -599,6 +600,11 @@ def lightonocr_pdf_to_html(
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
         pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_regions)
         pages_md = _recover_dropped_figures(pdf_path, pages_md, ocr_region)
+        # Recover short tails the OCR truncated, from the PDF text layer.  Runs
+        # *after* table/figure recovery so an appended tail can neither feed the
+        # table coverage gate's adjacent-token check nor make a figure number look
+        # already-emitted.  No-op on a PDF without a usable text layer.
+        pages_md = _reconcile_text_layer(pdf_path, pages_md)
         encode_image = (
             _file_image_writer(image_dir) if image_dir is not None else _base64_src
         )
