@@ -1120,6 +1120,24 @@ class TestLightonAssembly:
             "<p>Published online 28 December 2018 in Wiley Online Library "
             "(wileyonlinelibrary.com)</p>"
         )
+        # An author-contribution footnote ("These authors contributed equally …")
+        # the OCR stranded among body paragraphs is relocated — the clause closing
+        # the block (bare, or trailing "to this work/study/…") is the discriminator.
+        assert _is_stray_metadata(
+            "<p><em>These authors contributed equally to this work.</em></p>"
+        )
+        assert _is_stray_metadata("<p>D.L. and J.H. contributed equally.</p>")
+        assert _is_stray_metadata("<p>All authors contributed equally to the study</p>")
+        # Body prose that runs the phrase mid-sentence onto a non-publication object
+        # is not a footnote and stays in the body.
+        assert not _is_stray_metadata(
+            "<p>The two catalytic domains contributed equally to substrate "
+            "binding across the assayed pH range.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p>Both pathways contributed equally to this increase in metabolic "
+            "flux under anaerobic conditions.</p>"
+        )
         # A recognised journal-metadata bold label is relocated on the label alone,
         # even with no metadata token and even when the value runs long.
         assert _is_stray_metadata(
@@ -4567,6 +4585,15 @@ class TestBioscienceReportsRunningHeader:
         # a late continuation-page entry is folded into the list with its redundant
         # leading number dropped (the <ol> renders the number itself)
         assert re.search(r"<li>\s*<p>Suzek, B\.E\.", refs)
+
+    def test_author_contribution_footnote_in_metadata_panel(
+        self, bsr_html: str
+    ) -> None:
+        # "These authors contributed equally to this work." is an author footnote
+        # the OCR stranded among the Introduction paragraphs; it belongs in the
+        # Metadata panel, not the body.
+        assert "contributed equally" not in _body(bsr_html)
+        assert "contributed equally" in _metadata(bsr_html)
 
     def test_copyright_footer_stripped_from_body(self, bsr_html: str) -> None:
         # The full-sentence open-access footer ("© 2019 The Author(s). … Portland

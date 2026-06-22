@@ -310,18 +310,27 @@ _METADATA_TOKEN_RE = re.compile(
 )
 # Footer-metadata line shapes that carry fewer than two countable tokens yet are
 # unambiguous on their own: a supporting-information note, a "DOI 10.…" line, a
-# "Published online …" line, or a "Volume N, … Pages N" journal citation.  The
-# OCR often splits a journal's page-bottom block into such one-line pieces, so
+# "Published online …" line, a "Volume N, … Pages N" journal citation, or an
+# author-contribution footnote ("These authors contributed equally to this work").
+# The OCR often splits a journal's page-bottom block into such one-line pieces, so
 # none reaches the two-token bar alone.  The DOI, "Published online" and journal
 # alternatives are anchored at the block *start* (and supporting-info is a fixed
 # phrase), so body prose that merely mentions a volume/DOI/"published online"
 # mid-sentence ("See volume 3, pages 45-67, …") does not match — only a line that
-# opens as the citation/DOI/publication line does.
+# opens as the citation/DOI/publication line does.  The author-contribution
+# alternative is the one phrase not anchored at the block start — an author
+# footnote reads "X and Y contributed equally [to this work]" mid-line — so it is
+# instead anchored at its *end*: the clause must close the block (optionally with a
+# trailing "to this/the work/study/…"), which a body sentence that merely runs
+# "contributed equally to substrate binding …" past it does not.
 _STRAY_METADATA_PHRASE_RE = re.compile(
     r"(?:additional\s+)?supporting information (?:may be found|is available)"
     r"|^\s*doi\b\s*:?\s*10\.\d"
     r"|^\s*published\s+online\b"
-    r"|^\s*vol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d",
+    r"|^\s*vol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d"
+    r"|contributed\s+equally(?:\s+to\s+(?:this|the)\s+"
+    r"(?:work|study|manuscript|article|paper|research|publication|project))?"
+    r"\s*\.?\s*$",
     re.IGNORECASE,
 )
 # A self-contained footer-metadata line (journal citation, correspondence, a
