@@ -19,6 +19,7 @@ from pathlib import Path
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.classify import (
+    _FOOTNOTE_MARKER_CHARS,
     _REF_HEADING_RE,
     _REF_SECTION_RE,
     _UNICODE_SUP_MARKER_RE,
@@ -162,10 +163,11 @@ def _is_title_only_figure_caption(caption: str) -> bool:
 
 
 # Footnote-marker symbols that open a stranded note ("† Present address …", "‡ These
-# authors contributed equally").  '*' is excluded — a '*'-led block is an italicised
-# organism/gene name opening a legend ("*Bk*TauF is shown in …"), not a footnote —
-# and '#' is already rejected as a heading by _is_caption_continuation.
-_LEGEND_FOOTNOTE_MARKERS = "†‡§¶"
+# authors contributed equally") — the shared ``_FOOTNOTE_MARKER_CHARS`` set minus
+# '*', which is excluded here because a '*'-led block is an italicised organism/gene
+# name opening a legend ("*Bk*TauF is shown in …"), not a footnote.  ('#' is already
+# rejected as a heading by _is_caption_continuation.)
+_LEGEND_FOOTNOTE_MARKERS = _FOOTNOTE_MARKER_CHARS.replace("*", "")
 
 
 def _is_legend_continuation(block: str) -> bool:

@@ -1362,6 +1362,59 @@ class TestLightonAssembly:
         body = _body(_run_lighton([md]))
         assert "Raw data are available on request" in body
 
+    def test_equal_contribution_marker_derived_from_byline(self) -> None:
+        from pdfparser.pipeline.classify import _byline_equal_contribution_marker
+
+        # The marker is the footnote symbol the byline puts on ≥2 authors.
+        byline = (
+            "<p>Yan Zhou<sup>1,*</sup>, Yifeng Wei<sup>2,*</sup>, Lin<sup>1</sup></p>"
+        )
+        assert _byline_equal_contribution_marker([byline]) == "*"
+        # A different symbol is derived, not a hard-coded "*".
+        dagger = "<p>A. One<sup>1,†</sup>, B. Two<sup>2,†</sup></p>"
+        assert _byline_equal_contribution_marker([dagger]) == "†"
+        # A symbol on only one author (e.g. a lone corresponding-author mark) is not
+        # an equal-contribution marker, and numeric affiliation markers never count.
+        single = "<p>A. One<sup>1,*</sup>, B. Two<sup>2</sup>, C. Three<sup>3</sup></p>"
+        assert _byline_equal_contribution_marker([single]) is None
+
+    def test_equal_contribution_footnote_marker_restored(self) -> None:
+        from pdfparser.pipeline.classify import _restore_equal_contribution_marker
+
+        # The OCR swallows the footnote's marker into emphasis ("*…*" -> <em>);
+        # restore the byline-derived marker so the note still references its authors.
+        assert (
+            _restore_equal_contribution_marker(
+                "<p><em>These authors contributed equally to this work.</em></p>", "*"
+            )
+            == "<p>*<em>These authors contributed equally to this work.</em></p>"
+        )
+        # A note that already carries a footnote marker is left untouched.
+        assert (
+            _restore_equal_contribution_marker(
+                "<p>† These authors contributed equally to this work.</p>", "*"
+            )
+            == "<p>† These authors contributed equally to this work.</p>"
+        )
+        # A block that only *mentions* the phrase mid-text (relocated for another
+        # reason) is not a standalone note → no marker is prepended at its start.
+        merged = (
+            "<p>Correspondence: a@b.edu. These authors contributed equally. Tel: 1.</p>"
+        )
+        assert _restore_equal_contribution_marker(merged, "*") == merged
+        # No derivable marker → nothing invented.
+        assert (
+            _restore_equal_contribution_marker(
+                "<p><em>These authors contributed equally.</em></p>", None
+            )
+            == "<p><em>These authors contributed equally.</em></p>"
+        )
+        # A non-footnote metadata block is never given a spurious marker.
+        assert (
+            _restore_equal_contribution_marker("<p>DOI 10.1042/BSR20190715</p>", "*")
+            == "<p>DOI 10.1042/BSR20190715</p>"
+        )
+
     def test_stray_metadata_predicate(self) -> None:
         from pdfparser.pipeline.classify import _is_stray_metadata
 
@@ -3822,6 +3875,11 @@ class TestPipeline:
         # And they must appear in the same paragraph — no split <p>.
         assert "classical and contemporary</p>" not in abstract_block
 
+    def test_nad_plus_superscript_rendered_in_body(self, article_html: str) -> None:
+        # NAD$^+$ -> NAD⁺: the end-to-end LaTeX-superscript path (OCR -> span
+        # conversion -> render), only otherwise covered as a unit test.
+        assert "NAD⁺" in _body(article_html)
+
     def test_which_is_not_merged_with_as_a_testament(self, article_html: str) -> None:
         assert "which is As a testament to the utility" not in article_html
 
@@ -4768,6 +4826,19 @@ class TestFrontiersSidebarMetadata:
             assert fragment in panel, f"{fragment!r} missing from metadata panel"
             assert fragment not in body, f"{fragment!r} leaked into body"
 
+    def test_byline_affiliation_markers_rendered_as_superscripts(
+        self, frontiers_html: str
+    ) -> None:
+        # The numeric author markers ("1,2", "1,3") render as superscripts in the
+        # byline, not flattened to inline text, with no markdown-emphasis corruption.
+        header = frontiers_html[
+            frontiers_html.find("<header>") : frontiers_html.find("</header>")
+        ]
+        byline = header[header.find("<p>") :]
+        assert "<sup>" in byline
+        assert "<em>" not in byline
+        assert ",," not in byline
+
     def test_abstract_in_body_not_hidden_in_panel(self, frontiers_html: str) -> None:
         # The affiliation run ends "…South Korea" with no terminal punctuation; the
         # merge must not absorb the abstract that follows it (which, opening with the
@@ -4958,7 +5029,19 @@ class TestBioscienceReportsRunningHeader:
         # the OCR stranded among the Introduction paragraphs; it belongs in the
         # Metadata panel, not the body.
         assert "contributed equally" not in _body(bsr_html)
-        assert "contributed equally" in _metadata(bsr_html)
+        panel = _metadata(bsr_html)
+        assert "contributed equally" in panel
+        # its "*" marker (swallowed into emphasis by the OCR) is restored so the
+        # note still references the "*"-tagged authors in the byline
+        assert re.search(r"\*\s*(?:<em>)?These authors contributed equally", panel)
+
+    def test_chemical_super_and_subscripts_rendered(self, bsr_html: str) -> None:
+        body = _body(bsr_html)
+        # superscript: NAD$^{+}$ -> NAD⁺ (end-to-end, not just the unit test)
+        assert "NAD⁺" in body
+        # subscript: "toxic H$_{2}$S" -> H<sub>2</sub>S, locking the <sub> path
+        # through a real fixture (otherwise only unit-tested)
+        assert "H<sub>2</sub>S" in body
 
     def test_copyright_footer_stripped_from_body(self, bsr_html: str) -> None:
         # The full-sentence open-access footer ("© 2019 The Author(s). … Portland
@@ -5052,6 +5135,20 @@ class TestJafcAbstractAndByline:
     def test_no_raw_latex_in_byline_or_affiliations(self, jafc_html: str) -> None:
         assert "\\ddagger" not in jafc_html
         assert "\\S" not in jafc_html
+        # and positively: the \ddagger/\S fallback rendered the glyphs (a regression
+        # that dropped the fallback to "" would pass the negative checks alone).
+        assert "‡" in jafc_html
+        assert "§" in jafc_html
+
+    def test_byline_markers_rendered_as_superscripts(self, jafc_html: str) -> None:
+        # The multi-symbol author markers (e.g. "*,†,‡,§", the ‡/§ from the LaTeX
+        # fallback) render as superscripts, not flattened inline text, and the
+        # markdown parser does not eat the "*" (the "1,," corruption symptom).
+        header = jafc_html[jafc_html.find("<header>") : jafc_html.find("</header>")]
+        byline = header[header.find("<p>") :]
+        assert "<sup>" in byline
+        assert "<em>" not in byline
+        assert ",," not in byline
 
     def test_title_in_header(self, jafc_html: str) -> None:
         header = jafc_html[jafc_html.find("<header>") : jafc_html.find("</header>")]

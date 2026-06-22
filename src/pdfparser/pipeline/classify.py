@@ -322,17 +322,26 @@ _METADATA_TOKEN_RE = re.compile(
 # footnote reads "X and Y contributed equally [to this work]" mid-line — so it is
 # instead anchored at its *end*: the clause must close the block (optionally with a
 # trailing "to this/the work/study/…"), which a body sentence that merely runs
-# "contributed equally to substrate binding …" past it does not.
+# "contributed equally to substrate binding …" past it does not.  The author-
+# contribution clause is shared with the marker-restoration gate below
+# (``_EQUAL_CONTRIBUTION_RE``), so both agree on what *is* such a footnote.
+_EQUAL_CONTRIBUTION_PATTERN = (
+    r"contributed\s+equally(?:\s+to\s+(?:this|the)\s+"
+    r"(?:work|study|manuscript|article|paper|research|publication|project))?"
+    r"\s*\.?\s*$"
+)
 _STRAY_METADATA_PHRASE_RE = re.compile(
     r"(?:additional\s+)?supporting information (?:may be found|is available)"
     r"|^\s*doi\b\s*:?\s*10\.\d"
     r"|^\s*published\s+online\b"
     r"|^\s*vol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d"
-    r"|contributed\s+equally(?:\s+to\s+(?:this|the)\s+"
-    r"(?:work|study|manuscript|article|paper|research|publication|project))?"
-    r"\s*\.?\s*$",
+    r"|" + _EQUAL_CONTRIBUTION_PATTERN,
     re.IGNORECASE,
 )
+# The footnote symbols a journal tags authors with (never numeric affiliation
+# markers).  ``assemble._LEGEND_FOOTNOTE_MARKERS`` is the same set minus "*"
+# (a "*"-led legend block is an italic organism name, not a footnote).
+_FOOTNOTE_MARKER_CHARS = "*†‡§¶"
 # A self-contained footer-metadata line (journal citation, correspondence, a
 # "Received … DOI …" submission line, a supporting-information note) that OCR
 # dropped into the body away from the leading front-matter run.  It is relocated
@@ -1169,6 +1178,54 @@ def _is_stray_metadata(part: str) -> bool:
     return len(_METADATA_TOKEN_RE.findall(plain)) >= _STRAY_METADATA_MIN_TOKENS
 
 
+# An author-contribution footnote ("These authors contributed equally …") refers
+# to the authors the byline tags with a shared footnote symbol, but the OCR
+# swallows that symbol by wrapping the note in "*…*" emphasis (rendered <em>…</em>,
+# no visible marker).  When the note is relocated to the panel, restore its marker
+# so it still references those authors — derived from the byline rather than
+# assumed, since journals use any of these symbols, not always "*".  The gate is
+# the *same* end-anchored clause the relocation predicate uses, so the marker is
+# only prepended to a standalone note (not to an unrelated block that merely
+# mentions "contributed equally" mid-text).  (When the byline carries two symbols
+# each on ≥2 authors — e.g. "*" corresponding, "†" equal-contribution — the note's
+# own marker is unrecoverable, so the choice is a best-effort, not exact.)
+_EQUAL_CONTRIBUTION_RE = re.compile(_EQUAL_CONTRIBUTION_PATTERN, re.IGNORECASE)
+
+
+def _byline_equal_contribution_marker(parts: list[str]) -> str | None:
+    """The footnote symbol the byline puts on ≥2 authors — the one an equal-
+    contribution note refers to (plural "these authors").  ``None`` when the byline
+    carries no shared symbolic marker, so no marker is invented.  Numeric
+    affiliation markers are ignored; only ``_FOOTNOTE_MARKER_CHARS`` count."""
+    for part in parts:
+        inner = _plain_p_text(part)
+        if inner is None or not _is_byline(inner):
+            continue
+        text = _visible_text(inner)
+        counts = Counter(ch for ch in text if ch in _FOOTNOTE_MARKER_CHARS)
+        shared = [ch for ch, n in counts.items() if n >= 2]
+        if not shared:
+            return None
+        # The marker on the most authors; ties broken by first appearance so the
+        # choice is deterministic.
+        return min(shared, key=lambda ch: (-counts[ch], text.index(ch)))
+    return None
+
+
+def _restore_equal_contribution_marker(part: str, marker: str | None) -> str:
+    if marker is None:
+        return part
+    inner = _plain_p_text(part)
+    if inner is None:
+        return part
+    plain = _visible_text(inner)
+    if not _EQUAL_CONTRIBUTION_RE.search(plain) or plain.lstrip()[:1] in (
+        _FOOTNOTE_MARKER_CHARS
+    ):
+        return part
+    return f"<p>{marker}{inner}</p>"
+
+
 def _extract_stray_metadata(parts: list[str]) -> tuple[list[str], list[str]]:
     """Split self-contained stray metadata blocks (see ``_is_stray_metadata``) off
     a page's block stream — returns ``(metadata, rest)``.
@@ -1177,8 +1234,12 @@ def _extract_stray_metadata(parts: list[str]) -> tuple[list[str], list[str]]:
     paragraph-merge, so a footer line ending in ")" (e.g. "… Published online …
     (wileyonlinelibrary.com)") is pulled out before the merge can glue the
     following body prose onto it."""
+    marker = _byline_equal_contribution_marker(parts)
     metadata: list[str] = []
     rest: list[str] = []
     for part in parts:
-        (metadata if _is_stray_metadata(part) else rest).append(part)
+        if _is_stray_metadata(part):
+            metadata.append(_restore_equal_contribution_marker(part, marker))
+        else:
+            rest.append(part)
     return metadata, rest
