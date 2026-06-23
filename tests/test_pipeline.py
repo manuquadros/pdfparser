@@ -62,7 +62,6 @@ class TestOcrSeam:
         import json
 
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         captured: dict[str, object] = {}
@@ -92,7 +91,6 @@ class TestOcrSeam:
 
     def test_ocr_page_raises_on_server_error(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -105,7 +103,6 @@ class TestOcrSeam:
 
     def test_ocr_page_null_content_returns_empty_string(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -119,7 +116,6 @@ class TestOcrSeam:
 
     def test_ocr_page_raises_on_malformed_response(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -132,7 +128,6 @@ class TestOcrSeam:
 
     def test_ocr_page_null_choices_raises_runtime_error(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # "choices": null is a null-valued key (None[0] -> TypeError), not a missing
@@ -147,7 +142,6 @@ class TestOcrSeam:
 
     def test_ocr_page_non_string_content_raises(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # Structured (non-null, non-string) content — e.g. OpenAI content parts —
@@ -162,11 +156,97 @@ class TestOcrSeam:
         with pytest.raises(RuntimeError, match="unexpected OCR content type"):
             _ocr_page(_fake_image(8, 8), ocr)
 
+    def test_truncated_page_is_reocrd_with_full_context(self) -> None:
+        import json
+
+        import httpx
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        # First response truncates (finish_reason "length"); the seam must retry once
+        # with the whole remaining context window (max-model-len 8192 − prompt − a
+        # small margin) so the page's dropped tail is recovered.
+        calls: list[int] = []
+        truncated = "<table>the page up to the"
+        # The full re-OCR reproduces the prefix and continues, so it is longer than
+        # the truncated first response.
+        full = truncated + " cut and the rest</table>"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            calls.append(body["max_tokens"])
+            content, reason = (
+                (truncated, "length") if len(calls) == 1 else (full, "stop")
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": content}, "finish_reason": reason}
+                    ],
+                    "usage": {"prompt_tokens": 2500},
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        assert _ocr_page(_fake_image(8, 8), ocr) == full
+        assert len(calls) == 2
+        assert calls[0] == 2048
+        # The retry claims the full remaining window, not just another fixed block.
+        assert calls[1] == 8192 - 2500 - 64
+
+    def test_natural_finish_does_not_retry(self) -> None:
+        import httpx
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": "done"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 2500},
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "done"
+        assert len(calls) == 1
+
+    def test_truncation_without_headroom_keeps_best_effort(self) -> None:
+        import httpx
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        # The prompt already fills the window, so a retry has no more room than the
+        # first call — keep the truncated text rather than re-OCRing for nothing.
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": "partial"}, "finish_reason": "length"}
+                    ],
+                    "usage": {"prompt_tokens": 8000},
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "partial"
+        assert len(calls) == 1
+
     def test_ocr_pages_preserves_order_under_concurrency(self) -> None:
         import json
 
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         # Each page carries a distinct width so the handler can echo its identity;
@@ -189,7 +269,6 @@ class TestOcrSeam:
 
     def test_ocr_pages_empty_input_returns_empty(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         # No images → no requests, no thread pool; returns [] without touching the
@@ -203,7 +282,6 @@ class TestOcrSeam:
 
     def test_ocr_pages_propagates_page_error(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -216,7 +294,6 @@ class TestOcrSeam:
 
     def test_ocr_model_context_manager_closes_client(self) -> None:
         import httpx
-
         from pdfparser.pipeline.model import OcrModel
 
         transport = httpx.MockTransport(lambda r: httpx.Response(200))
@@ -231,7 +308,6 @@ class TestOcrSeam:
         transport; return the list of clients it builds so a test can assert on the
         pool's lifecycle."""
         import httpx
-
         from pdfparser.pipeline import model
 
         built: list[object] = []
@@ -249,7 +325,6 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
-
         from pdfparser.pipeline.model import load_ocr_model
 
         seen: dict[str, str] = {}
@@ -270,7 +345,6 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
-
         from pdfparser.pipeline.model import load_ocr_model
 
         monkeypatch.setenv("PDFPARSER_VLLM_URL", "http://envhost:9/v1")
@@ -291,7 +365,6 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
-
         from pdfparser.pipeline.model import load_ocr_model
 
         built = self._patch_client(
@@ -681,10 +754,7 @@ class TestTextLayerReconciliation:
         assert _reconcile_page(page, layer, set()) == page
 
     def test_recurring_footer_declined(self) -> None:
-        from pdfparser.pipeline.reconcile import (
-            _reconcile_page,
-            _recurring_furniture,
-        )
+        from pdfparser.pipeline.reconcile import _reconcile_page, _recurring_furniture
 
         footer = "Journal of Important Studies www.example.org 8 Volume 12 Article"
         furniture = _recurring_furniture([footer, footer, footer])
@@ -4207,12 +4277,7 @@ def plos_run(ocr_model: object) -> object:
         pytest.skip(f"Fixture PDF not found: {_PLOS_PDF}")
     from types import SimpleNamespace
 
-    from pdfparser.pipeline import (
-        OcrModel,
-        assemble,
-        lightonocr_pdf_to_html,
-        tables,
-    )
+    from pdfparser.pipeline import OcrModel, assemble, lightonocr_pdf_to_html, tables
 
     assert isinstance(ocr_model, OcrModel)
     real_recover = assemble._recover_dropped_tables
@@ -5307,3 +5372,40 @@ class TestJafcAbstractAndByline:
     def test_title_in_header(self, jafc_html: str) -> None:
         header = jafc_html[jafc_html.find("<header>") : jafc_html.find("</header>")]
         assert "Ketol-Acid Reductoisomerase" in header
+
+    def test_paragraphs_after_citation_superscript_not_merged(
+        self, jafc_html: str
+    ) -> None:
+        # Each of these prose paragraphs follows one that ends with a citation
+        # superscript ("…humans.<sup>15–18</sup>", "…sequence.<sup>21,23</sup>",
+        # "…software.³²"); the citation must not hide the terminal period and glue
+        # the new paragraph onto the previous one, so each opens its own <p>.
+        for opener in (
+            "In <em>C. glutamicum</em>, L-valine is synthesized by the BCAA",
+            "In the present study, we determined the crystal structure of KARI",
+            "<strong>Metal Activity Assay.</strong> The metal activity was measured",
+        ):
+            assert f"<p>{opener}" in jafc_html
+
+
+@pytest.mark.integration
+class TestJafcTruncatedPageRecovery:
+    """31298526.pdf page 2 carries the large Table 2; its OCR overruns the default
+    token budget and truncates mid-table, dropping the rest of the table and all the
+    prose after it (the pH-activity discussion).  ``_ocr_page`` detects the
+    ``finish_reason == "length"`` cut and re-OCRs the page with the full remaining
+    context window, so the table closes and the dropped prose returns."""
+
+    def test_table_2_complete(self, jafc_html: str) -> None:
+        # Table 2 must fully render — its last rows (and a closing </table>) are what
+        # the truncation dropped.  "redundancy" and the cell after it sit near the
+        # table's end, well past the 2048-token cut point.
+        assert "Data Collection and Structural Refinement" in jafc_html
+        assert "redundancy" in jafc_html
+        # the truncated dump left "</tr" unclosed; a recovered page closes the table
+        assert jafc_html.count("<table") == jafc_html.count("</table>")
+
+    def test_post_table_prose_recovered(self, jafc_html: str) -> None:
+        # The pH-activity prose that followed Table 2 on the page was dropped with the
+        # truncation; the re-OCR brings it back.
+        assert "highest enzyme activity at pH 8" in jafc_html

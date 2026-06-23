@@ -22,6 +22,16 @@ from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 _DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 _DEFAULT_MODEL = "lightonocr"
 _OCR_MAX_NEW_TOKENS = 2048
+# The server's context window — input (page-image) tokens plus generated tokens.
+# Must match the vLLM ``--max-model-len`` (see ``deploy/vllm/``); override for a
+# server started with a different window.  Used to size the retry budget when a
+# page's generation truncates: a dense page (a large table plus prose) can exceed
+# ``_OCR_MAX_NEW_TOKENS`` and get cut off mid-output, silently dropping the rest of
+# the table and everything after it.
+_DEFAULT_MODEL_CONTEXT_LEN = 8192
+# Leave a little of the window unclaimed so the retry's ``max_tokens`` can't tip
+# prompt+output past the server limit (vLLM rejects such a request outright).
+_CONTEXT_SAFETY_MARGIN = 64
 # Pages OCR independently, so the client issues several requests at once to let
 # the vLLM server's continuous batching engage — a serial caller pins
 # ``num_requests_running`` at 1, leaving most of the GPU idle.  Bounded because
@@ -89,18 +99,32 @@ def load_ocr_model(
     return OcrModel(client=client, base_url=base_url, model=model)
 
 
-def _ocr_page(
-    image: Image.Image, ocr: OcrModel, max_new_tokens: int = _OCR_MAX_NEW_TOKENS
-) -> str:
-    """OCR a single page image to markdown via the vLLM chat endpoint.
+def _model_context_len() -> int:
+    raw = os.environ.get("PDFPARSER_VLLM_MAX_MODEL_LEN")
+    if raw is None:
+        return _DEFAULT_MODEL_CONTEXT_LEN
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        # A misconfigured deployment should be visible, not silently defaulted.
+        warnings.warn(
+            f"PDFPARSER_VLLM_MAX_MODEL_LEN={raw!r} is not an integer; "
+            f"falling back to {_DEFAULT_MODEL_CONTEXT_LEN}",
+            stacklevel=2,
+        )
+        return _DEFAULT_MODEL_CONTEXT_LEN
 
-    Greedy (``temperature=0``) so the result is the most-likely transcription and
-    reproducible run-to-run, matching the former in-process decode.  The model
-    ignores any text prompt, so the request carries only the image.
+
+def _post_ocr_page(
+    encoded: str, ocr: OcrModel, max_new_tokens: int
+) -> tuple[str, str | None, int | None]:
+    """One OCR request; returns ``(markdown, finish_reason, prompt_tokens)``.
+
+    ``finish_reason`` is ``"length"`` when the generation hit ``max_new_tokens``
+    (the page was truncated) and ``"stop"`` on a natural end; ``prompt_tokens`` (the
+    image's token cost, from the response ``usage``) sizes a retry.  Either may be
+    ``None`` for a server/mock that omits them — the caller then skips the retry.
     """
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode()
     response = ocr.client.post(
         f"{ocr.base_url}/chat/completions",
         json={
@@ -123,21 +147,58 @@ def _ocr_page(
     response.raise_for_status()
     payload = response.json()
     try:
-        content = payload["choices"][0]["message"]["content"]
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         # TypeError covers a null-valued key ("choices": null -> None[0]), not just
         # a missing one, so a malformed shape always surfaces as this clear error.
         raise RuntimeError(f"unexpected OCR response shape: {payload}") from exc
+    finish_reason = choice.get("finish_reason")
+    usage = payload.get("usage")
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
     # A degenerate page yields null content; return "" (as the former in-process
     # decode did) rather than tripping the str return contract.  A non-string,
     # non-null content is a structurally different response (e.g. OpenAI content
     # parts) the pipeline can't consume — fail loudly rather than silently drop the
     # page's text as empty.
     if content is None:
-        return ""
+        return "", finish_reason, prompt_tokens
     if not isinstance(content, str):
         raise RuntimeError(f"unexpected OCR content type: {payload}")
-    return content
+    return content, finish_reason, prompt_tokens
+
+
+def _ocr_page(
+    image: Image.Image, ocr: OcrModel, max_new_tokens: int = _OCR_MAX_NEW_TOKENS
+) -> str:
+    """OCR a single page image to markdown via the vLLM chat endpoint.
+
+    Greedy (``temperature=0``) so the result is the most-likely transcription and
+    reproducible run-to-run, matching the former in-process decode.  The model
+    ignores any text prompt, so the request carries only the image.
+
+    A page dense enough to exceed ``max_new_tokens`` (a large table plus prose)
+    truncates mid-output, dropping the rest of the table and everything after it.
+    On that signal (``finish_reason == "length"``) the page is re-OCR'd once with
+    the entire remaining context window — greedy decode reproduces the prefix and
+    continues past the cut.  If even the full window is too small, or the retry
+    comes back degenerate (empty/shorter than the first response), the best-effort
+    truncated text is kept rather than dropped.
+    """
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    content, finish_reason, prompt_tokens = _post_ocr_page(encoded, ocr, max_new_tokens)
+    if finish_reason != "length" or prompt_tokens is None:
+        return content
+    retry_budget = _model_context_len() - prompt_tokens - _CONTEXT_SAFETY_MARGIN
+    if retry_budget <= max_new_tokens:
+        return content
+    retried, _, _ = _post_ocr_page(encoded, ocr, retry_budget)
+    # A degenerate retry (null content -> "", or a non-deterministic shorter decode)
+    # must not discard the good-but-truncated first response; keep whichever
+    # recovered more of the page.
+    return retried if len(retried) >= len(content) else content
 
 
 def _resolve_ocr_concurrency() -> int:
