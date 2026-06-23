@@ -17,8 +17,8 @@ from pdfparser.pipeline.classify import (
 from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
-    _SENTENCE_END_RE,
     _TABLE_CAPTION_RE,
+    _ends_sentence,
     _heading_inner,
     _opens_with_caption_label,
     _plain_p_text,
@@ -178,12 +178,13 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
         if inner is not None:
             stripped = inner.rstrip()
             # Terminal punctuation can sit *inside* a closing inline tag
-            # ("…carboxylase.</em>"), so the sentence-end test must run on the
-            # visible text — matching the raw HTML would miss the period behind
-            # the tag and wrongly treat a finished caption as a fragment.
+            # ("…carboxylase.</em>") or behind a trailing citation superscript
+            # ("…humans.<sup>15–18</sup>"), so the sentence-end test runs on the
+            # visible text past any such citation — matching the raw HTML would
+            # miss the period and wrongly treat a finished paragraph as a fragment.
             visible = _visible_text(stripped).rstrip()
             if (
-                not _SENTENCE_END_RE.search(visible)
+                not _ends_sentence(stripped)
                 and not _BOLD_LABEL_RE.match(inner)
                 and not _opens_with_caption_label(inner)
                 # A self-contained metadata footer (DOI / "Published online …" /

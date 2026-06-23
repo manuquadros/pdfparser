@@ -62,6 +62,7 @@ class TestOcrSeam:
         import json
 
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         captured: dict[str, object] = {}
@@ -91,6 +92,7 @@ class TestOcrSeam:
 
     def test_ocr_page_raises_on_server_error(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -103,6 +105,7 @@ class TestOcrSeam:
 
     def test_ocr_page_null_content_returns_empty_string(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -116,6 +119,7 @@ class TestOcrSeam:
 
     def test_ocr_page_raises_on_malformed_response(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -128,6 +132,7 @@ class TestOcrSeam:
 
     def test_ocr_page_null_choices_raises_runtime_error(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # "choices": null is a null-valued key (None[0] -> TypeError), not a missing
@@ -142,6 +147,7 @@ class TestOcrSeam:
 
     def test_ocr_page_non_string_content_raises(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # Structured (non-null, non-string) content — e.g. OpenAI content parts —
@@ -160,6 +166,7 @@ class TestOcrSeam:
         import json
 
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # First response truncates (finish_reason "length"); the seam must retry once
@@ -197,6 +204,7 @@ class TestOcrSeam:
 
     def test_natural_finish_does_not_retry(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         calls: list[int] = []
@@ -220,6 +228,7 @@ class TestOcrSeam:
 
     def test_truncation_without_headroom_keeps_best_effort(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_page
 
         # The prompt already fills the window, so a retry has no more room than the
@@ -243,10 +252,42 @@ class TestOcrSeam:
         assert _ocr_page(_fake_image(8, 8), ocr) == "partial"
         assert len(calls) == 1
 
+    def test_degenerate_retry_keeps_first_truncated_content(self) -> None:
+        import json
+
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        # First call truncates with usable text; the retry comes back degenerate
+        # (null content -> ""). The good-but-truncated first response must be kept,
+        # not replaced by the empty retry — otherwise the whole page is dropped.
+        contents = ["a real but truncated page of markdown", None]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            json.loads(request.content)
+            content = contents.pop(0)
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": content}, "finish_reason": "length"}
+                    ],
+                    "usage": {"prompt_tokens": 2500},
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        assert (
+            _ocr_page(_fake_image(8, 8), ocr) == "a real but truncated page of markdown"
+        )
+
     def test_ocr_pages_preserves_order_under_concurrency(self) -> None:
         import json
 
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         # Each page carries a distinct width so the handler can echo its identity;
@@ -269,6 +310,7 @@ class TestOcrSeam:
 
     def test_ocr_pages_empty_input_returns_empty(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         # No images → no requests, no thread pool; returns [] without touching the
@@ -282,6 +324,7 @@ class TestOcrSeam:
 
     def test_ocr_pages_propagates_page_error(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel, _ocr_pages
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -294,6 +337,7 @@ class TestOcrSeam:
 
     def test_ocr_model_context_manager_closes_client(self) -> None:
         import httpx
+
         from pdfparser.pipeline.model import OcrModel
 
         transport = httpx.MockTransport(lambda r: httpx.Response(200))
@@ -308,6 +352,7 @@ class TestOcrSeam:
         transport; return the list of clients it builds so a test can assert on the
         pool's lifecycle."""
         import httpx
+
         from pdfparser.pipeline import model
 
         built: list[object] = []
@@ -325,6 +370,7 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
+
         from pdfparser.pipeline.model import load_ocr_model
 
         seen: dict[str, str] = {}
@@ -345,6 +391,7 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
+
         from pdfparser.pipeline.model import load_ocr_model
 
         monkeypatch.setenv("PDFPARSER_VLLM_URL", "http://envhost:9/v1")
@@ -365,6 +412,7 @@ class TestOcrSeam:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
+
         from pdfparser.pipeline.model import load_ocr_model
 
         built = self._patch_client(
@@ -1576,6 +1624,31 @@ class TestLightonAssembly:
         )
         body = _body(_run_lighton([md]))
         assert "Raw data are available on request" in body
+
+    def test_metadata_run_ends_at_body_prose_with_trailing_citation(self) -> None:
+        from pdfparser.pipeline.classify import (
+            _front_matter_len,
+            _looks_like_body_prose,
+        )
+
+        # A body paragraph whose terminal period sits behind a trailing citation
+        # superscript still ends a metadata section's sticky run — the period must
+        # not be hidden by the <sup>, or the paragraph (and the body after it) is
+        # swept into the hidden Metadata panel (the never-hide-body invariant).
+        prose = (
+            "<p>This substantial body sentence describes the experimental method "
+            "and its results in considerable detail here.<sup>15</sup></p>"
+        )
+        assert _looks_like_body_prose(prose) is True
+        body = [
+            "<h2>Keywords</h2>",
+            "<p>enzyme; catalysis; crystal structure; cofactor</p>",
+            prose,
+            "<p>Another body paragraph follows here.</p>",
+        ]
+        # Only the heading + the keyword list are front matter; the citation-ended
+        # body prose ends the run rather than being counted into it.
+        assert _front_matter_len(body) == 2
 
     def test_equal_contribution_marker_derived_from_byline(self) -> None:
         from pdfparser.pipeline.classify import _byline_equal_contribution_marker
@@ -2818,6 +2891,34 @@ class TestCrossPageMerge:
             "<p>Many sugar alcohols enter the pentose phosphate pathway.</p>",
         ]
         assert _merge_split_paragraphs(parts) == parts
+
+    def test_citation_superscript_does_not_hide_sentence_end(self) -> None:
+        # A paragraph ending with a citation superscript ("…humans.<sup>15–18</sup>",
+        # "…software.³²") is a finished sentence; the trailing citation must not hide
+        # the period and let the next paragraph be glued on as a continuation.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        parts = [
+            "<p>this bacterium is harmless to humans.<sup>15–18</sup></p>",
+            "<p>In <em>C. glutamicum</em>, L-valine is synthesized by the pathway.</p>",
+            "<p>checked using PyMOL software.³²</p>",
+            "<p>The metal activity was measured at maximum.</p>",
+        ]
+        assert _merge_split_paragraphs(parts) == parts
+
+    def test_isotope_superscript_end_still_merges(self) -> None:
+        # The citation look-past is digit-anchored, so a trailing charge/isotope
+        # superscript ("…the cofactor NADP⁺") is not mistaken for a terminal-period
+        # citation: a genuinely unterminated fragment still rejoins its continuation.
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        parts = [
+            "<p>the enzyme binds the cofactor NADP⁺</p>",
+            "<p>and two magnesium ions in the active site.</p>",
+        ]
+        out = _merge_split_paragraphs(parts)
+        assert len(out) == 1
+        assert "binds the cofactor NADP⁺ and two magnesium ions" in out[0]
 
 
 class TestReferenceListMerge:

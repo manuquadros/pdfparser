@@ -11,6 +11,16 @@ import re
 
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
+# A trailing citation superscript ("…harmless to humans.<sup>15–18</sup>",
+# "…PyMOL software.³²") hides the sentence-terminal period from the visible-text
+# end test, so a finished paragraph looks like an unterminated fragment that the
+# paragraph merge then glues the next paragraph onto.  Both shapes occur: an HTML
+# <sup> citation (a LaTeX/markdown superscript) and a bare Unicode superscript run.
+# A citation is digits with list/range separators only — a charge or isotope
+# ("Mg²⁺", "³⁵S") ends in a non-digit superscript, so the digit-anchored patterns
+# leave it untouched.
+_TRAILING_SUP_CITATION_RE = re.compile(r"(?:\s*<sup>[\d\s,–—-]+</sup>)+\s*$")
+_TRAILING_UNICODE_SUP_CITATION_RE = re.compile(r"[¹²³⁰⁴-⁹]+\s*$")
 # Paragraphs that open with a bold label ("Keywords:", "Abbreviations:", "Note:")
 # are structured metadata, never mid-sentence continuations.
 _BOLD_LABEL_RE = re.compile(r"^<strong>[^<]+:</strong>")
@@ -67,6 +77,15 @@ def _visible_text_folded(html: str) -> str:
     matched case-insensitively against this form.
     """
     return _visible_text(html).strip().lower()
+
+
+def _ends_sentence(inner: str) -> bool:
+    """True when a block's visible text ends with terminal punctuation, looking
+    past a trailing citation superscript that would otherwise hide it
+    ("…humans.<sup>15–18</sup>", "…software.³²")."""
+    html = _TRAILING_SUP_CITATION_RE.sub("", inner.rstrip())
+    visible = _TRAILING_UNICODE_SUP_CITATION_RE.sub("", _visible_text(html).rstrip())
+    return bool(_SENTENCE_END_RE.search(visible.rstrip()))
 
 
 def _plain_p_text(s: str) -> str | None:

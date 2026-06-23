@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
+    _ends_sentence,
     _heading_inner,
     _plain_p_text,
     _visible_text,
@@ -964,8 +965,12 @@ def _looks_like_body_prose(part: str) -> bool:
     inner = _plain_p_text(part)
     if inner is None:
         return False
+    # _ends_sentence (not a raw _SENTENCE_END_RE search) so a body sentence whose
+    # terminal period sits behind a trailing citation superscript
+    # ("…studied here.<sup>15</sup>") still ends the metadata run rather than being
+    # swallowed into the hidden panel.
     text = _visible_text(inner)
-    return len(text) > _METADATA_PROSE_MIN_LEN and bool(_SENTENCE_END_RE.search(text))
+    return len(text) > _METADATA_PROSE_MIN_LEN and _ends_sentence(inner)
 
 
 def _is_list_like(part: str) -> bool:
