@@ -158,23 +158,33 @@ _BARE_NUMBER_RE = re.compile(r"[-+±]?\d[\d.,]*%?")
 _MATH_RELATION_RE = re.compile(r"[=<>≤≥≈≠]")
 _MATH_EXPR_RE = re.compile(r"[\w.,()\s=<>≤≥≈≠+\-−×⋅*/±°]+")
 _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+# _latex_to_html runs on the pre-markdown stream, which still carries raw HTML
+# (<sup>, <sub>, <td>, <br>…).  The math-relation class above includes '<'/'>',
+# which collide with a tag's angle brackets, so a span that straddles a tag would
+# read as containing a relation; reject any span holding a complete HTML tag so a
+# stray '$' pairing across markup isn't unwrapped (which drops a currency '$' and
+# mangles the tag).  A bare inequality ("a < b") has no '>'-closed tag, so it is
+# unaffected.
+_HTML_TAG_RE = re.compile(r"</?\w[^>]*>")
 
 
 def _is_inline_math_span(content: str) -> bool:
     """True when a markup-free ``$…$`` span is plain inline math the model wrapped
     in math mode, so its delimiters should drop (like a bare number's).
 
-    The whole span must be math-like (identifiers, numbers, operators) and open
-    with an identifier, not a digit: currency is always digit-led ("$5", "$10"), so
-    a spuriously paired span opens with a digit and is left intact — even one
-    bracketing a relation ("$10 > $5") or a hyphen range ("$5 - $10").  Given an
-    identifier lead, a relational operator (``=``/``<``/``>``) marks an equation
-    ("x = 22", "pH = 7", "P < 0.05") and is decisive; failing that, only an
+    The whole span must be math-like (identifiers, numbers, operators), carry no
+    HTML tag, and open with an identifier, not a digit: currency is always digit-led
+    ("$5", "$10"), so a spuriously paired span opens with a digit and is left intact
+    — even one bracketing a relation ("$10 > $5") or a hyphen range ("$5 - $10").
+    Given an identifier lead, a relational operator (``=``/``<``/``>``) marks an
+    equation ("x = 22", "pH = 7", "P < 0.05") and is decisive; failing that, only an
     operator/comma-separated list of single-letter variables ("a, b, c") qualifies,
     with no multi-letter English word — so a stray pairing over prose isn't
     swallowed."""
     stripped = content.strip()
     if not stripped or not _MATH_EXPR_RE.fullmatch(stripped):
+        return False
+    if _HTML_TAG_RE.search(stripped):
         return False
     if not stripped[:1].isalpha():
         return False

@@ -546,7 +546,9 @@ def _ends_like_sentence(part: str) -> bool:
     inner = _furniture_inner(part)
     if inner is None:
         return False
-    return bool(_SENTENCE_END_RE.search(_visible_text(inner).rstrip()))
+    # _ends_sentence, not a raw _SENTENCE_END_RE search, so a line whose terminal
+    # period hides behind a trailing citation superscript still reads as a sentence.
+    return _ends_sentence(inner)
 
 
 def _is_standalone_page_number(part: str) -> bool:
@@ -944,7 +946,11 @@ def _is_frontmatter_text(part: str, *, strict: bool = True) -> bool:
         return True
     if not _FRONTMATTER_TEXT_RE.match(plain):
         return False
-    if not _SENTENCE_END_RE.search(plain):
+    # _ends_sentence (not raw _SENTENCE_END_RE) so a body paragraph that merely opens
+    # with a front-matter keyword but ends in a citation superscript still reads as a
+    # finished sentence — otherwise the hidden period makes it look label-like and it
+    # is swept into the metadata panel, defeating the _looks_like_body_prose guard.
+    if not _ends_sentence(inner):
         return True
     # The line runs on like a sentence: either a body paragraph that merely opens
     # with the keyword ("Published reports indicate ….") or a genuine multi-clause

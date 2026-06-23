@@ -1650,6 +1650,35 @@ class TestLightonAssembly:
         # body prose ends the run rather than being counted into it.
         assert _front_matter_len(body) == 2
 
+    def test_keyword_led_body_with_citation_not_hidden_as_frontmatter(self) -> None:
+        from pdfparser.pipeline.classify import _front_matter_len, _is_frontmatter_text
+
+        # A body paragraph that merely opens with a front-matter keyword ("Published
+        # …") but ends in a citation superscript must not be mistaken for a metadata
+        # label: _is_frontmatter_text reads the period past the <sup>, so the body
+        # run still breaks instead of the paragraph (and the body after it) being
+        # swept into the hidden panel — otherwise it defeats the body-prose guard.
+        prose = (
+            "<p>Published reports indicate that this compound is harmless to all "
+            "humans studied to date.<sup>15</sup></p>"
+        )
+        assert _is_frontmatter_text(prose, strict=False) is False
+        body = [
+            "<h2>Keywords</h2>",
+            "<p>enzyme; catalysis; crystal structure; cofactor</p>",
+            prose,
+            "<p>More body text here.</p>",
+        ]
+        assert _front_matter_len(body) == 2
+
+    def test_ends_like_sentence_sees_past_trailing_citation(self) -> None:
+        from pdfparser.pipeline.classify import _ends_like_sentence
+
+        # _ends_like_sentence (used for running-furniture detection) must also look
+        # past a trailing citation superscript, or a recurring line ending in one is
+        # judged non-sentence-like and dropped at a lower repeat threshold.
+        assert _ends_like_sentence("<p>A recurring header line here.<sup>3</sup></p>")
+
     def test_equal_contribution_marker_derived_from_byline(self) -> None:
         from pdfparser.pipeline.classify import _byline_equal_contribution_marker
 
@@ -3852,6 +3881,22 @@ class TestLatexToHtml:
             _latex_to_html("stock fell $10 > $5 today") == "stock fell $10 > $5 today"
         )
         assert _latex_to_html("the $5 < $10 rule") == "the $5 < $10 rule"
+
+    def test_dollar_span_straddling_html_tag_left_alone(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # _latex_to_html runs on the pre-markdown stream, which still carries raw HTML
+        # (<sub>, <td>, …).  A stray '$' pairing that straddles a tag must not be read
+        # as inline math just because the tag's '<'/'>' look like a relation — doing so
+        # drops a currency '$' and mangles the tag.
+        assert (
+            _latex_to_html("the var $a<sub>x</sub> equals $5 today")
+            == "the var $a<sub>x</sub> equals $5 today"
+        )
+        assert (
+            _latex_to_html("<td>$a</td><td>cost $5</td>")
+            == "<td>$a</td><td>cost $5</td>"
+        )
 
     def test_script_span_reattaches_to_preceding_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
