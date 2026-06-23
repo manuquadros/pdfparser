@@ -152,6 +152,37 @@ _LATEX_MATH_RE = re.compile(r"[_^\\]")
 # is safe: the regex only pairs '$' spuriously across words ("$5 … $10"), whose
 # content is never a lone number.
 _BARE_NUMBER_RE = re.compile(r"[-+±]?\d[\d.,]*%?")
+# A markup-free span can still be a plain inline equation/variable the model
+# wrapped in math mode ("$x = 22$", "$a = 84.9$", "$P < 0.05$", "$a, b, c$"); its
+# delimiters should drop like a bare number's.  See ``_is_inline_math_span``.
+_MATH_RELATION_RE = re.compile(r"[=<>≤≥≈≠]")
+_MATH_EXPR_RE = re.compile(r"[\w.,()\s=<>≤≥≈≠+\-−×⋅*/±°]+")
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def _is_inline_math_span(content: str) -> bool:
+    """True when a markup-free ``$…$`` span is plain inline math the model wrapped
+    in math mode, so its delimiters should drop (like a bare number's).
+
+    The whole span must be math-like (identifiers, numbers, operators) and open
+    with an identifier, not a digit: currency is always digit-led ("$5", "$10"), so
+    a spuriously paired span opens with a digit and is left intact — even one
+    bracketing a relation ("$10 > $5") or a hyphen range ("$5 - $10").  Given an
+    identifier lead, a relational operator (``=``/``<``/``>``) marks an equation
+    ("x = 22", "pH = 7", "P < 0.05") and is decisive; failing that, only an
+    operator/comma-separated list of single-letter variables ("a, b, c") qualifies,
+    with no multi-letter English word — so a stray pairing over prose isn't
+    swallowed."""
+    stripped = content.strip()
+    if not stripped or not _MATH_EXPR_RE.fullmatch(stripped):
+        return False
+    if not stripped[:1].isalpha():
+        return False
+    if _MATH_RELATION_RE.search(stripped):
+        return True
+    return not _ENGLISH_WORD_RE.search(stripped)
+
+
 # Sub/superscript inside a math span: ^{multi} / ^cmd / ^x and the _ forms.
 # A bare script target may be a command pylatexenc left literal (``^\dagger``);
 # capture the whole command, not just the leading backslash, so a stray "\<"
@@ -197,8 +228,11 @@ def _latex_to_html(text: str) -> str:
     def replace(m: re.Match[str]) -> str:
         space, content = m.group(1), m.group(2)
         if not _LATEX_MATH_RE.search(content):
-            if _BARE_NUMBER_RE.fullmatch(content.strip()):
-                return space + content.strip()
+            stripped = content.strip()
+            if _BARE_NUMBER_RE.fullmatch(stripped):
+                return space + stripped
+            if _is_inline_math_span(content):
+                return space + _latex_span_to_html(content)
             return m.group(0)
         html = _latex_span_to_html(content)
         if space and content.lstrip()[:1] in ("^", "_"):

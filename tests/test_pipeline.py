@@ -3711,6 +3711,47 @@ class TestLatexToHtml:
         # the '$' delimiters but keep the number (and the surrounding spaces).
         assert _latex_to_html("was $42.26$ Sec") == "was 42.26 Sec"
 
+    def test_inline_equation_unwrapped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A markup-free "variable = value" span the model wrapped in math mode must
+        # shed its '$' delimiters like a bare number — the relational operator marks
+        # it as math, not a currency pairing.
+        assert _latex_to_html("size was $x = 22$ and $y = 16$ here") == (
+            "size was x = 22 and y = 16 here"
+        )
+        assert _latex_to_html("cell $a = 84.9$ Å") == "cell a = 84.9 Å"
+        assert _latex_to_html("at $P < 0.05$ level") == "at P < 0.05 level"
+
+    def test_inline_variable_list_unwrapped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A comma-separated list of single-letter variables ("a, b, c") the model
+        # wrapped in math mode — no relational operator — still sheds its delimiters,
+        # since it opens with an identifier (not a currency digit).
+        assert _latex_to_html("the $a, b, c$ (Å) axes") == "the a, b, c (Å) axes"
+
+    def test_currency_left_alone(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A spurious '$' pairing over prose (English words) and a digit-led currency
+        # range (no relation) must both stay verbatim — neither is inline math.
+        assert _latex_to_html("we paid $5 and lost $10 total") == (
+            "we paid $5 and lost $10 total"
+        )
+        assert _latex_to_html("priced $5 - $10 each") == "priced $5 - $10 each"
+
+    def test_currency_comparison_with_relation_left_alone(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A currency pairing that brackets a relational operator ("$10 > $5") must not
+        # be mistaken for an equation: currency is digit-led, so the identifier-lead
+        # requirement keeps it (and its '$') intact even though it holds a '>'/'<'.
+        assert (
+            _latex_to_html("stock fell $10 > $5 today") == "stock fell $10 > $5 today"
+        )
+        assert _latex_to_html("the $5 < $10 rule") == "the $5 < $10 rule"
+
     def test_script_span_reattaches_to_preceding_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
@@ -5386,6 +5427,15 @@ class TestJafcAbstractAndByline:
             "<strong>Metal Activity Assay.</strong> The metal activity was measured",
         ):
             assert f"<p>{opener}" in jafc_html
+
+    def test_inline_equations_rendered_not_leaked(self, jafc_html: str) -> None:
+        # The grid-size/cell-parameter equations the model wrapped in math mode
+        # ("$x = 22$", "$a = 84.9$") must render with their '$' delimiters dropped,
+        # not leak the raw "$… = …$" into the prose.
+        assert "x = 22" in jafc_html
+        assert "$x = " not in jafc_html
+        assert "$a = " not in jafc_html
+        assert "a = 84.9" in jafc_html
 
 
 @pytest.mark.integration
