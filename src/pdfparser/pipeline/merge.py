@@ -143,6 +143,32 @@ def _join_split_table_caption_labels(parts: list[str]) -> list[str]:
     return out
 
 
+# A table's abbreviation legend ("MW: molecular weight, NR: Not reported"): a
+# short block of two-or-more "ABBR: expansion" entries the OCR drops right after a
+# table.  When the table carries no <sup> markers, _colocate_table_footnotes can't
+# anchor it (no marker run) and it is not a source/attribution note, so it is left
+# loose — wedged between the table and the prose resuming after it.  The two-plus
+# short uppercase-led "X:" entries are the discriminator: ordinary prose never
+# carries such a run, so this can't swallow a genuine sentence continuation.
+_LEGEND_NOTE_MAX_LEN = 200
+_ABBREVIATION_ENTRY_RE = re.compile(r"\b[A-Z][A-Za-z0-9]{1,4}:\s")
+_MIN_LEGEND_ENTRIES = 2
+
+
+def _is_table_legend(part: str) -> bool:
+    """True for a short abbreviation-key legend the OCR stranded after a table
+    (see ``_ABBREVIATION_ENTRY_RE``).  The cross-table merge steps over such a
+    block instead of splicing it into the sentence split across the table."""
+    inner = _plain_p_text(part)
+    if inner is None:
+        return False
+    text = _visible_text(inner).strip()
+    return (
+        len(text) <= _LEGEND_NOTE_MAX_LEN
+        and len(_ABBREVIATION_ENTRY_RE.findall(text)) >= _MIN_LEGEND_ENTRIES
+    )
+
+
 def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     """Stitch paragraph fragments broken by two-column PDF layout.
 
@@ -198,16 +224,32 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                 # overruns _is_stray_metadata's length cap, so guard it directly or
                 # the abstract that follows is glued on and hidden with it.
                 and not _LEADING_SUP_RE.match(visible.lstrip())
+                # A table's abbreviation legend ("MW: molecular weight, NR: Not
+                # reported") ends without terminal punctuation but is not a sentence
+                # fragment, so it must not absorb the body prose resuming after it.
+                and not _is_table_legend(part)
             ):
                 j = i + 1
                 floats: list[str] = []
-                while (
-                    j < len(parts)
-                    and _FLOAT_RE.match(parts[j])
-                    and len(floats) < _MAX_FLOATS_TO_SKIP
-                ):
-                    floats.append(parts[j])
-                    j += 1
+                # Step over the tables/figures between the split halves, plus any
+                # table legend the OCR stranded among them (else the legend is taken
+                # as the continuation and spliced into the sentence).  A legend is
+                # furniture, not a float, so it does not consume the float budget;
+                # both are re-emitted after the rejoined paragraph.
+                skipped_floats = 0
+                while j < len(parts):
+                    if _is_table_legend(parts[j]):
+                        floats.append(parts[j])
+                        j += 1
+                    elif (
+                        _FLOAT_RE.match(parts[j])
+                        and skipped_floats < _MAX_FLOATS_TO_SKIP
+                    ):
+                        floats.append(parts[j])
+                        skipped_floats += 1
+                        j += 1
+                    else:
+                        break
                 if j < len(parts):
                     cont = _plain_p_text(parts[j])
                     cont_head = _visible_text(cont).lstrip() if cont is not None else ""

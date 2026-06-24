@@ -2973,6 +2973,30 @@ class TestCrossPageMerge:
         merged = _merge_split_paragraphs(parts)
         assert any("metabolism. The SpRDH operon of the genome" in p for p in merged)
 
+    def test_stranded_table_legend_not_spliced_into_cross_table_sentence(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs_stable
+
+        # A markerless table's abbreviation legend ("MW: …, NR: …") the OCR strands
+        # between the table and the prose resuming after it must be stepped over, not
+        # taken as the sentence continuation: the two sentence halves rejoin
+        # contiguously and the legend survives elsewhere in the output.
+        parts = [
+            "<p>enter the pentose phosphate pathway for carbon metabolism. The</p>",
+            "<table><caption>Table 2. Metal ion analysis.</caption>"
+            "<tr><td>Cu2+</td></tr></table>",
+            "<table><caption>Table 3. Biochemical properties.</caption>"
+            "<tr><td>MW</td></tr></table>",
+            "<p>MW: molecular weight, NR: Not reported</p>",
+            "<p>SpRDH operon of the genome contains a transporter (S4 Fig).</p>",
+        ]
+        out = _merge_split_paragraphs_stable(parts)
+        text = "".join(out)
+        assert "metabolism. The SpRDH operon of the genome" in re.sub(
+            r"<[^>]+>", "", text
+        )
+        assert "Not reported SpRDH" not in re.sub(r"<[^>]+>", "", text)
+        assert any("MW: molecular weight, NR: Not reported" in p for p in out)
+
     def test_function_word_guard_still_refuses_new_sentence(self) -> None:
         from pdfparser.pipeline.merge import _merge_split_paragraphs
 
