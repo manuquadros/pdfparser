@@ -157,9 +157,14 @@ def _figure_crop_box(
         b if r in (0, None) else None for b, r in zip(boxes, rotations, strict=True)
     ]
     lines = _group_lines(upright)
-    # y-up coords: a line sits entirely above the caption when its bottom (_Box[1])
-    # is higher up the page than the caption's top, so its bottom exceeds cap_top.
-    above = [ln[1] for ln in lines if ln[1] > cap_top]
+    # y-up coords: a line sits above the caption when its bottom (_Box[1]) is higher
+    # up the page than the caption's top, so its bottom exceeds cap_top.  Require a
+    # full label-line-height of clearance: a faux-bold caption renders the label's
+    # own first line *twice* with a sub-point vertical offset, and the ghost copy
+    # (bottom a fraction above cap_top) would otherwise count as "text above" and
+    # collapse the region onto the caption — clipping the figure out of the crop.
+    label_h = cap_box[3] - cap_box[1]
+    above = [ln[1] for ln in lines if ln[1] > cap_top + label_h]
     page_w, page_h = page_size
     region_top = min(above) if above else page_h
     region_bottom = max(0.0, cap_top - _CAPTION_BAND_FRAC * page_h)

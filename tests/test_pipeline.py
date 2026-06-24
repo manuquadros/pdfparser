@@ -2166,6 +2166,31 @@ class TestRecoverDroppedFigures:
         pages = ["Figure 1. A", "Figure 2. B", "Figure 3. C", "Figure 5. E"]
         assert _emitted_figure_numbers(pages) == {1, 2, 3, 5}
 
+    def test_crop_box_not_collapsed_by_ghost_caption_line(self) -> None:
+        from pdfparser.pipeline.recover_figures import _figure_crop_box
+
+        # A faux-bold caption double-renders its first line with a sub-point
+        # vertical offset, so a ghost copy sits a fraction above the "FIG. 6" label.
+        # The crop must still span the figure above the caption (region top reaching
+        # the page top here), not collapse onto the ghost line and clip the figure.
+        label = "FIG. 6 Title"
+        ghost = "Title"
+        text = f"{label}\n{ghost}\n"
+        boxes: list[tuple[float, float, float, float] | None] = []
+        for ch in label:  # label line: y in [366, 376]
+            boxes.append(None if ch == " " else (40.0, 366.0, 50.0, 376.0))
+        boxes.append(None)  # newline
+        for _ in ghost:  # ghost line: bottom (376.3) barely above the label's top
+            boxes.append((95.0, 376.3, 105.0, 383.6))
+        boxes.append(None)  # newline
+        rotations = [0 if b is not None else None for b in boxes]
+
+        located = _figure_crop_box(text, boxes, rotations, 6, (612.0, 792.0))
+        assert located is not None
+        (_, _, _, region_top), cap_top = located
+        assert region_top == 792.0
+        assert region_top - cap_top > 400.0  # the figure band, not the caption row
+
     def test_extract_recovered_figure_folds_caption_stops_at_body(self) -> None:
         from pdfparser.pipeline.recover_figures import _extract_recovered_figure
 
@@ -4411,6 +4436,21 @@ class TestAdPageExclusion:
         # LightOnOCR-bbox emits a crop box per figure (incl. the Fig 2 alignment
         # the old engine OCRed into a token wall); each is cropped and embedded.
         assert len(_figure_sizes(ad_prefix_html, _OUTPUT_DIR)) >= 4
+
+    @pytest.mark.parametrize("num", [1, 2, 3, 4, 5, 6])
+    def test_every_known_figure_present(self, ad_prefix_html: str, num: int) -> None:
+        # The article has six figures; each must survive to the output as a cropped
+        # <figure> carrying its "FIG. N" caption.  FIG. 6 in particular was dropped
+        # whole on some OCR runs and the whole-figure recovery declined it: a ghost
+        # faux-bold copy of the caption's first line, a fraction above the "FIG. 6"
+        # label, collapsed the recovery crop onto the caption and clipped the figure.
+        # The label is anchored with a non-digit lookahead so "FIG. 1" can't be
+        # satisfied by a surviving "FIG. 10" when a low-numbered figure is dropped.
+        label = re.compile(rf"FIG\.\s*{num}(?!\d)")
+        captions = re.findall(
+            r"<figcaption>(.*?)</figcaption>", ad_prefix_html, re.DOTALL
+        )
+        assert any(label.search(c) for c in captions), f"FIG. {num} missing from output"
 
     def test_figures_not_truncated(self, ad_prefix_html: str) -> None:
         # The model emits boxes normalized to [0, 1000]; cropping them as raw

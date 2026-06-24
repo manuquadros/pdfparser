@@ -200,9 +200,14 @@ internalizing because they encode this caution:
   is wrongly left in two.
 
 A subtlety that bites if you touch these predicates: terminal punctuation often
-hides inside a closing inline tag (``…carboxylase.</em>``).  Run sentence-end and
-footnote-marker checks on the **visible** text
-(:func:`~pdfparser.pipeline.text._visible_text`), never the raw block HTML.
+hides inside a closing inline tag (``…carboxylase.</em>``) or behind a trailing
+citation superscript (``…humans.<sup>15–18</sup>``, ``…software.³²``).  Run the
+sentence-end check through :func:`~pdfparser.pipeline.text._ends_sentence`, which
+strips a trailing citation before testing the **visible** text
+(:func:`~pdfparser.pipeline.text._visible_text`) — never a raw match on the block
+HTML.  The same predicate is shared by the classification side
+(``_looks_like_body_prose``, ``_is_frontmatter_text``, ``_ends_like_sentence``) so
+a body sentence ending in a citation isn't mistaken for a label and hidden.
 
 Classification: never hide the body
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -242,13 +247,22 @@ construct can't be reduced is *lossless degradation*: keep the TeX literal so a
 later pass can render it, rather than crash the page or leak ``%s`` substitution
 templates.  Symbol-command translation is delegated to ``pylatexenc``'s
 maintained macro table instead of a hand-curated map, with one documented
-override (``^\circ`` → "°", the degree idiom).  Currency is protected too — a
-``$…$`` span with no TeX markup is left verbatim so "$5 … $10" survives.
+override (``^\circ`` → "°", the degree idiom).  A ``$…$`` span with *no* TeX
+markup is reduced too when it is plain inline math the model wrapped in math mode
+— an identifier-led equation or variable list (``$x = 22$``, ``$a, b, c$``) sheds
+its delimiters (:func:`~pdfparser.pipeline.latex._is_inline_math_span`).  Currency
+is protected by the same test: it is digit-led (``$5``), so a stray ``$…$``
+pairing over "$5 … $10" is left verbatim, and a span carrying a complete HTML tag
+is rejected outright — the pre-markdown stream still holds raw ``<sup>``/``<td>``
+whose ``<``/``>`` would otherwise read as a math relation.
 
 OCR decoding is greedy (:func:`~pdfparser.pipeline.model._ocr_page`).  OCR wants
 the single most-likely transcription, and a deterministic decode avoids
 run-to-run drift — notably a figure box that occasionally over-segments into two
-stacked crops on a sampled decode.
+stacked crops on a sampled decode.  A page dense enough to overrun the token
+budget truncates mid-output — dropping the rest of a large table and every block
+after it — so ``_ocr_page`` detects the ``finish_reason == "length"`` cut and
+re-OCRs once with the full remaining context window, keeping the longer result.
 
 Tables are re-OCR'd from a tight crop (:mod:`pdfparser.pipeline.tables`).  The
 full-page pass silently drops small in-table content — a column-spanning
