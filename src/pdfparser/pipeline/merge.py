@@ -315,6 +315,26 @@ def _inject_table_caption(table_html: str, caption_part: str) -> str:
     )
 
 
+def _claim_table_caption(
+    table_idx: int,
+    step: int,
+    is_caption: list[bool],
+    is_figure: list[bool],
+    used: list[bool],
+) -> int | None:
+    """Index of the nearest unused caption from ``table_idx`` in direction ``step``,
+    skipping intervening figures and stopping at prose or another table."""
+    k = table_idx + step
+    while 0 <= k < len(is_caption):
+        if is_caption[k] and not used[k]:
+            return k
+        if is_figure[k]:
+            k += step
+            continue
+        return None
+    return None
+
+
 def _colocate_table_captions(parts: list[str]) -> list[str]:
     """Fold a free-standing "Table N …" caption into its ``<table>`` as a
     ``<caption>`` first child so it renders with the table rather than drifting
@@ -335,15 +355,7 @@ def _colocate_table_captions(parts: list[str]) -> list[str]:
     attached: dict[int, int] = {}
 
     def claim(table_idx: int, step: int) -> int | None:
-        k = table_idx + step
-        while 0 <= k < n:
-            if is_caption[k] and not used[k]:
-                return k
-            if is_figure[k]:
-                k += step
-                continue
-            return None
-        return None
+        return _claim_table_caption(table_idx, step, is_caption, is_figure, used)
 
     tables = [t for t in range(n) if needs_caption[t]]
     # Backward first for every table, so each secures its own leading caption

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
@@ -744,101 +744,123 @@ class _Meta:
     footnotes: list[str]
 
 
-def _classify_parts(parts: list[str]) -> _Meta:
-    """Single pass: pull the title, byline, abstract and footnotes out of the
-    flat block list; everything else is body."""
-    title_html = ""
-    byline_html = ""
-    abstract: list[str] = []
-    body: list[str] = []
-    footnotes: list[str] = []
+@dataclass
+class _ClassifyState:
+    """Mutable accumulator threaded through the single classify pass."""
+
+    title_html: str = ""
+    byline_html: str = ""
+    abstract: list[str] = field(default_factory=list)
+    body: list[str] = field(default_factory=list)
+    footnotes: list[str] = field(default_factory=list)
     # The byline is only the block *immediately* after the title heading; this
     # window closes at the next block so a body sentence is never mistaken for it.
-    expect_byline = False
-    in_abstract = False
+    expect_byline: bool = False
+    in_abstract: bool = False
     # The article title is the only legitimate <h1>; a body section heading the
     # model mis-levelled as <h1> ("# Molecular Mass Determination of Lxmdh"
     # mid-Methods) is demoted to <h2> once the title is claimed, so the document
     # carries a single top-level heading.  ``seen_body_heading`` also gates the
-    # unicode-superscript footnote sweep below to the body proper.
-    seen_body_heading = False
+    # unicode-superscript footnote sweep to the body proper.
+    seen_body_heading: bool = False
 
+
+def _is_body_footnote(inner_p: str, seen_body_heading: bool) -> bool:
+    """A leading superscript-marker line that is an article footnote, not an
+    affiliation: a "¹ Department of …, Country" affiliation shares the
+    leading-marker shape but is front matter for the panel, never a footnote, even
+    when OCR ordering drops it after the first body heading."""
+    return bool(
+        _SUP_MARKER_RE.match(inner_p)
+        or (
+            seen_body_heading
+            and _UNICODE_SUP_MARKER_RE.match(inner_p)
+            and not _is_affiliation_line(_visible_text(inner_p).strip())
+        )
+    )
+
+
+def _classify_heading(
+    state: _ClassifyState, level: int, inner: str, part: str, parts: list[str], idx: int
+) -> None:
+    if not state.title_html:
+        # A masthead / running head ("PLOS ONE", which may sit above a "RESEARCH
+        # ARTICLE" doc-type label) is dropped only when the real title heading
+        # follows it in the leading heading run; a section heading like "Abstract"
+        # after it means this heading IS the title.
+        if _is_masthead_heading(inner) and _leading_title_follows(parts, idx):
+            return
+        if _is_title_heading(inner):
+            state.title_html = inner
+            state.expect_byline = True
+            return
+    state.expect_byline = False
+    if _ABSTRACT_HEADING_RE.match(_visible_text(inner)):
+        state.in_abstract = True
+        return
+    if _visible_text_folded(inner) in _DOCUMENT_TYPE_LABELS:
+        return
+    state.in_abstract = False
+    if not (_is_named_metadata_heading(part) or _is_publication_metadata_heading(part)):
+        state.seen_body_heading = True
+    is_demoted_h1 = level == 1 and bool(state.title_html)
+    state.body.append(f"<h2>{inner}</h2>" if is_demoted_h1 else part)
+
+
+def _classify_paragraph(state: _ClassifyState, part: str) -> None:
+    inner_p = _plain_p_text(part)
+    # Strip a leading publication banner ("**OPEN ACCESS**") the OCR bolded onto
+    # a paragraph: drop the block if that is all it was, else keep the remainder
+    # (the abstract it was glued to) and reprocess it as a normal paragraph.
+    if inner_p is not None and (m := _LEADING_BANNER_RE.match(inner_p)):
+        inner_p = inner_p[m.end() :].lstrip()
+        if not inner_p:
+            return
+        part = f"<p>{inner_p}</p>"
+    if state.expect_byline:
+        state.expect_byline = False
+        if inner_p is not None and _is_byline(inner_p):
+            state.byline_html = _byline_html(inner_p)
+            return
+    # A headingless abstract carried as an inline "ABSTRACT: …" bold label: strip
+    # the label and route the paragraph to the abstract section, before it can be
+    # mistaken for a bold-label front-matter line and swept into the panel.  Open
+    # the abstract window (like the heading path) so a multi-paragraph abstract's
+    # continuation is captured too, closing at the next bold label / heading.
+    if inner_p is not None and (m := _INLINE_ABSTRACT_RE.match(inner_p)):
+        state.abstract.append(f"<p>{inner_p[m.end() :].lstrip()}</p>")
+        state.in_abstract = True
+        return
+    if state.in_abstract:
+        if inner_p is not None and not _BOLD_LABEL_EITHER_COLON_RE.match(inner_p):
+            state.abstract.append(part)
+            return
+        state.in_abstract = False
+    if inner_p is not None and _is_body_footnote(inner_p, state.seen_body_heading):
+        state.footnotes.append(f'<p class="footnote">{inner_p}</p>')
+        return
+    if inner_p is not None and _is_degenerate_repetition(inner_p):
+        return
+    state.body.append(part)
+
+
+def _classify_parts(parts: list[str]) -> _Meta:
+    """Single pass: pull the title, byline, abstract and footnotes out of the
+    flat block list; everything else is body."""
+    state = _ClassifyState()
     for idx, part in enumerate(parts):
         heading = _heading_inner(part)
         if heading is not None:
-            level, inner = heading
-            if not title_html:
-                # A masthead / running head ("PLOS ONE", which may sit above a
-                # "RESEARCH ARTICLE" doc-type label) is dropped only when the real
-                # title heading follows it in the leading heading run; a section
-                # heading like "Abstract" after it means this heading IS the title.
-                if _is_masthead_heading(inner) and _leading_title_follows(parts, idx):
-                    continue
-                if _is_title_heading(inner):
-                    title_html = inner
-                    expect_byline = True
-                    continue
-            expect_byline = False
-            if _ABSTRACT_HEADING_RE.match(_visible_text(inner)):
-                in_abstract = True
-                continue
-            if _visible_text_folded(inner) in _DOCUMENT_TYPE_LABELS:
-                continue
-            in_abstract = False
-            if not (
-                _is_named_metadata_heading(part)
-                or _is_publication_metadata_heading(part)
-            ):
-                seen_body_heading = True
-            body.append(f"<h2>{inner}</h2>" if level == 1 and title_html else part)
-            continue
-
-        inner_p = _plain_p_text(part)
-        # Strip a leading publication banner ("**OPEN ACCESS**") the OCR bolded onto
-        # a paragraph: drop the block if that is all it was, else keep the remainder
-        # (the abstract it was glued to) and reprocess it as a normal paragraph.
-        if inner_p is not None and (m := _LEADING_BANNER_RE.match(inner_p)):
-            inner_p = inner_p[m.end() :].lstrip()
-            if not inner_p:
-                continue
-            part = f"<p>{inner_p}</p>"
-        if expect_byline:
-            expect_byline = False
-            if inner_p is not None and _is_byline(inner_p):
-                byline_html = _byline_html(inner_p)
-                continue
-        # A headingless abstract carried as an inline "ABSTRACT: …" bold label: strip
-        # the label and route the paragraph to the abstract section, before it can be
-        # mistaken for a bold-label front-matter line and swept into the panel.  Open
-        # the abstract window (like the heading path) so a multi-paragraph abstract's
-        # continuation is captured too, closing at the next bold label / heading.
-        if inner_p is not None and (m := _INLINE_ABSTRACT_RE.match(inner_p)):
-            abstract.append(f"<p>{inner_p[m.end() :].lstrip()}</p>")
-            in_abstract = True
-            continue
-        if in_abstract:
-            if inner_p is not None and not _BOLD_LABEL_EITHER_COLON_RE.match(inner_p):
-                abstract.append(part)
-                continue
-            in_abstract = False
-        if inner_p is not None and (
-            _SUP_MARKER_RE.match(inner_p)
-            or (
-                seen_body_heading
-                and _UNICODE_SUP_MARKER_RE.match(inner_p)
-                # A "¹ Department of …, Country" affiliation shares the leading-marker
-                # shape; it is front matter for the panel, never an article footnote,
-                # even when OCR ordering drops it after the first body heading.
-                and not _is_affiliation_line(_visible_text(inner_p).strip())
-            )
-        ):
-            footnotes.append(f'<p class="footnote">{inner_p}</p>')
-            continue
-        if inner_p is not None and _is_degenerate_repetition(inner_p):
-            continue
-        body.append(part)
-
-    return _Meta(title_html, byline_html, abstract, body, footnotes)
+            _classify_heading(state, heading[0], heading[1], part, parts, idx)
+        else:
+            _classify_paragraph(state, part)
+    return _Meta(
+        state.title_html,
+        state.byline_html,
+        state.abstract,
+        state.body,
+        state.footnotes,
+    )
 
 
 def _is_metadata_heading(part: str) -> bool:

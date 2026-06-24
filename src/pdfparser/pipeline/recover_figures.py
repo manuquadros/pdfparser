@@ -281,6 +281,34 @@ def _splice_figures_into_page(
     return "\n\n".join([b for _, b in top] + [page_md] + [b for _, b in bottom])
 
 
+def _attempt_page_figure(
+    pdf: pdfium.PdfDocument,
+    p: int,
+    num: int,
+    page_text_boxes: Callable[[int], tuple[str, list[_Box | None], list[int | None]]],
+    ocr_region: Callable[[Image.Image], str],
+    page_md: str,
+) -> tuple[float, str] | None:
+    """Localize, crop and re-OCR figure ``num`` on page ``p``; return its
+    ``(caption_top, figure_block)`` or ``None`` if this page yields no figure
+    (a running caption reference localizes none above it)."""
+    page_size = pdf[p].get_size()
+    text, boxes, rotations = page_text_boxes(p)
+    located = _figure_crop_box(text, boxes, rotations, num, page_size)
+    if located is None:
+        return None
+    region, cap_top = located
+    crop_md = ocr_region(_scaled_crop(pdf[p], region, page_size))
+    recovered = _extract_recovered_figure(crop_md, num)
+    if recovered is None:
+        return None
+    bbox, caption = recovered
+    if _caption_already_present(caption, page_md):
+        caption = ""
+    block = _figure_block(_remap_bbox_to_page(bbox, region, page_size), caption)
+    return cap_top, block
+
+
 def _recover_dropped_figures(
     pdf_path: Path | str,
     pages_md: list[str],
@@ -321,23 +349,12 @@ def _recover_dropped_figures(
             for p in truth[num]:
                 if p < skip:
                     continue
-                page_size = pdf[p].get_size()
-                text, boxes, rotations = page_text_boxes(p)
-                located = _figure_crop_box(text, boxes, rotations, num, page_size)
-                if located is None:
-                    continue
-                region, cap_top = located
-                crop_md = ocr_region(_scaled_crop(pdf[p], region, page_size))
-                recovered = _extract_recovered_figure(crop_md, num)
-                if recovered is None:
-                    continue
-                bbox, caption = recovered
-                if _caption_already_present(caption, pages_md[p]):
-                    caption = ""
-                block = _figure_block(
-                    _remap_bbox_to_page(bbox, region, page_size), caption
+                found = _attempt_page_figure(
+                    pdf, p, num, page_text_boxes, ocr_region, pages_md[p]
                 )
-                recovered_by_page.setdefault(p, []).append((cap_top, block))
+                if found is None:
+                    continue
+                recovered_by_page.setdefault(p, []).append(found)
                 break
 
         for p, figs in recovered_by_page.items():

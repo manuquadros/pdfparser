@@ -234,9 +234,23 @@ def _recover_tail(
     cut = furn.start() if furn else head
     if _splits_source_char(end, src) or _splits_source_char(cut, src):
         return None
-    # Gate on a fully-cleaned view (the offset-mapped ``layer`` keeps markdown
-    # punctuation like ``|`` that ``_norm`` — and the furniture set — strip), but
-    # splice the faithful raw slice.
+    return _validate_gap_splice(layer, end, cut, src, raw, furniture)
+
+
+def _validate_gap_splice(
+    layer: str,
+    end: int,
+    cut: int,
+    src: list[int],
+    raw: str,
+    furniture: set[str],
+) -> str | None:
+    """Gate the recovered ``[end:cut]`` gap and return the escaped raw slice, or
+    ``None`` to decline.
+
+    Gate on a fully-cleaned view (the offset-mapped ``layer`` keeps markdown
+    punctuation like ``|`` that ``_norm`` — and the furniture set — strip), but
+    splice the faithful raw slice."""
     gap_clean = _norm(layer[end:cut])
     if not (_MIN_GAP_CHARS <= len(gap_clean) <= _MAX_GAP_CHARS):
         return None

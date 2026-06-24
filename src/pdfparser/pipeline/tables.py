@@ -211,6 +211,31 @@ def _seed_rotation(rotations: list[int]) -> int:
     return 0 if counts[0] == best else max(counts, key=lambda r: (counts[r], -r))
 
 
+def _collect_seeds(
+    anchors: list[str],
+    page_norm: str,
+    idx_map: list[int],
+    char_boxes: list[_Box | None],
+    char_rotations: list[int | None],
+) -> tuple[list[_Box], list[int]]:
+    """Seed boxes and their rotations from each anchor that occurs exactly once
+    (a repeated anchor is ambiguous — it may be prose — so it is skipped)."""
+    seeds: list[_Box] = []
+    seed_rotations: list[int] = []
+    for anchor in anchors:
+        first = page_norm.find(anchor)
+        if first == -1 or page_norm.find(anchor, first + 1) != -1:
+            continue  # absent, or ambiguous (recurs elsewhere on the page)
+        i0, i1 = idx_map[first], idx_map[first + len(anchor) - 1]
+        spanned = [b for b in char_boxes[i0 : i1 + 1] if b is not None]
+        if spanned:
+            seeds.append(_union(spanned))
+            seed_rotations.extend(
+                r for r in char_rotations[i0 : i1 + 1] if r is not None
+            )
+    return seeds, seed_rotations
+
+
 def _locate_bbox(
     anchors: list[str],
     page_norm: str,
@@ -233,19 +258,9 @@ def _locate_bbox(
     glyphs sharing the table's rotation are clustered — so the box grows over the
     table's columns and stops at the gutter to the upright body text beside it
     instead of sweeping a neighbouring column's heading into the crop."""
-    seeds: list[_Box] = []
-    seed_rotations: list[int] = []
-    for anchor in anchors:
-        first = page_norm.find(anchor)
-        if first == -1 or page_norm.find(anchor, first + 1) != -1:
-            continue  # absent, or ambiguous (recurs elsewhere on the page)
-        i0, i1 = idx_map[first], idx_map[first + len(anchor) - 1]
-        spanned = [b for b in char_boxes[i0 : i1 + 1] if b is not None]
-        if spanned:
-            seeds.append(_union(spanned))
-            seed_rotations.extend(
-                r for r in char_rotations[i0 : i1 + 1] if r is not None
-            )
+    seeds, seed_rotations = _collect_seeds(
+        anchors, page_norm, idx_map, char_boxes, char_rotations
+    )
     if not seeds:
         return None
 
