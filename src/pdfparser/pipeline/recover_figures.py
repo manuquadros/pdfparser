@@ -37,7 +37,11 @@ import pypdfium2 as pdfium
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.classify import _leading_pages_to_skip_md
-from pdfparser.pipeline.figures import _BBOX_NORM_MAX, _opens_with_panel_label
+from pdfparser.pipeline.figures import (
+    _BBOX_NORM_MAX,
+    _is_bare_figure_label,
+    _opens_with_panel_label,
+)
 from pdfparser.pipeline.tables import (
     _Box,
     _group_lines,
@@ -46,7 +50,7 @@ from pdfparser.pipeline.tables import (
     _scaled_crop,
     _union,
 )
-from pdfparser.pipeline.text import _looks_like_figure_caption, _split_md_blocks
+from pdfparser.pipeline.text import _split_md_blocks
 
 # A figure caption *label* at the start of a text line: "FIG 1", "Figure 4.",
 # "**Figure 6.**", "FIGURE 1 |" (Frontiers), "Fig 1. Effect…".  After the number
@@ -199,40 +203,70 @@ def _remap_bbox_to_page(
     )
 
 
+def _starts_new_section(block: str) -> bool:
+    """True when ``block`` begins a new structural element — a heading, a table, or
+    another figure's caption — rather than continuing the current caption.  Used to
+    stop a bare "FIG. N" label from claiming a following heading/table/figure block
+    (body the generous crop also caught) as its title."""
+    s = block.lstrip()
+    return (
+        s.startswith(("#", "|", "<table")) or _FIG_CAPTION_LABEL_RE.match(s) is not None
+    )
+
+
 def _extract_recovered_figure(
     crop_md: str, num: int
 ) -> tuple[tuple[int, int, int, int], str] | None:
     """Pull the recovered figure's crop-relative box and caption from the crop
     re-OCR, or ``None`` when no figure placeholder came back.
 
-    The caption is the first caption-like block after the placeholder (the
-    "Figure N …" line) plus any following parenthesised panel descriptions; the
-    scan stops at the first block that is neither (a heading, a download/DOI note,
-    or the body prose the generous crop also captured), so none of that page text
-    is re-spliced.  An empty caption (no caption-like block followed) still yields
-    the figure — it renders without a ``<figcaption>`` rather than not at all."""
+    The crop re-OCR emits the caption either *after* the ``![image]`` placeholder or
+    *before* it (the model orders the caption and the image inconsistently for an
+    above-the-image caption), so the placeholder line is dropped and *this* figure's
+    caption is located across the whole crop by its **numbered** label — a tight crop
+    can also catch a neighbouring figure's caption tail above the image, which a
+    number-agnostic test would mistake for this figure's caption.  The caption is
+    that label block, then — when the label is bare (the crop re-OCR often splits the
+    label, its title and the panels into separate blocks) — the title block that
+    follows, then any parenthesised panel descriptions; the scan stops at the first
+    block that starts a new section (heading/table/another figure) or is neither
+    title nor panel, so the body prose the generous crop also captured is not
+    re-spliced.  No numbered label found (a caption-below-figure layout, or a garbled
+    re-OCR) yields an empty caption — the figure renders without a ``<figcaption>``
+    rather than not at all."""
     m = _PLACEHOLDER_BBOX_RE.search(crop_md)
     if m is None:
         return None
     bbox = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
 
-    blocks = [b.strip() for b in _split_md_blocks(crop_md[m.end() :])]
-    caption_blocks: list[str] = []
-    for block in blocks:
-        if not block:
+    blocks = [
+        b.strip()
+        for b in _split_md_blocks(_PLACEHOLDER_BBOX_RE.sub("", crop_md))
+        if b.strip()
+    ]
+    start = next(
+        (
+            i
+            for i, block in enumerate(blocks)
+            if (label := _FIG_CAPTION_LABEL_RE.match(block)) is not None
+            and int(label.group(1)) == num
+        ),
+        None,
+    )
+    if start is None:
+        return bbox, ""
+    # A bare label carries no title on its own block; the next block is its title.
+    expect_title = _is_bare_figure_label(blocks[start])
+    caption_blocks = [blocks[start]]
+    for block in blocks[start + 1 :]:
+        if expect_title and not _starts_new_section(block):
+            caption_blocks.append(block)
+            expect_title = False
             continue
-        if not caption_blocks:
-            label = _FIG_CAPTION_LABEL_RE.match(block)
-            is_caption = (
-                label is not None and int(label.group(1)) == num
-            ) or _looks_like_figure_caption(block)
-            if not is_caption:
-                break
-        elif not _opens_with_panel_label(block):
+        if not _opens_with_panel_label(block):
             break
         caption_blocks.append(block)
-    caption = "\n\n".join(caption_blocks)
-    return bbox, caption
+    return bbox, "\n\n".join(caption_blocks)
 
 
 def _figure_block(bbox: tuple[int, int, int, int], caption: str) -> str:
@@ -251,8 +285,13 @@ def _caption_already_present(caption: str, page_md: str) -> bool:
     show it twice, so the figure is spliced image-only in that case.  Matched on
     the NFKD-folded text, so the separator/casing differences that defeated the
     label regex collapse away; a bare "Figure N" with no title folds too short to
-    match (``_MIN_CAPTION_MATCH_LEN``) and is left to splice normally."""
-    header = caption.splitlines()[0] if caption else ""
+    match (``_MIN_CAPTION_MATCH_LEN``) and is left to splice normally.
+
+    The caption arrives as the label and its title in *separate* blocks (joined by
+    a blank line), so the match runs on the whole caption flattened to one line —
+    keying on the first block alone would be the bare "FIG. N" label, which folds
+    too short and never matches even when the full caption is already on the page."""
+    header = caption.replace("\n", " ").strip()
     norm = _normalize(header)
     return len(norm) >= _MIN_CAPTION_MATCH_LEN and norm in _normalize(page_md)
 

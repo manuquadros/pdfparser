@@ -2257,6 +2257,118 @@ class TestRecoverDroppedFigures:
         no_box = "Figure 4. Crystal structures\n\nprose"
         assert _extract_recovered_figure(no_box, 4) is None
 
+    def test_extract_recovered_figure_caption_before_placeholder(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # The crop re-OCR sometimes emits the caption *before* the ![image]
+        # placeholder (observed for FIG. 6 of 31051047); the caption — split into a
+        # bare "FIG. N" label and its title block — must still be captured, or the
+        # recovered figure renders with no <figcaption> and reads as "missing".
+        crop_md = (
+            "FIG. 6\n\n"
+            "The optimum pH points and enzymatic activities. "
+            "(A) Reduction reaction activities of PtTRI. "
+            "(B) Reduction reaction activities of PtTRII.\n\n"
+            "![image](image_1.png)123,147,865,775"
+        )
+        result = _extract_recovered_figure(crop_md, 6)
+        assert result is not None
+        bbox, caption = result
+        assert bbox == (123, 147, 865, 775)
+        assert caption.startswith("FIG. 6")
+        assert "The optimum pH points and enzymatic activities" in caption
+        assert "(A) Reduction reaction activities of PtTRI" in caption
+
+    def test_extract_recovered_figure_bare_label_title_after_placeholder(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # The same split (bare label, then title) after the placeholder: the title
+        # block that follows a bare "FIG. N" label is its caption, not body prose.
+        crop_md = (
+            "![image](image_1.png)10,20,800,600\n\n"
+            "Figure 3\n\n"
+            "Phylogenetic tree analysis. (A) Tree. (B) Tissue profile.\n\n"
+            "## Results\n\nThe tree shows three clades."
+        )
+        result = _extract_recovered_figure(crop_md, 3)
+        assert result is not None
+        _, caption = result
+        assert caption.startswith("Figure 3")
+        assert "Phylogenetic tree analysis" in caption
+        assert "(A) Tree" in caption
+        # body heading/prose the crop also captured is still excluded
+        assert "Results" not in caption
+        assert "three clades" not in caption
+
+    def test_extract_recovered_figure_ignores_neighbouring_figure_caption(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # The tight crop can catch a neighbouring figure's caption tail above the
+        # image; it must not be taken as THIS figure's caption — match the numbered
+        # label, not any figure-like block.
+        crop_md = (
+            "Figure 5. Previous figure caption tail.\n\n"
+            "![image](image_1.png)5,6,7,8\n\n"
+            "Figure 6. The real caption for this figure."
+        )
+        result = _extract_recovered_figure(crop_md, 6)
+        assert result is not None
+        bbox, caption = result
+        assert bbox == (5, 6, 7, 8)
+        assert caption.startswith("Figure 6. The real caption")
+        assert "Figure 5" not in caption
+
+    def test_extract_recovered_figure_no_matching_label_yields_empty(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # Only a *different* figure/scheme caption is in the crop (no caption for the
+        # requested number): recover the image with an empty caption rather than
+        # mislabeling it with the neighbour's caption.
+        crop_md = (
+            "Scheme 2. Synthetic route.\n\n"
+            "![image](image_1.png)1,2,3,4\n\n"
+            "resumed body text unrelated to the figure."
+        )
+        result = _extract_recovered_figure(crop_md, 5)
+        assert result == ((1, 2, 3, 4), "")
+
+    def test_extract_recovered_figure_bare_label_then_heading(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # A bare "FIG. N" label followed by a heading (the crop reached into the body
+        # below): the heading must NOT be claimed as the title — caption is the label.
+        crop_md = (
+            "![image](image_1.png)10,20,30,40\n\n"
+            "FIG. 6\n\n## Results\n\nThe assay showed activity."
+        )
+        result = _extract_recovered_figure(crop_md, 6)
+        assert result is not None
+        _, caption = result
+        assert caption == "FIG. 6"
+
+    def test_extract_recovered_figure_bare_label_last_block(self) -> None:
+        from pdfparser.pipeline.recover_figures import _extract_recovered_figure
+
+        # A bare label with no following block (no title arrives) yields a label-only
+        # caption, not a crash.
+        crop_md = "![image](image_1.png)1,2,3,4\n\nFIG. 6"
+        result = _extract_recovered_figure(crop_md, 6)
+        assert result == ((1, 2, 3, 4), "FIG. 6")
+
+    def test_caption_already_present_matches_split_label_title(self) -> None:
+        from pdfparser.pipeline.recover_figures import _caption_already_present
+
+        # The recovered caption is a label/title split; the dedup must flatten it so a
+        # caption already on the page (in an em-dash form the label regex missed) is
+        # recognised and the figure is spliced image-only, not as a visible duplicate.
+        caption = "FIG. 6\n\nThe optimum pH points and enzymatic activities."
+        page_md = (
+            "Prose. FIG. 6 — The optimum pH points and enzymatic activities. More."
+        )
+        assert _caption_already_present(caption, page_md) is True
+        # A bare label with no title still folds too short to match and splices.
+        assert _caption_already_present("FIG. 6", page_md) is False
+
     def test_remap_full_width_region_keeps_x_offsets_y_into_band(self) -> None:
         from pdfparser.pipeline.recover_figures import _remap_bbox_to_page
 
