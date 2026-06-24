@@ -1755,6 +1755,41 @@ class TestLightonAssembly:
             "<p>Published online 28 December 2018 in Wiley Online Library "
             "(wileyonlinelibrary.com)</p>"
         )
+        # A submission-history footer — a publishing-process label immediately
+        # followed by a date — is relocated even when unbolded, in US "Month DD,
+        # YYYY" order (ACS) or day-first order, whether OCR keeps the four lines
+        # glued into one block (markdown-it emits each hard break as "<br />\n", so
+        # the dates end on a newline), splits each onto its own line, or runs the
+        # submission history on one ";"-separated line.
+        assert _is_stray_metadata(
+            "<p>Received: May 25, 2019<br />\nRevised: July 10, 2019<br />\n"
+            "Accepted: July 12, 2019<br />\nPublished: July 12, 2019</p>"
+        )
+        assert _is_stray_metadata("<p>Received: May 25, 2019</p>")
+        assert _is_stray_metadata("<p>Accepted 12 July 2019</p>")
+        assert _is_stray_metadata(
+            "<p>Received 19 June 2018; Revised 23 August 2018; "
+            "Accepted 6 December 2018</p>"
+        )
+        # A body sentence merely opening with the keyword and running the date on
+        # into prose (no line/entry break after it) is not a footer and stays.
+        assert not _is_stray_metadata(
+            "<p>Published reports indicate the enzyme is highly conserved.</p>"
+        )
+        assert not _is_stray_metadata(
+            "<p>Published May 25, 2019 in a leading journal, the work spread.</p>"
+        )
+        # Body prose citing a date range must not be swept into the panel on its
+        # dates alone — a metadata block needs a non-date token (e-mail/DOI/phone).
+        assert not _is_stray_metadata(
+            "<p>Patients enrolled between March 3, 2001 and December 12, 2004 "
+            "were followed for five years.</p>"
+        )
+        # A word that merely opens with a month prefix ("decided", "Mayor") is not a
+        # month, so it cannot form a spurious date token.
+        assert not _is_stray_metadata(
+            "<p>The board decided 5 2019 was the augment 3 2020 target year.</p>"
+        )
         # An author-contribution footnote ("These authors contributed equally …")
         # the OCR stranded among body paragraphs is relocated — the clause closing
         # the block (bare, or trailing "to this work/study/…") is the discriminator.
@@ -1972,13 +2007,16 @@ class TestLightonAssembly:
     def test_all_frontmatter_body_kept_visible(self) -> None:
         # If every body block looks like front matter, that signals misdetection,
         # not a metadata-only doc: keep it visible rather than emptying the body.
+        # The submission-date footer is unambiguous metadata and is relocated to the
+        # panel, but the ambiguous affiliation-looking line stays in the body.
         md = (
             "# T\n\n## Abstract\n\nThe abstract.\n\n**Keywords:** alpha, beta\n\n"
             "¹Affiliation One, City\n\nReceived 26 March 2019"
         )
         html = _run_lighton([md])
         assert "Affiliation One" in _body(html)
-        assert "<details class='metadata'>" not in html
+        assert "Received 26 March 2019" not in _body(html)
+        assert "Received 26 March 2019" in _metadata(html)
 
     def test_figure_placeholder_becomes_cropped_figure(self) -> None:
         md = (
@@ -5599,6 +5637,16 @@ class TestJafcAbstractAndByline:
     def test_title_in_header(self, jafc_html: str) -> None:
         header = jafc_html[jafc_html.find("<header>") : jafc_html.find("</header>")]
         assert "Ketol-Acid Reductoisomerase" in header
+
+    def test_submission_dates_in_panel_not_body(self, jafc_html: str) -> None:
+        # The page-bottom submission-history footer ("Received: May 25, 2019" …,
+        # US "Month DD, YYYY" order, unbolded) is relocated to the Metadata panel;
+        # left in the body it would interrupt the cross-page paragraph it sits in.
+        panel = _metadata(jafc_html)
+        body = _body(jafc_html)
+        for line in ("Received: May 25, 2019", "Published: July 12, 2019"):
+            assert line in panel
+            assert line not in body
 
     def test_paragraphs_after_citation_superscript_not_merged(
         self, jafc_html: str

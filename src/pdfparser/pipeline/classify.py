@@ -292,6 +292,26 @@ _AFFILIATION_MAX_LEN = 300
 # prose clause ("enrolled 250 patients …") cannot stand in for the address tail.
 _POSTAL_TAIL_RE = re.compile(r"\b\d{4,6}\b")
 _AFFILIATION_TAIL_SEGMENTS = 2
+# A month, abbreviated or spelled out, fenced with ``(?![a-z])`` so a longer word
+# that merely opens with a month prefix ("decided", "Mayor", "augment", "novel")
+# is not read as a month — a bare ``(?:jan…dec)[a-z]*`` would swallow the whole
+# word and flag "decided 5 2019" as a date.
+_MONTH_NAME = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?"
+    r"|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?"
+    r"|dec(?:ember)?)\.?(?![a-z])"
+)
+# A calendar date in either ordering — "26 March 2019" (day-first, used by many
+# journals) or "May 25, 2019" (month-first, ACS and other US journals).  The
+# trailing year is fenced with ``(?!\d)`` rather than ``\b`` so it still matches
+# when OCR glues the next line's first word straight onto the year ("2019Revised").
+_DATE_RE = (
+    r"\b(?:"
+    r"\d{1,2}\s+" + _MONTH_NAME + r"\s+\d{4}"
+    r"|" + _MONTH_NAME + r"\s+\d{1,2},?\s+\d{4}"
+    r")(?!\d)"
+)
+_DATE_TOKEN_RE = re.compile(_DATE_RE, re.IGNORECASE)
 # A token only metadata carries: an e-mail, a DOI/URL, a submission date, or a
 # phone/fax label.  Its presence separates a genuine multi-clause metadata line
 # ("Received … DOI: …", "Address for correspondence: … e-mail: …") from a body
@@ -302,9 +322,9 @@ _METADATA_TOKEN_RE = re.compile(
       \S+@\S+\.\S                                # e-mail address
     | doi:\s*10\.\d{4,}                          # DOI
     | https?://                                  # URL
-    | \b\d{1,2}\s+
-      (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+
-      \d{4}\b                                    # a "26 March 2019" date
+    | """
+    + _DATE_RE
+    + r"""                                       # a calendar date
     | \b(?:tel|fax|phone)\b                      # phone / fax label
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -336,7 +356,19 @@ _STRAY_METADATA_PHRASE_RE = re.compile(
     r"|^\s*doi\b\s*:?\s*10\.\d"
     r"|^\s*published\s+online\b"
     r"|^\s*vol(?:\.|ume)?\s*\d+.*\bp(?:p\.?|ages?)\s*\d"
-    r"|" + _EQUAL_CONTRIBUTION_PATTERN,
+    # A submission-history line ("Received: May 25, 2019", "Accepted 12 July 2019",
+    # "Received 19 June 2018; Revised 23 August 2018; …") — a publishing-process
+    # label followed by a date that then *ends its entry*: the end of the line, a
+    # newline (OCR merges the four ACS footer lines into one block, dates separated
+    # by ``<br>``→newline), or a ";" (the separator in a one-line submission
+    # history).  A body sentence opening with the keyword runs the date straight on
+    # into lowercase prose ("Published May 25, 2019 in a leading journal, …"), which
+    # none of those three terminators follows, so it stays in the body.
+    r"|^\s*(?:received|revised|accepted|published|submitted)\b\s*:?\s*"
+    + _DATE_RE
+    + r"[ \t]*(?:\n|;|$)"
+    + r"|"
+    + _EQUAL_CONTRIBUTION_PATTERN,
     re.IGNORECASE,
 )
 # The footnote symbols a journal tags authors with (never numeric affiliation
@@ -1208,7 +1240,15 @@ def _is_stray_metadata(part: str) -> bool:
         return False
     if _STRAY_METADATA_PHRASE_RE.search(plain):
         return True
-    return len(_METADATA_TOKEN_RE.findall(plain)) >= _STRAY_METADATA_MIN_TOKENS
+    tokens = _METADATA_TOKEN_RE.findall(plain)
+    if len(tokens) < _STRAY_METADATA_MIN_TOKENS:
+        return False
+    # A calendar date is weak evidence when judged position-independently: body
+    # prose routinely cites date ranges ("between March 3, 2001 and December 12,
+    # 2004"), which would otherwise reach the two-token bar on dates alone and be
+    # hidden in the panel.  Require at least one non-date token; a genuine date-only
+    # submission footer is caught by the keyword-anchored phrase above.
+    return any(not _DATE_TOKEN_RE.fullmatch(tok) for tok in tokens)
 
 
 # An author-contribution footnote ("These authors contributed equally …") refers
