@@ -209,21 +209,39 @@ _LATEX_WRAP_RE = re.compile(
 
 # In math, a standalone single Latin letter is a variable and renders italic
 # ("$x = 22$" → x italic, "$k_{cat}/K_m$" → k and K italic); numbers, operators,
-# and multi-letter identifiers (units, "max", "cat") stay upright.  Italics are
-# applied only at the span's *top level*: a single letter inside a generated
-# <sub>/<sup> is left alone, so an affiliation/footnote marker ("$^{a}$" →
-# "<sup>a</sup>") is never italicised.  The capturing group keeps the script
-# spans in the split list (at the odd indices) so they pass through untouched.
+# and multi-letter identifiers ("max", "cat") stay upright.  Italics are applied
+# only at the span's *top level*: a single letter inside a generated <sub>/<sup>
+# is left alone, so an affiliation/footnote marker ("$^{a}$" → "<sup>a</sup>") is
+# never italicised.  The capturing group keeps the script spans in the split list
+# (at the odd indices) so they pass through untouched.
 _SCRIPT_SPAN_RE = re.compile(r"(<su[bp]>.*?</su[bp]>)", re.DOTALL)
 _MATH_VARIABLE_RE = re.compile(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])")
+# A single letter in *unit position* — trailing a numeric magnitude ("5 V",
+# "10⁸ m/s", "9.8 m/s²") — is a unit symbol, not a variable, and must stay
+# upright.  The run starts at the first letter after a digit (ASCII or
+# superscript, optionally one space) and extends across the unit cluster: more
+# letters, the connectors '·'/'/'/'*' joining sub-units, and superscript
+# exponents.  A coefficient·variable like "2x" reads as unit position too, but
+# such glued forms are vanishingly rare in the model's wrapped spans, whereas a
+# trailing unit is common.
+_UNIT_RUN_RE = re.compile(r"(?<=[0-9¹²³⁰⁴-⁹])\s?[A-Za-z]+(?:[·/*][A-Za-z]+|[¹²³⁰⁴-⁹])*")
 
 
 def _italicize_math_variables(content: str) -> str:
     parts = _SCRIPT_SPAN_RE.split(content)
-    parts[::2] = [
-        _MATH_VARIABLE_RE.sub(r"<em>\g<0></em>", segment) for segment in parts[::2]
-    ]
+    parts[::2] = [_italicize_segment(segment) for segment in parts[::2]]
     return "".join(parts)
+
+
+def _italicize_segment(segment: str) -> str:
+    unit_spans = [m.span() for m in _UNIT_RUN_RE.finditer(segment)]
+
+    def wrap(m: re.Match[str]) -> str:
+        if any(lo <= m.start() < hi for lo, hi in unit_spans):
+            return m.group(0)
+        return f"<em>{m.group(0)}</em>"
+
+    return _MATH_VARIABLE_RE.sub(wrap, segment)
 
 
 def _latex_span_to_html(content: str) -> str:

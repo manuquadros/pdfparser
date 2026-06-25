@@ -308,6 +308,20 @@ class TestCaptionMergeBarrier:
             "Xanthobacter autotrophicus and related species.</p>"
         ]
 
+    def test_capital_continuation_behind_leading_tag_still_blocked(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_paragraphs
+
+        # A new sentence opening with an italicised token (a math variable or a
+        # species name) leads with "<em>", not its capital.  The function-word
+        # guard must judge the continuation by its *visible* head, not the raw
+        # "<", or the leading tag hides the capital and the sentences are wrongly
+        # glued into one paragraph.
+        parts = [
+            "<p>the kinetics were analysed assuming that</p>",
+            "<p><em>P</em> denotes the partial pressure.</p>",
+        ]
+        assert _merge_split_paragraphs(parts) == parts
+
     def test_metadata_line_not_merged_into_following_prose(self) -> None:
         # A self-contained footer-metadata line that ends without terminal
         # punctuation (here a ")") must not be treated as an incomplete paragraph

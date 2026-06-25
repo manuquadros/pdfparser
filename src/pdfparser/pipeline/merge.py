@@ -268,8 +268,8 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
                         and cont_head[:1] not in _FOOTNOTE_SYMBOLS
                         and not (
                             _FUNCTION_WORD_END_RE.search(visible)
-                            and cont[:1].isupper()
-                            and not _MIDSENTENCE_HEAD_RE.match(cont)
+                            and cont_head[:1].isupper()
+                            and not _MIDSENTENCE_HEAD_RE.match(cont_head)
                         )
                         # In the references section a capital-led continuation is the
                         # next bibliography entry (author surname), even one with an

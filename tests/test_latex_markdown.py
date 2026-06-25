@@ -226,6 +226,17 @@ class TestLatexToHtml:
         assert _latex_to_html(r"Author$^{A}$") == "Author<sup>A</sup>"
         assert _latex_to_html("$E_a$") == "<em>E</em><sub>a</sub>"
 
+    def test_single_letter_units_not_italicised(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A single letter in *unit position* — trailing a numeric magnitude — is a
+        # unit symbol, not a variable, and stays upright; the variable left of the
+        # relation still italicises.  The unit run extends across '/' and a
+        # superscript exponent ("m/s²"), so both m and s stay upright.
+        assert _latex_to_html("$P = 5 V$") == "<em>P</em> = 5 V"
+        assert _latex_to_html("$9.8 m/s^2$") == "9.8 m/s²"
+        assert _latex_to_html(r"$c = 3 \times 10^8 m/s$") == "<em>c</em> = 3 × 10⁸ m/s"
+
     def test_script_span_reattaches_to_preceding_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
