@@ -1014,11 +1014,12 @@ class TestJafcAbstractAndByline:
     def test_inline_equations_rendered_not_leaked(self, jafc_html: str) -> None:
         # The grid-size/cell-parameter equations the model wrapped in math mode
         # ("$x = 22$", "$a = 84.9$") must render with their '$' delimiters dropped,
-        # not leak the raw "$… = …$" into the prose.
-        assert "x = 22" in jafc_html
+        # not leak the raw "$… = …$" into the prose.  Their single-letter variables
+        # render italic (<em>x</em>/<em>a</em>) per the math-variable italicization.
+        assert "<em>x</em> = 22" in jafc_html
         assert "$x = " not in jafc_html
         assert "$a = " not in jafc_html
-        assert "a = 84.9" in jafc_html
+        assert "<em>a</em> = 84.9" in jafc_html
 
 
 @pytest.mark.integration

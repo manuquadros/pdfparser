@@ -8,12 +8,12 @@ class TestLatexToHtml:
     def test_simple_subscript(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
-        assert _latex_to_html("$K_m$") == "K<sub>m</sub>"
+        assert _latex_to_html("$K_m$") == "<em>K</em><sub>m</sub>"
 
     def test_braced_subscript(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
-        assert _latex_to_html("$V_{max}$") == "V<sub>max</sub>"
+        assert _latex_to_html("$V_{max}$") == "<em>V</em><sub>max</sub>"
 
     def test_superscript_becomes_unicode(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -39,13 +39,20 @@ class TestLatexToHtml:
 
         # A '*' *outside* the sub/superscript but inside a converted span (a
         # multiplication) is escaped too, so two of them are not paired into
-        # emphasis by the markdown parser ("a²<em>b</em>c²").
-        assert _latex_to_html("$a^2*b*c^2$") == "a²&#42;b&#42;c²"
+        # emphasis by the markdown parser.  The single-letter variables a, b, c
+        # render italic; the escaped '*' separates them.
+        assert (
+            _latex_to_html("$a^2*b*c^2$")
+            == "<em>a</em>²&#42;<em>b</em>&#42;<em>c</em>²"
+        )
 
     def test_ratio_of_kinetic_constants(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
-        assert _latex_to_html("$k_{cat}/K_m$") == "k<sub>cat</sub>/K<sub>m</sub>"
+        assert (
+            _latex_to_html("$k_{cat}/K_m$")
+            == "<em>k</em><sub>cat</sub>/<em>K</em><sub>m</sub>"
+        )
 
     def test_degree_command_superscript(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -68,7 +75,7 @@ class TestLatexToHtml:
     def test_greek_command_as_subscript(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
-        assert _latex_to_html(r"$T_\alpha$") == "T<sub>α</sub>"
+        assert _latex_to_html(r"$T_\alpha$") == "<em>T</em><sub>α</sub>"
 
     def test_command_matched_as_whole_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -78,7 +85,7 @@ class TestLatexToHtml:
         # "\sim" vs "\simeq") — each resolves to its own glyph.
         assert _latex_to_html(r"$\to$") == "→"
         assert _latex_to_html(r"$\top$") == "⊤"
-        assert _latex_to_html(r"$A \simeq B$") == "A ≃ B"
+        assert _latex_to_html(r"$A \simeq B$") == "<em>A</em> ≃ <em>B</em>"
 
     def test_command_still_terminated_by_digit(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -90,13 +97,15 @@ class TestLatexToHtml:
 
         # pylatexenc returns "" for an unknown macro; we keep the literal rather
         # than silently dropping it.
-        assert _latex_to_html(r"$x\notacommand y$") == r"x\notacommand y"
+        assert (
+            _latex_to_html(r"$x\notacommand y$") == r"<em>x</em>\notacommand <em>y</em>"
+        )
 
     def test_extended_symbol_coverage(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
         # Coverage we get for free from pylatexenc that the old hand map lacked.
-        assert _latex_to_html(r"$T_\beta + \nabla$") == "T<sub>β</sub> + ∇"
+        assert _latex_to_html(r"$T_\beta + \nabla$") == "<em>T</em><sub>β</sub> + ∇"
 
     def test_arg_macro_that_raises_does_not_crash(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -146,10 +155,10 @@ class TestLatexToHtml:
         # shed its '$' delimiters like a bare number — the relational operator marks
         # it as math, not a currency pairing.
         assert _latex_to_html("size was $x = 22$ and $y = 16$ here") == (
-            "size was x = 22 and y = 16 here"
+            "size was <em>x</em> = 22 and <em>y</em> = 16 here"
         )
-        assert _latex_to_html("cell $a = 84.9$ Å") == "cell a = 84.9 Å"
-        assert _latex_to_html("at $P < 0.05$ level") == "at P < 0.05 level"
+        assert _latex_to_html("cell $a = 84.9$ Å") == "cell <em>a</em> = 84.9 Å"
+        assert _latex_to_html("at $P < 0.05$ level") == "at <em>P</em> < 0.05 level"
 
     def test_inline_variable_list_unwrapped(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -157,7 +166,10 @@ class TestLatexToHtml:
         # A comma-separated list of single-letter variables ("a, b, c") the model
         # wrapped in math mode — no relational operator — still sheds its delimiters,
         # since it opens with an identifier (not a currency digit).
-        assert _latex_to_html("the $a, b, c$ (Å) axes") == "the a, b, c (Å) axes"
+        assert (
+            _latex_to_html("the $a, b, c$ (Å) axes")
+            == "the <em>a</em>, <em>b</em>, <em>c</em> (Å) axes"
+        )
 
     def test_currency_left_alone(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
@@ -195,6 +207,24 @@ class TestLatexToHtml:
             _latex_to_html("<td>$a</td><td>cost $5</td>")
             == "<td>$a</td><td>cost $5</td>"
         )
+
+    def test_single_letter_variables_italicised(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # Math-mode convention: a standalone single Latin letter is a variable and
+        # renders italic; numbers, operators, and multi-letter identifiers stay
+        # upright.  "pH" is a two-letter token, so neither letter italicises.
+        assert _latex_to_html("$pH = 7.4$") == "pH = 7.4"
+        assert _latex_to_html("$n = 12$") == "<em>n</em> = 12"
+
+    def test_script_marker_letter_not_italicised(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A single letter inside a generated <sub>/<sup> — e.g. an affiliation or
+        # table footnote marker that falls back to a tag — must NOT be italicised;
+        # only top-level variables are.
+        assert _latex_to_html(r"Author$^{A}$") == "Author<sup>A</sup>"
+        assert _latex_to_html("$E_a$") == "<em>E</em><sub>a</sub>"
 
     def test_script_span_reattaches_to_preceding_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html

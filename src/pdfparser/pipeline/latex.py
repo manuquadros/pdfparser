@@ -3,8 +3,10 @@
 Leaf module, no GPU or IO.  Covers the deterministic text transforms applied to
 LightOnOCR's markdown: bold/italic, and inline ``$…$`` spans reduced to Unicode
 super/subscripts and HTML ``<sup>``/``<sub>`` (full math is out of scope — a
-later MathJax option).  Symbol-command translation is delegated to pylatexenc's
-maintained macro table rather than a hand-curated map.
+later MathJax option).  A converted span also italicises its standalone
+single-letter variables (math convention) while leaving numbers, operators, and
+multi-letter identifiers upright.  Symbol-command translation is delegated to
+pylatexenc's maintained macro table rather than a hand-curated map.
 """
 
 from __future__ import annotations
@@ -205,6 +207,24 @@ _LATEX_WRAP_RE = re.compile(
     r"\\(?:text|mathrm|mathit|mathbf|mathsf|operatorname)\{([^{}]*)\}"
 )
 
+# In math, a standalone single Latin letter is a variable and renders italic
+# ("$x = 22$" → x italic, "$k_{cat}/K_m$" → k and K italic); numbers, operators,
+# and multi-letter identifiers (units, "max", "cat") stay upright.  Italics are
+# applied only at the span's *top level*: a single letter inside a generated
+# <sub>/<sup> is left alone, so an affiliation/footnote marker ("$^{a}$" →
+# "<sup>a</sup>") is never italicised.  The capturing group keeps the script
+# spans in the split list (at the odd indices) so they pass through untouched.
+_SCRIPT_SPAN_RE = re.compile(r"(<su[bp]>.*?</su[bp]>)", re.DOTALL)
+_MATH_VARIABLE_RE = re.compile(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])")
+
+
+def _italicize_math_variables(content: str) -> str:
+    parts = _SCRIPT_SPAN_RE.split(content)
+    parts[::2] = [
+        _MATH_VARIABLE_RE.sub(r"<em>\g<0></em>", segment) for segment in parts[::2]
+    ]
+    return "".join(parts)
+
 
 def _latex_span_to_html(content: str) -> str:
     """Convert the inside of a ``$…$`` span: sub/superscripts to HTML, then drop
@@ -224,6 +244,7 @@ def _latex_span_to_html(content: str) -> str:
         content,
     )
     content = content.replace("\\,", " ").replace("{", "").replace("}", "")
+    content = _italicize_math_variables(content)
     return content.translate(_MD_EMPHASIS_ESCAPE)
 
 
