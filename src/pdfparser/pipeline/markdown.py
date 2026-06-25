@@ -18,6 +18,17 @@ from pdfparser.pipeline.text import _plain_p_text, _visible_text
 
 _MD = MarkdownIt("commonmark", {"html": True}).enable("table")
 
+# Inline fragments — figure captions, table cells — need only emphasis and the raw
+# inline HTML ``_latex_to_html`` already emitted (``<sup>``/``<sub>``/``<em>``).
+# Their OCR prose can carry backticks (mis-read primes "3`"), bracket+paren
+# adjacencies ("[12](2019)"), and bare ``<addr>`` tokens that a full CommonMark
+# pass would turn into ``<code>``/``<a href>``/autolinks; those rules are disabled
+# so such text stays literal, while balanced-emphasis and ``\\*``-escape handling
+# (the reason for using the parser over a regex sub) are kept.
+_MD_INLINE = MarkdownIt("commonmark", {"html": True}).disable(
+    ["backticks", "link", "image", "autolink"]
+)
+
 # When LightOnOCR transcribes a page column-by-column it preserves the visual
 # line wrapping, emitting one paragraph as many soft-wrapped lines (CommonMark
 # keeps these as ``\n`` inside the rendered <p>).  Two artefacts follow from
@@ -38,6 +49,21 @@ _TABLE_CELL_RE = re.compile(
 )
 
 
+def _render_inline_html(text: str) -> str:
+    """Inline-render a fragment whose ``$…$`` spans were already converted.
+
+    The CommonMark inline parser is the tag-aware counterpart to a regex sub: it
+    passes valid inline HTML through (``<sup>a</sup>`` markers, ``<sub>`` from
+    ``_latex_to_html``), escapes a stray ``<``/``&``, and — unlike a hand-rolled
+    bold/italic pass — forms *balanced* emphasis, nesting ``**bold *italic***``
+    correctly and honouring ``\\*`` escapes instead of mis-ordering the closing
+    tags (``…<em>X</strong></em>``).  Use this for a fragment that has already been
+    through ``_latex_to_html`` (figure captions); :func:`_render_inline` is the
+    variant that applies that pass first."""
+    rendered: str = _MD_INLINE.renderInline(text)
+    return rendered.strip()
+
+
 def _render_inline(text: str) -> str:
     """Render a fragment of OCR markup to HTML through CommonMark's *inline*
     parser, the tag-aware counterpart to a regex sub.
@@ -47,8 +73,7 @@ def _render_inline(text: str) -> str:
     safe rather than starting a bogus tag), and forms emphasis only on properly
     flanked ``*`` (so a cell ``5 * 10 * 3`` is not spuriously italicised).
     """
-    rendered: str = _MD.renderInline(_latex_to_html(text))
-    return rendered.strip()
+    return _render_inline_html(_latex_to_html(text))
 
 
 def _render_cell_markdown(table_html: str) -> str:

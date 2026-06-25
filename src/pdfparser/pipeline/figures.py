@@ -28,7 +28,7 @@ from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtim
 import numpy as np
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
-from pdfparser.pipeline.latex import _inline_md_to_html
+from pdfparser.pipeline.markdown import _render_inline_html
 
 _log = logging.getLogger(__name__)
 
@@ -201,7 +201,7 @@ def _figure_html(
     :func:`_file_image_writer`)."""
     src = encode_src(crop)
     caption_html = (
-        f"<figcaption>{_inline_md_to_html(caption_text)}</figcaption>"
+        f"<figcaption>{_render_inline_html(caption_text)}</figcaption>"
         if caption_text
         else ""
     )

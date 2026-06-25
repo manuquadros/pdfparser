@@ -45,8 +45,8 @@ from pdfparser.pipeline.figures import (
     _safe_crop,
     _union_box,
 )
-from pdfparser.pipeline.latex import _inline_md_to_html, _latex_to_html
-from pdfparser.pipeline.markdown import _md_to_html_blocks
+from pdfparser.pipeline.latex import _latex_to_html
+from pdfparser.pipeline.markdown import _md_to_html_blocks, _render_inline_html
 from pdfparser.pipeline.merge import (
     _TABLE_OPEN_RE,
     _colocate_table_captions,
@@ -377,7 +377,7 @@ def _resolve_figure_clusters(
 
 def _figcaption_only(caption_html: str) -> str:
     return (
-        f"<figure><figcaption>{_inline_md_to_html(caption_html)}</figcaption></figure>"
+        f"<figure><figcaption>{_render_inline_html(caption_html)}</figcaption></figure>"
     )
 
 

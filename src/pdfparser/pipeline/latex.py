@@ -124,21 +124,6 @@ def _to_superscript(core: str) -> str:
     return f"<sup>{core}</sup>"
 
 
-_BOLDITALIC_RE = re.compile(r"\*\*\*(.+?)\*\*\*", re.DOTALL)
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-# re.DOTALL intentionally omitted: italic spans in academic text don't cross
-# line boundaries, and DOTALL would cause two stray footnote asterisks anywhere
-# in a multi-line region to wrap the entire intervening content in <em>.
-_ITALIC_RE = re.compile(r"\*(.+?)\*")
-
-
-def _inline_md_to_html(text: str) -> str:
-    text = _BOLDITALIC_RE.sub(r"<strong><em>\1</em></strong>", text)
-    text = _BOLD_RE.sub(r"<strong>\1</strong>", text)
-    text = _ITALIC_RE.sub(r"<em>\1</em>", text)
-    return text.strip()
-
-
 # An inline math span: $…$ not preceded by a backslash, shortest match, on a
 # single line (no DOTALL — a stray '$' must not swallow across paragraphs).  A
 # single space *before* the span is captured so a span that opens with a script
@@ -168,6 +153,13 @@ _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 # mangles the tag).  A bare inequality ("a < b") has no '>'-closed tag, so it is
 # unaffected.
 _HTML_TAG_RE = re.compile(r"</?\w[^>]*>")
+# A parenthesized CIP stereodescriptor the model wraps in math mode ("$(R)$",
+# "$(S)$", "$(R,S)$", "$(R/S)$"): one or more single descriptor letters (R/S
+# absolute configuration, E/Z double-bond geometry), comma- or slash-separated.
+# This is the only *bare* paren-led span unwrapped — a figure panel label "(A)" or
+# a roman list item "(i)" has the same shape but must stay intact so its letter is
+# not italicised as a variable.
+_STEREODESCRIPTOR_RE = re.compile(r"\(\s*[RSEZ](?:\s*[,/]\s*[RSEZ])*\s*\)")
 
 
 def _is_inline_math_span(content: str) -> bool:
@@ -175,11 +167,16 @@ def _is_inline_math_span(content: str) -> bool:
     in math mode, so its delimiters should drop (like a bare number's).
 
     The whole span must be math-like (identifiers, numbers, operators), carry no
-    HTML tag, and open with an identifier, not a digit: currency is always digit-led
-    ("$5", "$10"), so a spuriously paired span opens with a digit and is left intact
-    — even one bracketing a relation ("$10 > $5") or a hyphen range ("$5 - $10").
-    Given an identifier lead, a relational operator (``=``/``<``/``>``) marks an
-    equation ("x = 22", "pH = 7", "P < 0.05") and is decisive; failing that, only an
+    HTML tag, and not open with a digit: currency is always digit-led ("$5", "$10"),
+    so a spuriously paired span opens with a digit and is left intact — even one
+    bracketing a relation ("$10 > $5") or a hyphen range ("$5 - $10").
+
+    A paren lead is admitted only for a parenthesized CIP stereodescriptor
+    ("(R)"/"(S)"/"(R,S)") or a genuine equation carrying a relation ("(n = 5)"); a
+    bare parenthesized label — a figure panel "(A)" or roman list item "(i)" — has
+    neither and is left intact, so its letter is not italicised.  Otherwise the lead
+    must be a letter: a relational operator (``=``/``<``/``>``) then marks an equation
+    ("x = 22", "pH = 7", "P < 0.05") and is decisive; failing that, only an
     operator/comma-separated list of single-letter variables ("a, b, c") qualifies,
     with no multi-letter English word — so a stray pairing over prose isn't
     swallowed."""
@@ -188,7 +185,13 @@ def _is_inline_math_span(content: str) -> bool:
         return False
     if _HTML_TAG_RE.search(stripped):
         return False
-    if not stripped[:1].isalpha():
+    head = stripped[:1]
+    if head == "(":
+        return bool(
+            _STEREODESCRIPTOR_RE.fullmatch(stripped)
+            or _MATH_RELATION_RE.search(stripped)
+        )
+    if not head.isalpha():
         return False
     if _MATH_RELATION_RE.search(stripped):
         return True
@@ -217,14 +220,20 @@ _LATEX_WRAP_RE = re.compile(
 _SCRIPT_SPAN_RE = re.compile(r"(<su[bp]>.*?</su[bp]>)", re.DOTALL)
 _MATH_VARIABLE_RE = re.compile(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])")
 # A single letter in *unit position* — trailing a numeric magnitude ("5 V",
-# "10⁸ m/s", "9.8 m/s²") — is a unit symbol, not a variable, and must stay
-# upright.  The run starts at the first letter after a digit (ASCII or
+# "10⁸ m/s", "9.8 m/s²", "25°C", "5 µg") — is a unit symbol, not a variable, and
+# must stay upright.  The run starts at the first letter after a digit (ASCII or
 # superscript, optionally one space) and extends across the unit cluster: more
-# letters, the connectors '·'/'/'/'*' joining sub-units, and superscript
-# exponents.  A coefficient·variable like "2x" reads as unit position too, but
-# such glued forms are vanishingly rare in the model's wrapped spans, whereas a
-# trailing unit is common.
-_UNIT_RUN_RE = re.compile(r"(?<=[0-9¹²³⁰⁴-⁹])\s?[A-Za-z]+(?:[·/*][A-Za-z]+|[¹²³⁰⁴-⁹])*")
+# letters, the connectors '·'/'/'/'*' joining sub-units, and superscript exponents.
+# A non-letter unit prefix may sit between the magnitude and the unit letter —
+# a degree sign ("°C"/"°F") or a micro sign ("µg"/"μL") — so the letter after it is
+# still read as a unit; ``_UNIT_PREFIX`` is the one place to extend that set.  A
+# coefficient·variable like "2x" reads as unit position too, but such glued forms
+# are vanishingly rare in the model's wrapped spans, whereas a trailing unit is
+# common.
+_UNIT_PREFIX = "°µμ"
+_UNIT_RUN_RE = re.compile(
+    rf"(?<=[0-9¹²³⁰⁴-⁹])\s?[{_UNIT_PREFIX}]?[A-Za-z]+(?:[·/*][A-Za-z]+|[¹²³⁰⁴-⁹])*"
+)
 
 
 def _italicize_math_variables(content: str) -> str:

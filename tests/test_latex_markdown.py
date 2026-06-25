@@ -237,12 +237,73 @@ class TestLatexToHtml:
         assert _latex_to_html("$9.8 m/s^2$") == "9.8 m/s²"
         assert _latex_to_html(r"$c = 3 \times 10^8 m/s$") == "<em>c</em> = 3 × 10⁸ m/s"
 
+    def test_temperature_unit_not_italicised(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # "°C"/"°F" is a unit: the degree sign sits between the magnitude and the
+        # letter, so the unit run must bridge it and keep C/F upright, not read the
+        # lone letter as a variable ("25 ± 1°<em>C</em>").
+        assert _latex_to_html(r"$25 \pm 1^\circ \text{C}$") == "25 ± 1°C"
+        assert _latex_to_html(r"$T = 37^\circ C$") == "<em>T</em> = 37°C"
+
+    def test_paren_led_stereodescriptor_unwrapped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # The model wraps a Cahn-Ingold-Prelog stereodescriptor in math mode
+        # ("$(R)$-2-alkanols"); a paren lead is not currency, so the delimiters drop
+        # and the single letter italicises (the chemical convention for (R)/(S)),
+        # instead of leaking a literal '$'.
+        assert (
+            _latex_to_html("the $(R)$-2-alkanols and $(S)$-pentanol")
+            == "the (<em>R</em>)-2-alkanols and (<em>S</em>)-pentanol"
+        )
+        assert "$" not in _latex_to_html("$(R)$ vs $(S)$")
+        # comma/slash-joined descriptors too
+        assert _latex_to_html("$(R,S)$") == "(<em>R</em>,<em>S</em>)"
+
+    def test_paren_led_panel_label_not_unwrapped(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A bare parenthesized label has the same shape as a stereodescriptor but is
+        # NOT one: a figure panel "(A)"/"(B)", a roman list item "(i)", or a letter
+        # pair "(C, D)" must stay verbatim, never unwrapped and italicised as a
+        # variable.  A genuine equation in parens ("(n = 5)") still unwraps.
+        for label in ("$(A)$", "$(B)$", "$(i)$", "$(C, D)$"):
+            assert _latex_to_html(label) == label
+        assert _latex_to_html("$(n = 5)$") == "(<em>n</em> = 5)"
+
     def test_script_span_reattaches_to_preceding_token(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
         # The model writes a unit and its exponent with a gap ("Sec $^{-1}$"); a
         # span opening with a script attaches to the previous token, no space.
         assert _latex_to_html("Sec $^{-1}$ mM $^{-1}$") == "Sec⁻¹ mM⁻¹"
+
+
+class TestRenderInlineHtml:
+    """The inline renderer for already-LaTeX'd fragments (figure captions, table
+    cells): balanced emphasis, but no full-CommonMark code/link/autolink parsing of
+    the model's caption prose."""
+
+    def test_balanced_emphasis_and_escapes(self) -> None:
+        from pdfparser.pipeline.markdown import _render_inline_html
+
+        # The reason for using the parser over a regex sub: nested bold+italic closes
+        # in order, and a backslash-escaped marker stays literal.
+        assert (
+            _render_inline_html("**Figure 2. analyses of *BkTauF***")
+            == "<strong>Figure 2. analyses of <em>BkTauF</em></strong>"
+        )
+        assert _render_inline_html(r"Jang\* and Lee\*") == "Jang* and Lee*"
+
+    def test_code_link_autolink_left_literal(self) -> None:
+        from pdfparser.pipeline.markdown import _render_inline_html
+
+        # A caption's OCR prose can carry backticks (mis-read primes), bracket+paren
+        # adjacencies, and bare <addr> tokens; none must become <code>/<a>/autolinks.
+        assert _render_inline_html("the 5`-end and 3`-end") == "the 5`-end and 3`-end"
+        assert _render_inline_html("ref [12](2019) here") == "ref [12](2019) here"
+        assert "href" not in _render_inline_html("contact <a@b.edu>")
 
 
 class TestMdToHtmlBlocks:

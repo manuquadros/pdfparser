@@ -53,6 +53,26 @@ class TestSplitFigureCaption:
         assert "<p>B</p>" not in body
         assert "B Protein alignments" not in body
 
+    def test_bolditalic_caption_nests_balanced(self) -> None:
+        # The model bolds the whole caption and italicises a species name at its end
+        # ("**Figure 2. … of *BkTauF***").  The inline renderer must close the tags in
+        # order (<strong>…<em>BkTauF</em></strong>), not the mis-ordered
+        # "<em>BkTauF</strong></em>" the old hand-rolled regex produced.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "**Figure 2. SDS/PAGE analyses of *BkTauF***"
+        )
+        html = _run_lighton([md], image=img)
+        assert (
+            "<figcaption><strong>Figure 2. SDS/PAGE analyses of "
+            "<em>BkTauF</em></strong></figcaption>" in html
+        )
+        # no mis-ordered / stray-asterisk artefacts
+        assert "</strong></em>" not in html
+        assert "BkTauF***" not in html
+
     def test_full_label_caption_does_not_swallow_next_block(self) -> None:
         # A caption already complete in one block must not pull the next paragraph.
         img = _fake_image(1190, 1540)

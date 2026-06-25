@@ -86,6 +86,13 @@ class TestPipeline:
         # conversion -> render), only otherwise covered as a unit test.
         assert "NAD⁺" in _body(article_html)
 
+    def test_stereodescriptor_math_span_unwrapped(self, article_html: str) -> None:
+        # The model wraps CIP stereodescriptors in math mode ("$(R)$-2-alkanols");
+        # the delimiters must drop (no literal '$') and the letter italicise.
+        body = _body(article_html)
+        assert "$(R)$" not in body and "$(S)$" not in body
+        assert "(<em>R</em>)-2-alkanols" in body
+
     def test_which_is_not_merged_with_as_a_testament(self, article_html: str) -> None:
         assert "which is As a testament to the utility" not in article_html
 
@@ -201,6 +208,14 @@ class TestAdPageExclusion:
 
     def test_species_name_italicized(self, ad_prefix_html: str) -> None:
         assert "<em>Przewalskia tangutica</em>" in ad_prefix_html
+
+    def test_temperature_unit_stays_upright(self, ad_prefix_html: str) -> None:
+        # "$25 \\pm 1^\\circ \\text{C}$" -> "25 ± 1°C": the degree sign bridges the
+        # magnitude and the unit letter, so C is a unit symbol, not an italic
+        # variable ("25 ± 1°<em>C</em>").
+        body = _body(ad_prefix_html)
+        assert "25 ± 1°C" in body
+        assert "1°<em>C</em>" not in body
 
     def test_gene_names_not_collapsed_by_ocr(self, ad_prefix_html: str) -> None:
         # The motivating bug: the old OCR misread both PtTRI and PtTRII as the
@@ -363,6 +378,17 @@ class TestPlosSidebarMetadata:
         )
         assert title in header, "article title missing from header"
         assert "<h1>PLOS ONE</h1>" not in header
+
+    def test_byline_has_no_stray_or_misnested_markup(self, plos_html: str) -> None:
+        # The author line is bolded with literal '*' equal-contribution markers
+        # ("**… Jang\\*, ChangWoo Lee\\***").  The inline parser must form balanced
+        # emphasis — no leftover '**' and no mis-ordered "<em>…</strong></em>" /
+        # redundant "<em><em>" the old hand-rolled regex produced.
+        header = plos_html[: plos_html.find("</header>")]
+        assert "ChangWoo Lee" in header
+        assert "**" not in header
+        assert "</strong></em>" not in header
+        assert "<em><em>" not in header
 
     def test_body_opens_with_introduction_prose(self, plos_html: str) -> None:
         # With the sidebar relocated, the body proper opens at the Introduction —
@@ -921,6 +947,17 @@ class TestBioscienceReportsRunningHeader:
         )
         assert in_figcaption
         assert f"<p>{panel}" not in _body(bsr_html)
+
+    def test_figure_captions_have_balanced_emphasis(self, bsr_html: str) -> None:
+        # The model bolds a caption and italicises the species at its end
+        # ("**Figure 2. … of *BkTauF***"); the inline renderer must close the tags in
+        # order, never the mis-ordered "<em>…</strong></em>" the old regex produced,
+        # and never leak a stray "BkTauF***".
+        captions = re.findall(r"<figcaption>(.*?)</figcaption>", bsr_html, re.DOTALL)
+        assert any("BkTauF" in c for c in captions)
+        for c in captions:
+            assert "</strong></em>" not in c
+            assert "***" not in c
 
     def test_dropped_figure_4_recovered(self, bsr_html: str) -> None:
         # The model drops Figure 4 entirely from page 7 — no ![image] placeholder
