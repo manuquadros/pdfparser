@@ -480,6 +480,44 @@ class TestTableFigureDedup:
         assert "<figure" in html
         assert "FIGURE 3 | Activity assay results." in html
 
+    def test_captioned_figure_before_table_caption_and_table_is_kept(self) -> None:
+        # A genuine figure with its own "FIG N" caption, immediately followed by a
+        # *separate* table (its "TABLE N" caption then the <table>) with no "---"
+        # between, must not be deduped as a boxed table — only a caption-less figure
+        # is.  (Real case: FIG. 6 + TABLE 1 on page 9 of 31051047 when the OCR drops
+        # the separator.)  Both the figure and the table survive.
+        md = (
+            "![image](image_1.png)113,89,865,514\n"
+            "FIG. 6 The optimum pH points and enzymatic activities. "
+            "(A) Reduction reaction activities of PtTRI.\n\n"
+            "TABLE 1 Enzyme kinetics of PtTRI and PtTRII\n\n"
+            "<table>\n<thead><tr><th>Reductase</th><th>Km</th></tr></thead>\n"
+            "<tbody><tr><td>PtTRI</td><td>0.52</td></tr></tbody>\n</table>"
+        )
+        html = _run_lighton([md])
+        assert "<figure" in html
+        assert "FIG. 6 The optimum pH points" in html
+        assert "<table><caption>TABLE 1 Enzyme kinetics of PtTRI and PtTRII" in html
+
+    def test_figure_with_non_fig_caption_before_table_is_kept(self) -> None:
+        # The dedup keeps a figure that carries ANY caption of its own, not only a
+        # "FIG N"-labelled one — per the figures-over-include trade, an ambiguous
+        # captioned figure before a table is kept rather than risk dropping a real
+        # figure whose caption the model didn't prefix with "FIG N".  (A boxed table
+        # that the model captions descriptively would double-render here; that stray
+        # image is the accepted lesser evil versus losing a genuine figure.)
+        md = (
+            "![image](image_1.png)100,100,400,400\n"
+            "Schematic of the reaction apparatus and flow path.\n\n"
+            "TABLE 1 Enzyme kinetics of PtTRI and PtTRII\n\n"
+            "<table>\n<thead><tr><th>Reductase</th><th>Km</th></tr></thead>\n"
+            "<tbody><tr><td>PtTRI</td><td>0.52</td></tr></tbody>\n</table>"
+        )
+        html = _run_lighton([md])
+        assert "<figure" in html
+        assert "Schematic of the reaction apparatus" in html
+        assert "<table><caption>TABLE 1 Enzyme kinetics of PtTRI and PtTRII" in html
+
 
 class TestFigureFileOutput:
     """With an image directory, crops are written as sidecar PNGs and referenced

@@ -314,7 +314,19 @@ def _dedup_table_figures(blocks: list[_Block]) -> list[_Block]:
                 else None
             )
             table_follows = _is_table_md(blocks[j] if j < len(blocks) else None)
-            if table_follows and (standalone_caption or baked_caption is not None):
+            # The standalone-table-caption path dedups only a *caption-less* figure: a
+            # table the model boxed as an image carries no caption of its own (its
+            # caption is the standalone "TABLE N" block, or — the baked_caption path —
+            # the table label baked onto the placeholder).  A figure that carries any
+            # caption of its own is kept as a genuine figure that merely precedes a
+            # separate table (the OCR dropping the "---" between them).  Deliberately
+            # "any caption", not "a FIG-labelled caption": per the figures-over-include
+            # trade, leaving a boxed table's stray duplicate image beats dropping a
+            # real figure whose caption the model didn't prefix with "FIG N".
+            if table_follows and (
+                baked_caption is not None
+                or (standalone_caption and block.caption is None)
+            ):
                 if baked_caption is not None:
                     # The caption rode on the placeholder line, not as its own block;
                     # re-emit it so _colocate_table_captions can fold it in.
