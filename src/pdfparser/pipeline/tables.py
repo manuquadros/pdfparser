@@ -82,6 +82,9 @@ _GAP_FACTOR = 1.5
 _LEGEND_GAP_FACTOR = 2.5
 _MAX_LEGEND_LINES = 1
 _LEGEND_MAX_LEN = 200  # a recovered legend/source note is short, not body prose
+# More than this many byte-identical consecutive rows is a decode repetition loop,
+# not real data — a genuine table never repeats one row this many times in a row.
+_MAX_IDENTICAL_ROW_RUN = 3
 _PAD_PT = 4.0  # small margin so glyph edges are not clipped by the crop
 
 # Crop render scale: aim for this long side in px, clamped to a sane DPI band.
@@ -383,6 +386,53 @@ def _extract_tables(md: str) -> list[str]:
     return tables
 
 
+def _collapse_repeated_rows(table_html: str) -> str:
+    """Collapse a degenerate run of identical consecutive ``<tr>`` rows to one.
+
+    A tight table crop sometimes drives the model into a decode repetition loop:
+    it emits one row over and over (the "RAMS Deviations" explosion — dozens of
+    identical rows trailing a real table).  A run of more than
+    ``_MAX_IDENTICAL_ROW_RUN`` byte-identical adjacent rows is that pathology, never
+    real tabular data, so it is reduced to its first occurrence.  Left in, the loop's
+    cell count also beats the truncated original and wins the substitution gate."""
+    matches = list(_ROW_RE.finditer(table_html))
+    drop = [False] * len(matches)
+    i = 0
+    while i < len(matches):
+        key = matches[i].group()
+        j = i + 1
+        while j < len(matches) and matches[j].group() == key:
+            j += 1
+        if j - i > _MAX_IDENTICAL_ROW_RUN:
+            for k in range(i + 1, j):
+                drop[k] = True
+        i = j
+    if not any(drop):
+        return table_html
+    out: list[str] = []
+    cursor = 0
+    for m, dropped in zip(matches, drop, strict=True):
+        if dropped:
+            gap = table_html[cursor : m.start()]
+            if gap.strip():
+                out.append(gap)
+            cursor = m.end()
+    out.append(table_html[cursor:])
+    return "".join(out)
+
+
+def _collapse_repeated_rows_md(md: str) -> str:
+    """Collapse decode-loop row runs in every ``<table>`` of a page's markdown.
+
+    The crop re-OCR path collapses its own substitutions, but the *page* pass has
+    its own re-OCR (``_ocr_page`` retries a length-truncated page over the full
+    context window) that can decode-loop on a dense table and land the explosion
+    straight in ``pages_md`` — a path the crop guard never sees.  Running the
+    collapse over the assembled page markdown catches the loop whatever its source.
+    Idempotent: a table with no degenerate run is returned byte-for-byte."""
+    return _TABLE_RE.sub(lambda m: _collapse_repeated_rows(m.group()), md)
+
+
 def _table_regions(md: str) -> list[tuple[int, int, list[str]]]:
     """Group the page's ``<table>`` blocks into regions of consecutive tables
     (separated by whitespace only).  Returns ``(start, end, [table_html, ...])``
@@ -651,7 +701,7 @@ def _apply_page_results(md: str, results: list[tuple[_RegionPlan, str]]) -> str:
     offsets stay valid."""
     source_norm = _normalize(md)  # to tell a recovered legend from one already in md
     for plan, crop_md in sorted(results, key=lambda pc: pc[0].start, reverse=True):
-        new_tables = _extract_tables(crop_md)
+        new_tables = [_collapse_repeated_rows(t) for t in _extract_tables(crop_md)]
         if not new_tables:
             continue
         old_cells = sum(_nonempty_cell_count(t) for t in plan.tables)

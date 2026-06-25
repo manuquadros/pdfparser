@@ -58,7 +58,11 @@ from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_m
 from pdfparser.pipeline.reconcile import _reconcile_text_layer
 from pdfparser.pipeline.recover_figures import _recover_dropped_figures
 from pdfparser.pipeline.render import _render_page_images
-from pdfparser.pipeline.tables import _close_unclosed_tables, _recover_dropped_tables
+from pdfparser.pipeline.tables import (
+    _close_unclosed_tables,
+    _collapse_repeated_rows_md,
+    _recover_dropped_tables,
+)
 from pdfparser.pipeline.text import (
     _looks_like_figure_caption,
     _opens_with_caption_label,
@@ -534,9 +538,16 @@ def _assemble_html(
     images = images[start:]
 
     # Close any table the OCR left open at a page's bottom before block-splitting,
-    # so a table that overran the page does not swallow the next page's prose.
+    # so a table that overran the page does not swallow the next page's prose; and
+    # collapse any decode-loop row explosion the page re-OCR may have produced
+    # (the crop re-OCR collapses its own output, but the page pass does not).
     per_page_parts = [
-        _page_to_html_parts(_close_unclosed_tables(md), img, ocr_region, encode_image)
+        _page_to_html_parts(
+            _collapse_repeated_rows_md(_close_unclosed_tables(md)),
+            img,
+            ocr_region,
+            encode_image,
+        )
         for md, img in zip(pages_md, images, strict=True)
     ]
     # Front matter the OCR scattered into the article's first page — a glossary

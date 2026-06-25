@@ -1042,3 +1042,17 @@ class TestJafcTruncatedPageRecovery:
         # The pH-activity prose that followed Table 2 on the page was dropped with the
         # truncation; the re-OCR brings it back.
         assert "highest enzyme activity at pH 8" in jafc_html
+
+    def test_table_2_has_no_decode_loop_explosion(self, jafc_html: str) -> None:
+        # The page-level re-OCR (full-window retry on the truncated Table 2 page) can
+        # decode-loop and trail the real table with dozens of byte-identical empty
+        # rows ("RAMS Deviations" explosion).  ``test_table_2_complete`` stays green
+        # through it — its anchor strings precede the loop and the table is still
+        # balanced — so assert the explosion is gone directly: no row repeats more
+        # than a sane handful of times in a row.
+        rows = re.findall(r"<tr\b.*?</tr>", jafc_html, re.DOTALL | re.IGNORECASE)
+        longest_run = max_run = 1
+        for prev, cur in zip(rows, rows[1:], strict=False):
+            max_run = max_run + 1 if cur == prev else 1
+            longest_run = max(longest_run, max_run)
+        assert longest_run <= 3, f"decode-loop explosion: {longest_run} identical rows"

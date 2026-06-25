@@ -588,6 +588,99 @@ class TestTableTextHelpers:
             "Tris &amp; HCl buffer</p>"
         )
 
+    def test_collapse_repeated_rows_kills_decode_loop(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows
+
+        # The crop re-OCR fell into a repetition loop, trailing a real table with
+        # dozens of identical "RAMS Deviations" rows; collapse them to one.
+        loop = "\n".join(
+            "<tr><td>RAMS Deviations</td><td></td></tr>" for _ in range(55)
+        )
+        table = (
+            "<table><tbody>"
+            "<tr><td>bond lengths</td><td>0.011</td></tr>\n" + loop + "</tbody></table>"
+        )
+        collapsed = _collapse_repeated_rows(table)
+        assert collapsed.count("RAMS Deviations") == 1
+        assert "<td>bond lengths</td>" in collapsed
+
+    def test_collapse_repeated_rows_keeps_short_repeats(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows
+
+        # Genuine adjacent rows that happen to repeat a value a few times are not a
+        # decode loop — a short run is left untouched.
+        table = (
+            "<table><tbody>"
+            "<tr><td>x</td><td>1</td></tr>"
+            "<tr><td>x</td><td>1</td></tr>"
+            "<tr><td>x</td><td>1</td></tr>"
+            "</tbody></table>"
+        )
+        assert _collapse_repeated_rows(table) == table
+
+    def test_collapse_repeated_rows_preserves_repeated_cell_value(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows
+
+        # A column repeating "NA" (or a number) across many rows is real data, not a
+        # loop — the rows differ in their label cell, so they are not byte-identical
+        # and must be left intact.
+        table = (
+            "<table><tbody>"
+            + "".join(
+                f"<tr><td>{label}</td><td>NA</td></tr>"
+                for label in ("completeness", "redundancy", "resolution", "Rwork")
+            )
+            + "</tbody></table>"
+        )
+        assert _collapse_repeated_rows(table) == table
+
+    def test_collapse_repeated_rows_preserves_sign_and_superscript_diffs(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows
+
+        # The comparison is byte-exact, not normalized: rows sharing a label but
+        # differing only by a sign or a superscript carry distinct data and must
+        # survive (a normalized key would fold +1.5/-1.5 and R²/R2 together).
+        table = (
+            "<table><tbody>"
+            "<tr><td>ΔG</td><td>+1.5</td></tr>"
+            "<tr><td>ΔG</td><td>-1.5</td></tr>"
+            "<tr><td>ΔG</td><td>+1.5</td></tr>"
+            "<tr><td>ΔG</td><td>-1.5</td></tr>"
+            "</tbody></table>"
+        )
+        assert _collapse_repeated_rows(table) == table
+
+    def test_collapse_repeated_rows_md_collapses_page_table_loop(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows_md
+
+        # The page-level re-OCR (not the crop path) can land a decode loop straight
+        # in pages_md; the markdown-level pass collapses every table's loop in place
+        # and leaves surrounding prose untouched.
+        loop = "".join("<tr><td>RAMS Deviations</td><td></td></tr>" for _ in range(40))
+        md = (
+            "Some prose before.\n\n"
+            '<table border="1" class="dataframe"><tbody>'
+            "<tr><td>bond lengths</td><td>0.011</td></tr>" + loop + "</tbody></table>"
+            "\n\nSome prose after."
+        )
+        collapsed = _collapse_repeated_rows_md(md)
+        assert collapsed.count("RAMS Deviations") == 1
+        assert "<td>bond lengths</td>" in collapsed
+        assert "Some prose before." in collapsed
+        assert "Some prose after." in collapsed
+
+    def test_collapse_repeated_rows_md_is_idempotent_without_loop(self) -> None:
+        from pdfparser.pipeline.tables import _collapse_repeated_rows_md
+
+        # A page whose tables carry no degenerate run is returned byte-for-byte.
+        md = (
+            "Intro.\n\n<table><tbody>"
+            "<tr><td>a</td><td>1</td></tr>"
+            "<tr><td>b</td><td>2</td></tr>"
+            "</tbody></table>\n\nOutro."
+        )
+        assert _collapse_repeated_rows_md(md) == md
+
     def test_extract_tables_strips_inner_caption(self) -> None:
         from pdfparser.pipeline.tables import _extract_tables
 
