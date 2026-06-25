@@ -1121,6 +1121,37 @@ def _extract_front_matter(body: list[str]) -> tuple[list[str], list[str]]:
     return list(body[:n]) + trailing, kept
 
 
+def _recover_headingless_abstract(body: list[str]) -> tuple[list[str], list[str]]:
+    """Promote the leading prose run that precedes the first section heading to the
+    abstract — returns ``(abstract, rest)``.
+
+    Some journals (Frontiers, Bioscience Reports) print the abstract with neither an
+    "Abstract" heading nor an inline bold ``**ABSTRACT:**`` label, so the classifier's
+    cued paths miss it and it lands at the top of the body.  Run only as a fallback
+    (when no abstract was otherwise found) and *after* front-matter extraction, so the
+    affiliation/keyword furniture is already gone and the run opens on the abstract.
+
+    Conservative against the never-hide-the-whole-body rule: only substantial
+    body-prose paragraphs (no front-matter or list-like block), and only when a
+    section heading immediately follows the run — a heading-less short note, which may
+    carry no abstract at all, is left untouched."""
+    n = 0
+    for part in body:
+        if _heading_inner(part) is not None:
+            break
+        if (
+            _looks_like_body_prose(part)
+            and not _is_frontmatter_text(part, strict=False)
+            and not _is_list_like(part)
+        ):
+            n += 1
+            continue
+        break
+    if n == 0 or n >= len(body) or _heading_inner(body[n]) is None:
+        return [], body
+    return list(body[:n]), list(body[n:])
+
+
 def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[str]]:
     """Pull glossary-style metadata sections out of a single page's block stream,
     wherever they sit — returns ``(metadata, rest)``.

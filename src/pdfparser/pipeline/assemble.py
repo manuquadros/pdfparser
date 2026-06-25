@@ -28,6 +28,7 @@ from pdfparser.pipeline.classify import (
     _extract_named_metadata_sections,
     _extract_stray_metadata,
     _leading_pages_to_skip_md,
+    _recover_headingless_abstract,
     _strip_running_furniture,
 )
 from pdfparser.pipeline.figures import (
@@ -579,6 +580,10 @@ def _assemble_html(
     body = _consolidate_numbered_references(body)
     body = _insert_footnotes_before_refs(body, meta.footnotes)
     leading_metadata, body = _extract_front_matter(body)
+    # A headingless, label-less abstract (Frontiers, Bioscience Reports) the
+    # classifier left atop the body — recovered once the leading front matter is gone.
+    if not abstract:
+        abstract, body = _recover_headingless_abstract(body)
     metadata = leading_metadata + named_metadata + stray_metadata
 
     return _document_shell(

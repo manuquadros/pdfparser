@@ -321,6 +321,51 @@ class TestLightonAssembly:
         assert "The abstract paragraph here." in html[start:end]
         assert "Prose." not in html[start:end]
 
+    def test_headingless_abstract_recovered_to_section(self) -> None:
+        # A journal that prints the abstract with neither an "Abstract" heading nor
+        # an inline bold label (Frontiers, Bioscience Reports): the leading prose run
+        # before the first section heading is promoted to the abstract section.
+        md = (
+            "# A Study\n\nJane Doe¹\n\n"
+            "This study reports a finding presented in a headingless abstract "
+            "paragraph that precedes the first section heading.\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        start = html.find("<section class='abstract'>")
+        end = html.find("</section>", start)
+        assert "This study reports a finding" in html[start:end]
+        assert "This study reports a finding" not in _body(html)
+        assert "<h2>Introduction</h2>" in _body(html)
+        assert "The body begins here." in _body(html)
+
+    def test_headingless_recovery_skipped_without_following_heading(self) -> None:
+        # Never hide the whole body: with no section heading after the leading prose
+        # (a short note that may carry no abstract) the recovery leaves it in place.
+        from pdfparser.pipeline.classify import _recover_headingless_abstract
+
+        body = [
+            "<p>A lone substantial prose paragraph with no section heading after "
+            "it, so it cannot be assumed to be an abstract.</p>",
+            "<p>Another body paragraph, still no heading.</p>",
+        ]
+        abstract, rest = _recover_headingless_abstract(body)
+        assert abstract == []
+        assert rest == body
+
+    def test_headingless_recovery_skips_existing_abstract_cue(self) -> None:
+        # The recovery is a fallback: a cued abstract (heading or inline label) is
+        # already classified, so the leading body run is left untouched.
+        md = (
+            "# T\n\n## Abstract\n\nThe cued abstract paragraph.\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        start = html.find("<section class='abstract'>")
+        end = html.find("</section>", start)
+        assert "The cued abstract paragraph." in html[start:end]
+        assert "The body begins here." in _body(html)
+
     def test_leading_superscript_routed_to_footnote_before_refs(self) -> None:
         md = (
             "# T\n\n## Abstract\n\nAbstract.\n\n## Body\n\n"
@@ -458,10 +503,10 @@ class TestLightonAssembly:
         assert "<h2>Background</h2>" in _body(html)
 
     def test_keywords_after_headingless_abstract_relocated(self) -> None:
-        # When the abstract has no "Abstract" heading it stays in the body and heads
-        # it, so the leading front-matter run never starts; the keyword line right
-        # after it is still relocated to the panel (post-classify), while the
-        # abstract prose stays visible in the body.
+        # An abstract with no "Abstract" heading is recovered into the abstract
+        # section (see test_headingless_abstract_recovered_to_section); the keyword
+        # line right after it is still relocated to the panel (post-classify, before
+        # the recovery), and never leaks into the body.
         md = (
             "# T\n\nWe report the discovery of an enzyme, described in this "
             "abstract which carries no heading and so remains in the body.\n\n"
@@ -471,7 +516,10 @@ class TestLightonAssembly:
         html = _run_lighton([md])
         assert "Keywords:" in _metadata(html)
         assert "Keywords:" not in _body(html)
-        assert "We report the discovery of an enzyme" in _body(html)
+        start = html.find("<section class='abstract'>")
+        end = html.find("</section>", start)
+        assert "We report the discovery of an enzyme" in html[start:end]
+        assert "We report the discovery of an enzyme" not in _body(html)
 
     def test_extract_front_matter_relocates_trailing_label(self) -> None:
         from pdfparser.pipeline.classify import _extract_front_matter
@@ -867,9 +915,13 @@ class TestLightonAssembly:
         ):
             assert fragment in meta, fragment
             assert fragment not in body, fragment
-        # The abstract stays in the body, not glued onto the affiliation and hidden.
-        assert "Bioconversion of C1 chemicals" in body
+        # The abstract is recovered into the abstract section, not glued onto the
+        # affiliation and hidden in the panel.
+        start = html.find("<section class='abstract'>")
+        end = html.find("</section>", start)
+        assert "Bioconversion of C1 chemicals" in html[start:end]
         assert "Bioconversion of C1 chemicals" not in meta
+        assert "Bioconversion of C1 chemicals" not in body
         # The glossary footnote is pulled out before the merge, so the paragraph it
         # split rejoins as one block in the body.
         assert (
@@ -1168,11 +1220,12 @@ class TestLightonAssembly:
     def test_body_sentence_mentioning_university_not_hidden(self) -> None:
         # The affiliation detector must not hide a body sentence that merely names
         # an institution: a terminal period marks it as prose, not an address.
+        # (Placed after a real abstract+heading so the headingless-abstract recovery
+        # doesn't claim it — the recovery only promotes the leading pre-heading run.)
         md = (
-            "# A Study\n\n"
+            "# A Study\n\n## Abstract\n\nThe abstract.\n\n## Methods\n\n"
             "The work was carried out with the University of Example, the "
-            "Department of Chemistry, and several partners.\n\n"
-            "## Methods\n\nMethod text."
+            "Department of Chemistry, and several partners."
         )
         body = _body(_run_lighton([md]))
         assert "The work was carried out with the University of Example" in body

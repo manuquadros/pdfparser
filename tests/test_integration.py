@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from helpers import (
+    _abstract,
     _body,
     _figure_size_by_caption,
     _figure_sizes,
@@ -689,23 +690,31 @@ class TestFrontiersSidebarMetadata:
         assert "<em>" not in byline
         assert ",," not in byline
 
-    def test_abstract_in_body_not_hidden_in_panel(self, frontiers_html: str) -> None:
-        # The affiliation run ends "…South Korea" with no terminal punctuation; the
-        # merge must not absorb the abstract that follows it (which, opening with the
-        # affiliation's "¹", would otherwise be hidden in the collapsed panel).
-        panel, body = _metadata(frontiers_html), _body(frontiers_html)
-        abstract = (
+    def test_headingless_abstract_recovered_to_section(
+        self, frontiers_html: str
+    ) -> None:
+        # The abstract has no "Abstract" heading and no inline label, and the
+        # affiliation run before it ends "…South Korea" with no terminal punctuation;
+        # it must be recovered into the abstract section, not left in the body nor
+        # (opening with the affiliation's "¹") hidden in the collapsed panel.
+        abstract_text = (
             "Bioconversion of C1 chemicals such as methane and methanol into higher"
         )
-        assert abstract in body
-        assert abstract not in panel
+        abstract, panel, body = (
+            _abstract(frontiers_html),
+            _metadata(frontiers_html),
+            _body(frontiers_html),
+        )
+        assert abstract_text in abstract
+        assert abstract_text not in body
+        assert abstract_text not in panel
 
     def test_keywords_relocated_to_panel_after_headingless_abstract(
         self, frontiers_html: str
     ) -> None:
-        # The headingless abstract stays in the body and heads it, so the leading
-        # front-matter run never starts; the keyword line right after it is still
-        # relocated to the panel (post-classify), not stranded in the body.
+        # The headingless abstract is recovered to its own section; the keyword line
+        # that follows it is relocated to the panel (post-classify), not stranded in
+        # the body.
         panel, body = _metadata(frontiers_html), _body(frontiers_html)
         assert "<strong>Keywords:</strong>" in panel
         assert "<strong>Keywords:</strong>" not in body
@@ -831,9 +840,11 @@ class TestBioscienceReportsRunningHeader:
         assert _body(bsr_html).count(self._CITATION) == 0
 
     def test_open_access_banner_not_glued_to_abstract(self, bsr_html: str) -> None:
-        # the abstract is visible in the body, without the OPEN ACCESS banner prefix
-        # the model bolds onto its front (<strong>OPEN ACCESS</strong> Hydroxy…)
-        assert "Hydroxyethylsulfonate" in _body(bsr_html)
+        # the headingless abstract is recovered into the abstract section, without the
+        # OPEN ACCESS banner prefix the model bolds onto its front
+        # (<strong>OPEN ACCESS</strong> Hydroxy…)
+        assert "Hydroxyethylsulfonate" in _abstract(bsr_html)
+        assert "Hydroxyethylsulfonate" not in _body(bsr_html)
         assert "<strong>OPEN ACCESS</strong>" not in bsr_html
 
     def test_title_and_references_intact(self, bsr_html: str) -> None:

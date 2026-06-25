@@ -106,6 +106,14 @@ def _metadata(html: str) -> str:
     return html[start : html.find("</details>", start)]
 
 
+def _abstract(html: str) -> str:
+    """Content of the <section class='abstract'> element; '' when absent."""
+    start = html.find("<section class='abstract'>")
+    if start < 0:
+        return ""
+    return html[start : html.find("</section>", start)]
+
+
 def _header_h1(html: str) -> str:
     """Return the text of the document's <header><h1> title element."""
     m = re.search(r"<header>.*?<h1>(.*?)</h1>", html, re.DOTALL)
