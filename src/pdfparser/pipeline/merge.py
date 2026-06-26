@@ -77,6 +77,15 @@ _MAX_FLOATS_TO_SKIP = 3
 _TABLE_OPEN_RE = re.compile(r"^<table[\s>]", re.IGNORECASE)
 _TABLE_OPEN_TAG_RE = re.compile(r"^<table\b[^>]*>", re.IGNORECASE)
 _FIGURE_OPEN_RE = re.compile(r"^<figure[\s>]", re.IGNORECASE)
+_FIRST_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+# A row that is a single cell spanning ``colspan`` (>= 2) columns — the shape a
+# table title takes when the model bakes it into the table instead of leaving it a
+# free-standing caption.
+_SPANNING_TITLE_CELL_RE = re.compile(
+    r"^<(th|td)\b[^>]*\bcolspan\s*=\s*[\"']?([2-9]\d*)[^>]*>(.*?)</\1>$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EMPTY_THEAD_RE = re.compile(r"<thead\b[^>]*>\s*</thead>", re.IGNORECASE)
 # A *bare* table label: the "Table <id>" caption header with no descriptive text
 # after it ("TABLE I", "Table 1.", "Supplementary Table 2:").  Unlike
 # _TABLE_CAPTION_RE this rejects a label carrying its own title ("Table 4 X"),
@@ -357,6 +366,35 @@ def _inject_table_caption(table_html: str, caption_part: str) -> str:
     )
 
 
+def _hoist_inline_table_caption(table_html: str) -> str:
+    """Hoist a table's leading "Table N …" title row into a ``<caption>``.
+
+    When the OCR (or the text-layer rebuild) bakes the title into the first row as a
+    lone spanning ``<th colspan=N>Table N …</th>`` cell instead of leaving it a
+    free-standing block, ``_colocate_table_captions`` can't fold it. Recognise that
+    row — the first row, one cell spanning multiple columns, caption-shaped text — and
+    move it out into a ``<caption>`` so the title renders semantically like every other
+    table's. The caption-text guard (``_TABLE_CAPTION_RE``) leaves a genuine spanning
+    *section* header (e.g. "A. Effect of EDTA …") in place as a row.
+    """
+    if "<caption" in table_html.lower():
+        return table_html
+    row = _FIRST_ROW_RE.search(table_html)
+    if row is None:
+        return table_html
+    cell = _SPANNING_TITLE_CELL_RE.match(row.group(1).strip())
+    if cell is None:
+        return table_html
+    inner = cell.group(3).strip()
+    if not _TABLE_CAPTION_RE.match(_visible_text(inner).lstrip()):
+        return table_html
+    body = table_html[: row.start()] + table_html[row.end() :]
+    body = _EMPTY_THEAD_RE.sub("", body)
+    return _TABLE_OPEN_TAG_RE.sub(
+        lambda m: f"{m.group(0)}<caption>{inner}</caption>", body, count=1
+    )
+
+
 def _claim_table_caption(
     table_idx: int,
     step: int,
@@ -386,7 +424,14 @@ def _colocate_table_captions(parts: list[str]) -> list[str]:
     one just *before* it (the usual convention), else just *after* — skipping
     only intervening figures and never reaching across prose or another table.
     A caption with no table nearby is left untouched as its own block.
+
+    A table that carries its title as an inline spanning row (rather than a
+    free-standing block) is first rewritten so the title becomes its ``<caption>``;
+    it then reads as already-captioned here and claims no neighbouring caption.
     """
+    parts = [
+        _hoist_inline_table_caption(p) if _TABLE_OPEN_RE.match(p) else p for p in parts
+    ]
     n = len(parts)
     is_caption = [_is_table_caption(p) for p in parts]
     is_figure = [bool(_FIGURE_OPEN_RE.match(p)) for p in parts]

@@ -357,6 +357,73 @@ class TestCaptionMergeBarrier:
         assert out[1:] == parts[1:4]
 
 
+class TestInlineTableTitleHoist:
+    """A table title the model bakes into the first row as a lone spanning
+    ``<th colspan=N>Table N …</th>`` cell is hoisted into a ``<caption>``."""
+
+    def test_thead_title_row_hoisted_to_caption(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        parts = [
+            "<table>\n  <thead>\n    <tr>\n"
+            '      <th colspan="5">Table 1. Kinetic Analysis of CgKARI</th>\n'
+            "    </tr>\n    <tr>\n      <th></th>\n      <th>Vmax</th>\n"
+            "      <th>Km</th>\n      <th>kcat</th>\n      <th>kcat/Km</th>\n"
+            "    </tr>\n  </thead>\n  <tbody>\n"
+            "    <tr><td>NADPH</td><td>0.4</td><td>0.02</td>"
+            "<td>13</td><td>578</td></tr>\n"
+            "  </tbody>\n</table>"
+        ]
+        (out,) = _colocate_table_captions(parts)
+        assert "<caption>Table 1. Kinetic Analysis of CgKARI</caption>" in out
+        # The title row is gone, the real header survives, no empty <thead> left.
+        assert 'colspan="5">Table 1' not in out
+        assert "<th>Vmax</th>" in out
+        assert "<thead></thead>" not in out
+
+    def test_caption_first_thead_title_row_hoisted_without_thead(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        # The text-layer-rebuilt shape: no <thead>, the title is the first <tr>.
+        parts = [
+            "<table>\n<tr>\n"
+            '      <th colspan="2">Table 2. Data Collection Statistics</th>\n'
+            "    </tr>\n"
+            "<tr><td></td><td>CgKARI_NADP⁺</td></tr>\n"
+            "<tr><td>PDB code</td><td>6JX2</td></tr>\n</table>"
+        ]
+        (out,) = _colocate_table_captions(parts)
+        assert "<caption>Table 2. Data Collection Statistics</caption>" in out
+        assert 'colspan="2">Table 2' not in out
+        assert "<td>CgKARI_NADP⁺</td>" in out
+
+    def test_spanning_section_header_not_hoisted(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        # A genuine full-width *section* header ("A. Effect of EDTA …") is not a
+        # "Table N" caption, so it stays a row and no <caption> is fabricated.
+        parts = [
+            "<table>\n  <thead>\n"
+            '    <tr><th colspan="3">A. Effect of EDTA on SpRDH activity</th></tr>\n'
+            "    <tr><th></th><th>1 mM</th><th>10 mM</th></tr>\n"
+            "  </thead>\n  <tbody>\n"
+            "    <tr><td>None</td><td>100</td><td>100</td></tr>\n  </tbody>\n</table>"
+        ]
+        (out,) = _colocate_table_captions(parts)
+        assert "<caption>" not in out
+        assert 'colspan="3">A. Effect of EDTA' in out
+
+    def test_ordinary_multicell_header_row_untouched(self) -> None:
+        from pdfparser.pipeline.merge import _colocate_table_captions
+
+        # A normal multi-cell first row (no lone spanning title cell) is left alone.
+        parts = [
+            "<table><thead><tr><th>Gene</th><th>Length</th></tr></thead>"
+            "<tbody><tr><td>xecD1</td><td>800</td></tr></tbody></table>"
+        ]
+        assert _colocate_table_captions(parts) == parts
+
+
 class TestReflowWrappedParagraph:
     """When LightOnOCR preserves a column's visual line wrapping, a paragraph
     arrives as soft-wrapped lines inside one <p>: words break across the wrap

@@ -1078,6 +1078,21 @@ class TestJafcAbstractAndByline:
         assert kw in panel
         assert "<strong>KEYWORDS" not in body
 
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Table 1. Kinetic Analysis of CgKARI",
+            "Table 2. Data Collection and Structural Refinement Statistics",
+        ],
+    )
+    def test_table_title_rendered_as_caption(self, jafc_html: str, title: str) -> None:
+        # The model bakes each table's title into the first row as a lone spanning
+        # "<th colspan=N>Table N. …</th>" cell; it is hoisted into a <caption> so it
+        # renders semantically like every other fixture's table title, not as a header.
+        assert f"<caption>{title}</caption>" in jafc_html
+        assert f'colspan="5">{title}' not in jafc_html
+        assert f'colspan="2">{title}' not in jafc_html
+
     def test_paragraphs_after_citation_superscript_not_merged(
         self, jafc_html: str
     ) -> None:
