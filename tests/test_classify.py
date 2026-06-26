@@ -321,6 +321,33 @@ class TestLightonAssembly:
         assert "The abstract paragraph here." in html[start:end]
         assert "Prose." not in html[start:end]
 
+    def test_abstract_citation_tail_relocated_to_panel(self) -> None:
+        # A copyright/journal-citation clause the OCR ran onto the abstract's end is
+        # front matter: split off and surfaced in the Metadata panel, not the abstract.
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract prose ends here. "
+            "© 2018 International Union of Biochemistry, 47(2):124–132, 2019.\n\n"
+            "## Introduction\n\nBody."
+        )
+        html = _run_lighton([md])
+        start = html.find("<section class='abstract'>")
+        abstract = html[start : html.find("</section>", start)]
+        assert "The abstract prose ends here." in abstract
+        assert "International Union" not in abstract
+        assert "© 2018 International Union" in _metadata(html)
+
+    def test_split_abstract_citation_pure(self) -> None:
+        from pdfparser.pipeline.classify import _split_abstract_citation
+
+        abstract = ["<p>Prose ends here. © 2019 A Publisher, 66(4):597–606, 2019</p>"]
+        kept, tail = _split_abstract_citation(abstract)
+        assert kept == ["<p>Prose ends here.</p>"]
+        assert tail == ["<p>© 2019 A Publisher, 66(4):597–606, 2019</p>"]
+        # an abstract without a copyright tail is returned unchanged
+        plain = ["<p>Just abstract prose, no citation, mentioning 2019 in passing.</p>"]
+        assert _split_abstract_citation(plain) == (plain, [])
+        assert _split_abstract_citation([]) == ([], [])
+
     def test_headingless_abstract_recovered_to_section(self) -> None:
         # A journal that prints the abstract with neither an "Abstract" heading nor
         # an inline bold label (Frontiers, Bioscience Reports): the leading prose run

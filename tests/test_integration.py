@@ -83,6 +83,20 @@ class TestPipeline:
         # And they must appear in the same paragraph — no split <p>.
         assert "classical and contemporary</p>" not in abstract_block
 
+    def test_abstract_citation_tail_in_panel_not_abstract(
+        self, article_html: str
+    ) -> None:
+        # The OCR runs the article's copyright + journal citation
+        # ("© 2018 International Union …, 47(2):124–132, 2019.") onto the abstract's
+        # end; it is front matter and must be relocated to the Metadata panel.
+        abstract_start = article_html.find("<section class='abstract'>")
+        abstract = article_html[
+            abstract_start : article_html.find("</section>", abstract_start)
+        ]
+        assert "University-Chico." in abstract  # the real abstract still ends here
+        assert "International Union of Biochemistry" not in abstract
+        assert "International Union of Biochemistry" in _metadata(article_html)
+
     def test_nad_plus_superscript_rendered_in_body(self, article_html: str) -> None:
         # NAD$^+$ -> NAD⁺: the end-to-end LaTeX-superscript path (OCR -> span
         # conversion -> render), only otherwise covered as a unit test.

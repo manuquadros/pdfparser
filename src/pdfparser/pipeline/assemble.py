@@ -29,6 +29,7 @@ from pdfparser.pipeline.classify import (
     _extract_stray_metadata,
     _leading_pages_to_skip_md,
     _recover_headingless_abstract,
+    _split_abstract_citation,
     _strip_running_furniture,
 )
 from pdfparser.pipeline.figures import (
@@ -584,7 +585,10 @@ def _assemble_html(
     # classifier left atop the body — recovered once the leading front matter is gone.
     if not abstract:
         abstract, body = _recover_headingless_abstract(body)
-    metadata = leading_metadata + named_metadata + stray_metadata
+    # A copyright/journal-citation clause the OCR ran onto the abstract's end is front
+    # matter; move it to the panel so it doesn't read as abstract prose.
+    abstract, abstract_citation = _split_abstract_citation(abstract)
+    metadata = leading_metadata + named_metadata + stray_metadata + abstract_citation
 
     return _document_shell(
         title_html=meta.title_html or "Untitled",

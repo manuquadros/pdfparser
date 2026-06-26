@@ -466,6 +466,14 @@ _ABSTRACT_HEADING_RE = re.compile(r"^\s*abstract\b", re.IGNORECASE)
 _INLINE_ABSTRACT_RE = re.compile(
     r"^<strong>\s*abstract\s*(?::\s*</strong>|</strong>\s*:)\s*", re.IGNORECASE
 )
+# Some journals run the article's copyright + journal citation onto the end of the
+# abstract ("… University-Chico. © 2018 …, 47(2):124–132, 2019.").  That tail is front
+# matter, not abstract prose; anchored on a copyright sign followed by a year so it
+# can't fire on a mid-abstract "©" mention, and split off to the Metadata panel.
+_ABSTRACT_CITATION_TAIL_RE = re.compile(
+    r"^(<p[^>]*>)(.*?)(\s*(?:©|\(c\))\s*\d{4}\b.*?)(</p>)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 # A paragraph opening with a bold label, with the colon inside or outside the bold
 # ("<strong>Keywords:</strong>" / "<strong>KEYWORDS</strong>:").  Broader than
 # text._BOLD_LABEL_RE (colon-inside only); used to end the abstract so a
@@ -1150,6 +1158,21 @@ def _recover_headingless_abstract(body: list[str]) -> tuple[list[str], list[str]
     if n == 0 or n >= len(body) or _heading_inner(body[n]) is None:
         return [], body
     return list(body[:n]), list(body[n:])
+
+
+def _split_abstract_citation(abstract: list[str]) -> tuple[list[str], list[str]]:
+    """Split a trailing copyright/journal-citation clause off the abstract.
+
+    Returns ``(abstract, tail)``: the abstract with the clause removed from its last
+    paragraph, and ``tail`` a (possibly empty) list of blocks for the caller to put in
+    the Metadata panel — the copyright/citation is front matter, not abstract prose."""
+    if not abstract:
+        return abstract, []
+    m = _ABSTRACT_CITATION_TAIL_RE.match(abstract[-1])
+    if m is None:
+        return abstract, []
+    prose = m.group(1) + m.group(2).rstrip() + m.group(4)
+    return abstract[:-1] + [prose], [f"<p>{m.group(3).strip()}</p>"]
 
 
 def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[str]]:
