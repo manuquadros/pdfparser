@@ -468,10 +468,12 @@ _INLINE_ABSTRACT_RE = re.compile(
 )
 # Some journals run the article's copyright + journal citation onto the end of the
 # abstract ("… University-Chico. © 2018 …, 47(2):124–132, 2019.").  That tail is front
-# matter, not abstract prose; anchored on a copyright sign followed by a year so it
-# can't fire on a mid-abstract "©" mention, and split off to the Metadata panel.
+# matter, not abstract prose; it is split off to the Metadata panel.  Anchored on the
+# copyright *sign* followed by a year (a bare "(c)" is dropped — it false-matches
+# chemistry/quantities like "(c) 2000 mg").  The prose group is *greedy* so the split
+# lands on the **last** "© <year>" clause, not an earlier in-abstract "© 1998" mention.
 _ABSTRACT_CITATION_TAIL_RE = re.compile(
-    r"^(<p[^>]*>)(.*?)(\s*(?:©|\(c\))\s*\d{4}\b.*?)(</p>)\s*$",
+    r"^(<p[^>]*>)(.*)(\s*©\s*\d{4}\b.*?)(</p>)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 # A paragraph opening with a bold label, with the colon inside or outside the bold
@@ -1169,7 +1171,9 @@ def _split_abstract_citation(abstract: list[str]) -> tuple[list[str], list[str]]
     if not abstract:
         return abstract, []
     m = _ABSTRACT_CITATION_TAIL_RE.match(abstract[-1])
-    if m is None:
+    # Require real prose before the clause: a citation-*only* paragraph would otherwise
+    # leave an empty ``<p></p>`` stub, and is too degenerate to be a real abstract.
+    if m is None or not m.group(2).strip():
         return abstract, []
     prose = m.group(1) + m.group(2).rstrip() + m.group(4)
     return abstract[:-1] + [prose], [f"<p>{m.group(3).strip()}</p>"]

@@ -348,6 +348,32 @@ class TestLightonAssembly:
         assert _split_abstract_citation(plain) == (plain, [])
         assert _split_abstract_citation([]) == ([], [])
 
+    def test_split_abstract_citation_anchors_on_last_clause(self) -> None:
+        from pdfparser.pipeline.classify import _split_abstract_citation
+
+        # An in-abstract "© <year>" mention must be kept; only the trailing journal
+        # citation is split off (the prose group is greedy, anchoring on the last ©).
+        abstract = [
+            "<p>An older work © 1998 noted X. The abstract continues here. "
+            "© 2019 Publisher, 1(1):1–2, 2019</p>"
+        ]
+        kept, tail = _split_abstract_citation(abstract)
+        assert "© 1998 noted X. The abstract continues here." in kept[0]
+        assert tail == ["<p>© 2019 Publisher, 1(1):1–2, 2019</p>"]
+
+    def test_split_abstract_citation_ignores_parenthetical_c_and_citation_only(
+        self,
+    ) -> None:
+        from pdfparser.pipeline.classify import _split_abstract_citation
+
+        # A bare "(c) <number>" is not a copyright sign — a quantity like "(c) 2000 mg"
+        # must not be mistaken for a citation tail.
+        quantity = ["<p>The molecule (c) 2000 mg was tested for activity.</p>"]
+        assert _split_abstract_citation(quantity) == (quantity, [])
+        # A citation-only paragraph is left intact (no empty <p></p> stub is produced).
+        citation_only = ["<p>© 2018 Publisher, 1(1):1–2, 2018</p>"]
+        assert _split_abstract_citation(citation_only) == (citation_only, [])
+
     def test_headingless_abstract_recovered_to_section(self) -> None:
         # A journal that prints the abstract with neither an "Abstract" heading nor
         # an inline bold label (Frontiers, Bioscience Reports): the leading prose run
