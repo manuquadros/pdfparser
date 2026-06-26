@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -43,6 +44,14 @@ _REQUEST_TIMEOUT_S = 600.0
 # The reachability probe must fail fast — it shares the client but not the long
 # generation budget, so a wedged server doesn't block startup for ten minutes.
 _HEALTH_TIMEOUT_S = 10.0
+# A page POST runs concurrently against a small shared GPU, so a transient
+# connection blip or vLLM overload status on any one page would otherwise abort the
+# whole multi-page document via the propagated exception.  Absorb those with a
+# bounded backoff retry.  A 4xx (e.g. a 400 malformed request) is a caller bug —
+# retrying re-fails identically — so it is *not* retried.
+_MAX_OCR_RETRIES = 2
+_RETRY_BACKOFF_BASE_S = 0.5
+_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
 
 @dataclass
@@ -99,20 +108,66 @@ def load_ocr_model(
     return OcrModel(client=client, base_url=base_url, model=model)
 
 
-def _model_context_len() -> int:
-    raw = os.environ.get("PDFPARSER_VLLM_MAX_MODEL_LEN")
+def _env_int(name: str, default: int) -> int:
+    """Read a positive-int env var, defaulting (with a warning) on a bad value."""
+    raw = os.environ.get(name)
     if raw is None:
-        return _DEFAULT_MODEL_CONTEXT_LEN
+        return default
     try:
         return max(1, int(raw))
     except ValueError:
         # A misconfigured deployment should be visible, not silently defaulted.
         warnings.warn(
-            f"PDFPARSER_VLLM_MAX_MODEL_LEN={raw!r} is not an integer; "
-            f"falling back to {_DEFAULT_MODEL_CONTEXT_LEN}",
-            stacklevel=2,
+            f"{name}={raw!r} is not an integer; falling back to {default}",
+            stacklevel=3,  # past this helper to the real caller
         )
-        return _DEFAULT_MODEL_CONTEXT_LEN
+        return default
+
+
+def _model_context_len() -> int:
+    return _env_int("PDFPARSER_VLLM_MAX_MODEL_LEN", _DEFAULT_MODEL_CONTEXT_LEN)
+
+
+def _request_ocr(encoded: str, ocr: OcrModel, max_new_tokens: int) -> httpx.Response:
+    """POST one page to the chat endpoint, retrying transient failures.
+
+    A connection blip (``httpx.TransportError`` — connect/read timeout, reset) or a
+    retryable vLLM status (``_RETRYABLE_STATUS``: overload / gateway) is retried with
+    exponential backoff up to ``_MAX_OCR_RETRIES`` times.  A non-retryable status (any
+    other 4xx/5xx) and a final exhausted retry re-raise unchanged, so a genuine error
+    still surfaces.
+    """
+    body = {
+        "model": ocr.model,
+        "temperature": 0.0,
+        "max_tokens": max_new_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    }
+                ],
+            }
+        ],
+    }
+    for attempt in range(_MAX_OCR_RETRIES + 1):
+        try:
+            response = ocr.client.post(f"{ocr.base_url}/chat/completions", json=body)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _RETRYABLE_STATUS:
+                raise
+            if attempt >= _MAX_OCR_RETRIES:
+                raise
+        except httpx.TransportError:
+            if attempt >= _MAX_OCR_RETRIES:
+                raise
+        time.sleep(_RETRY_BACKOFF_BASE_S * (2**attempt))
+    raise AssertionError("unreachable: OCR retry loop exited without return/raise")
 
 
 def _post_ocr_page(
@@ -125,26 +180,7 @@ def _post_ocr_page(
     image's token cost, from the response ``usage``) sizes a retry.  Either may be
     ``None`` for a server/mock that omits them — the caller then skips the retry.
     """
-    response = ocr.client.post(
-        f"{ocr.base_url}/chat/completions",
-        json={
-            "model": ocr.model,
-            "temperature": 0.0,
-            "max_tokens": max_new_tokens,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{encoded}"},
-                        }
-                    ],
-                }
-            ],
-        },
-    )
-    response.raise_for_status()
+    response = _request_ocr(encoded, ocr, max_new_tokens)
     payload = response.json()
     try:
         choice = payload["choices"][0]
@@ -202,19 +238,7 @@ def _ocr_page(
 
 
 def _resolve_ocr_concurrency() -> int:
-    raw = os.environ.get("PDFPARSER_OCR_CONCURRENCY")
-    if raw is None:
-        return _DEFAULT_OCR_CONCURRENCY
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        # A misconfigured deployment should be visible, not silently defaulted.
-        warnings.warn(
-            f"PDFPARSER_OCR_CONCURRENCY={raw!r} is not an integer; "
-            f"falling back to {_DEFAULT_OCR_CONCURRENCY}",
-            stacklevel=2,
-        )
-        return _DEFAULT_OCR_CONCURRENCY
+    return _env_int("PDFPARSER_OCR_CONCURRENCY", _DEFAULT_OCR_CONCURRENCY)
 
 
 def _ocr_pages(

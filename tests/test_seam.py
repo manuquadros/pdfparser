@@ -381,6 +381,105 @@ class TestOcrSeam:
         assert built and built[0].is_closed  # type: ignore[attr-defined]
 
 
+class TestOcrTransientRetry:
+    """A transient connection blip or vLLM overload status on one page must not
+    abort the whole document — it is retried with backoff; a non-retryable status
+    and an exhausted retry still propagate."""
+
+    @staticmethod
+    def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline import model
+
+        monkeypatch.setattr(model.time, "sleep", lambda _s: None)
+
+    def test_retryable_status_then_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 3:  # two transient 503s, then a good response
+                return httpx.Response(503, json={"error": "overloaded"})
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "recovered"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "recovered"
+        assert len(calls) == 3
+
+    def test_transport_error_then_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                raise httpx.ConnectError("connection reset")
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "ok"
+        assert len(calls) == 2
+
+    def test_retries_exhausted_reraises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import _MAX_OCR_RETRIES, OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(503, json={"error": "down"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        with pytest.raises(httpx.HTTPStatusError):
+            _ocr_page(_fake_image(8, 8), ocr)
+        # the initial attempt plus exactly _MAX_OCR_RETRIES retries, then it gives up
+        assert len(calls) == _MAX_OCR_RETRIES + 1
+
+    def test_non_retryable_status_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        # A 400 is a caller bug, not a transient blip — retrying re-fails identically,
+        # so it must propagate on the first attempt.
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(400, json={"error": "bad request"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        with pytest.raises(httpx.HTTPStatusError):
+            _ocr_page(_fake_image(8, 8), ocr)
+        assert len(calls) == 1
+
+
 class TestOcrConcurrencyResolution:
     """``PDFPARSER_OCR_CONCURRENCY`` parsing — defaulting, flooring, and the
     misconfiguration warning — without spinning up the thread pool."""
