@@ -47,11 +47,14 @@ _HEALTH_TIMEOUT_S = 10.0
 # A page POST runs concurrently against a small shared GPU, so a transient
 # connection blip or vLLM overload status on any one page would otherwise abort the
 # whole multi-page document via the propagated exception.  Absorb those with a
-# bounded backoff retry.  A 4xx (e.g. a 400 malformed request) is a caller bug —
-# retrying re-fails identically — so it is *not* retried.
+# bounded backoff retry.  Deliberately narrow (see _is_retryable_ocr_error): a 4xx
+# is a caller bug that re-fails identically, and a *timeout* already spent the full
+# per-request budget, so neither is retried.
 _MAX_OCR_RETRIES = 2
 _RETRY_BACKOFF_BASE_S = 0.5
 _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
+# Cap a server-sent Retry-After so a pathological header can't pin a pool worker.
+_MAX_RETRY_AFTER_S = 30.0
 
 
 @dataclass
@@ -128,14 +131,45 @@ def _model_context_len() -> int:
     return _env_int("PDFPARSER_VLLM_MAX_MODEL_LEN", _DEFAULT_MODEL_CONTEXT_LEN)
 
 
+def _is_retryable_ocr_error(exc: httpx.HTTPError) -> bool:
+    """Whether a failed page POST is worth re-issuing.
+
+    Retryable: a connection-level blip (``httpx.NetworkError`` — connect refused/reset,
+    a dropped read) or a vLLM overload/gateway status (``_RETRYABLE_STATUS``).  A
+    *timeout* (``httpx.TimeoutException``: read/connect/pool) is excluded on purpose —
+    it already spent the full per-request budget, so retrying re-spends it, and
+    ``_ocr_pages`` relies on a wedged page failing *without* retry so the pool tears
+    down promptly rather than after ~3× the timeout.  A 4xx (caller bug) is excluded
+    too — it re-fails identically.
+    """
+    if isinstance(exc, httpx.NetworkError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return False
+
+
+def _retry_delay(exc: httpx.HTTPError, attempt: int) -> float:
+    """Seconds to wait before the next attempt: honor a server-sent ``Retry-After`` on
+    an overload status (so the client doesn't pile load back onto a busy server),
+    capped by ``_MAX_RETRY_AFTER_S``; otherwise exponential backoff."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        raw = exc.response.headers.get("Retry-After")
+        if raw is not None:
+            try:
+                return min(max(0.0, float(raw)), _MAX_RETRY_AFTER_S)
+            except ValueError:
+                pass  # HTTP-date form (rare from vLLM) → fall back to backoff
+    return _RETRY_BACKOFF_BASE_S * (2.0**attempt)
+
+
 def _request_ocr(encoded: str, ocr: OcrModel, max_new_tokens: int) -> httpx.Response:
     """POST one page to the chat endpoint, retrying transient failures.
 
-    A connection blip (``httpx.TransportError`` — connect/read timeout, reset) or a
-    retryable vLLM status (``_RETRYABLE_STATUS``: overload / gateway) is retried with
-    exponential backoff up to ``_MAX_OCR_RETRIES`` times.  A non-retryable status (any
-    other 4xx/5xx) and a final exhausted retry re-raise unchanged, so a genuine error
-    still surfaces.
+    A connection-level blip or a retryable vLLM status (see ``_is_retryable_ocr_error``)
+    is retried with backoff (``_retry_delay``) up to ``_MAX_OCR_RETRIES`` times; any
+    other error — and a final exhausted retry — re-raises unchanged, so a genuine
+    failure (and a slow-timeout wedge) still surfaces promptly.
     """
     body = {
         "model": ocr.model,
@@ -158,15 +192,10 @@ def _request_ocr(encoded: str, ocr: OcrModel, max_new_tokens: int) -> httpx.Resp
             response = ocr.client.post(f"{ocr.base_url}/chat/completions", json=body)
             response.raise_for_status()
             return response
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in _RETRYABLE_STATUS:
+        except httpx.HTTPError as exc:
+            if not _is_retryable_ocr_error(exc) or attempt >= _MAX_OCR_RETRIES:
                 raise
-            if attempt >= _MAX_OCR_RETRIES:
-                raise
-        except httpx.TransportError:
-            if attempt >= _MAX_OCR_RETRIES:
-                raise
-        time.sleep(_RETRY_BACKOFF_BASE_S * (2**attempt))
+            time.sleep(_retry_delay(exc, attempt))
     raise AssertionError("unreachable: OCR retry loop exited without return/raise")
 
 

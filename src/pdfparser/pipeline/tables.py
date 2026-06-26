@@ -534,6 +534,35 @@ def _page_text_and_boxes(
     return "".join(parts), boxes, rotations
 
 
+@dataclass(frozen=True)
+class _PageLayer:
+    """A page's text layer extracted once: the raw text + per-char geometry, plus the
+    normalized text and its index map back to the raw stream.
+
+    Building it walks the page char by char through pdfium's native API (a
+    ``get_text_range`` + ``get_charbox`` + ``FPDFText_GetCharAngle`` round-trip each —
+    thousands of ctypes calls), so the localization passes share one instance per page
+    rather than re-extracting it per table."""
+
+    page_text: str
+    char_boxes: list[_Box | None]
+    char_rotations: list[int | None]
+    norm: str
+    idx_map: list[int]
+
+
+def _page_layer(page: pdfium.PdfPage) -> _PageLayer:
+    """Extract ``page``'s text layer once (see ``_PageLayer``), closing the native
+    text page handle rather than leaking it to GC."""
+    textpage = page.get_textpage()
+    try:
+        page_text, char_boxes, char_rotations = _page_text_and_boxes(textpage)
+    finally:
+        textpage.close()
+    norm, idx_map = _normalize_with_map(page_text)
+    return _PageLayer(page_text, char_boxes, char_rotations, norm, idx_map)
+
+
 def _glyph_centers(
     page_norm: str, idx_map: list[int], char_boxes: list[_Box | None]
 ) -> list[tuple[float, float] | None]:
@@ -657,9 +686,8 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
     if not regions:
         return md, []
 
-    page_text, char_boxes, char_rotations = _page_text_and_boxes(page.get_textpage())
-    page_norm, idx_map = _normalize_with_map(page_text)
-    centers = _glyph_centers(page_norm, idx_map, char_boxes)
+    layer = _page_layer(page)
+    centers = _glyph_centers(layer.norm, layer.idx_map, layer.char_boxes)
     page_size = page.get_size()
 
     plans: list[_RegionPlan] = []
@@ -667,10 +695,10 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
         cells = [c for tbl in tables for c in _cell_texts(tbl)]
         located = _locate_bbox(
             _anchor_texts(cells),
-            page_norm,
-            idx_map,
-            char_boxes,
-            char_rotations,
+            layer.norm,
+            layer.idx_map,
+            layer.char_boxes,
+            layer.char_rotations,
             page_size,
         )
         if located is None:
@@ -678,7 +706,7 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
         bbox, rot = located
         captured = {t for c in cells for t in _normalize(c).split()}
         captured |= _adjacent_para_tokens(md, start, end)
-        if _region_fully_captured(bbox, page_norm, centers, captured):
+        if _region_fully_captured(bbox, layer.norm, centers, captured):
             continue
         crop = _scaled_crop(page, bbox, page_size)
         # Turn a sideways table upright before re-OCR: the model reads an upright
@@ -866,15 +894,17 @@ def _build_reconstructed_table(
 
 
 def _reconstruct_table_from_text_layer(
-    page: pdfium.PdfPage, table_html: str
+    layer: _PageLayer, table_html: str
 ) -> str | None:
     """Rebuild a two-column table from the page text layer, or ``None`` if it can't be
     localized.  Localizes the table *column* from the OCR cells used as anchors, so the
     body prose in the other column of a two-column page is excluded."""
-    page_text, char_boxes, char_rot = _page_text_and_boxes(page.get_textpage())
-    page_norm, idx_map = _normalize_with_map(page_text)
     seeds, _ = _collect_seeds(
-        _anchor_texts(_cell_texts(table_html)), page_norm, idx_map, char_boxes, char_rot
+        _anchor_texts(_cell_texts(table_html)),
+        layer.norm,
+        layer.idx_map,
+        layer.char_boxes,
+        layer.char_rotations,
     )
     if len(seeds) < _RECON_MIN_SEEDS:
         return None
@@ -883,7 +913,7 @@ def _reconstruct_table_from_text_layer(
     y_top = max(s[3] for s in seeds) + _RECON_X_PAD
     glyphs = [
         (ch, b[0], b[2], (b[1] + b[3]) / 2)
-        for ch, b in zip(page_text, char_boxes, strict=True)
+        for ch, b in zip(layer.page_text, layer.char_boxes, strict=True)
         if b is not None
         and not ch.isspace()
         and col_left <= (b[0] + b[2]) / 2 <= col_right
@@ -930,11 +960,21 @@ def _repair_tables_from_text_layer(
 
 
 def _repair_page_tables(md: str, page: pdfium.PdfPage) -> str:
+    # Extract the page text layer lazily and at most once: _TABLE_RE.sub calls repair
+    # for every complete <table>, and the extraction is thousands of native calls — so
+    # share it across a page's 2-column tables, but skip it entirely on a page whose
+    # tables are all non-2-column (the common case) or whose <table> is unclosed (no
+    # _TABLE_RE match), where no reconstruction is ever attempted.
+    layer: _PageLayer | None = None
+
     def repair(m: re.Match[str]) -> str:
+        nonlocal layer
         table = m.group()
         if _table_columns(table) != 2:  # the repair only understands label|value tables
             return table
-        recon = _reconstruct_table_from_text_layer(page, table)
+        if layer is None:
+            layer = _page_layer(page)
+        recon = _reconstruct_table_from_text_layer(layer, table)
         # Compare against the *collapsed* OCR table: a decode-loop explosion inflates
         # its raw <tr> count (collapsed only later in _assemble_html), which would
         # otherwise mask a genuinely shorter (off-by-one/truncated) table.

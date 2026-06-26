@@ -387,6 +387,15 @@ class TestOcrTransientRetry:
     and an exhausted retry still propagate."""
 
     @staticmethod
+    def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        """Stub out the backoff sleep and return the list it records each delay into."""
+        from pdfparser.pipeline import model
+
+        delays: list[float] = []
+        monkeypatch.setattr(model.time, "sleep", lambda s: delays.append(s))
+        return delays
+
+    @staticmethod
     def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
         from pdfparser.pipeline import model
 
@@ -478,6 +487,55 @@ class TestOcrTransientRetry:
         with pytest.raises(httpx.HTTPStatusError):
             _ocr_page(_fake_image(8, 8), ocr)
         assert len(calls) == 1
+
+    def test_read_timeout_is_not_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        # A read timeout already spent the full per-request budget; retrying would
+        # re-spend it (~3× the 600s timeout) and defeats _ocr_pages' fast-fail of a
+        # wedged page — so it must propagate on the first attempt, unlike a connection
+        # blip (ConnectError, a NetworkError) which IS retried.
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            raise httpx.ReadTimeout("read timed out")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        with pytest.raises(httpx.ReadTimeout):
+            _ocr_page(_fake_image(8, 8), ocr)
+        assert len(calls) == 1
+
+    def test_retry_after_header_is_honored_and_capped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import _MAX_RETRY_AFTER_S, OcrModel, _ocr_page
+
+        delays = self._record_sleeps(monkeypatch)
+        calls: list[int] = []
+        # First a 503 with a sane Retry-After (honored verbatim), then a 503 with an
+        # absurd one (capped), then success — the client waits the server's hint rather
+        # than piling load back onto a busy server.
+        retry_afters = ["2", "9999"]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if retry_afters:
+                return httpx.Response(503, headers={"Retry-After": retry_afters.pop(0)})
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "ok"
+        assert delays == [2.0, _MAX_RETRY_AFTER_S]
 
 
 class TestOcrConcurrencyResolution:

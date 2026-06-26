@@ -1190,3 +1190,47 @@ class TestTextLayerTableRepair:
         assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in out
         assert re.search(r"wavelength \(Å\)</td><td>0\.97934", out)
         assert out.count("RAMS Deviations") <= 1
+
+
+class TestRepairLazyExtraction:
+    """_repair_page_tables extracts the page text layer lazily — at most once, and not
+    at all when no complete 2-column table is present — so a page with only
+    multi-column or unclosed tables pays nothing (the _page_layer call is thousands of
+    native pdfium calls)."""
+
+    def test_no_extraction_when_no_two_column_table(self) -> None:
+        from unittest.mock import MagicMock
+
+        import pypdfium2 as pdfium
+        import pytest
+
+        from pdfparser.pipeline import tables
+
+        calls: list[int] = []
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(tables, "_page_layer", lambda page: calls.append(1))
+            # a 3-column table: the repair only understands label|value (2-col) tables
+            md = "<table><tr><td>a</td><td>b</td><td>c</td></tr></table>"
+            page = MagicMock(spec=pdfium.PdfPage)
+            assert tables._repair_page_tables(md, page) == md
+        assert calls == []
+
+    def test_extraction_runs_once_across_two_column_tables(self) -> None:
+        from unittest.mock import MagicMock
+
+        import pypdfium2 as pdfium
+        import pytest
+
+        from pdfparser.pipeline import tables
+
+        calls: list[int] = []
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(tables, "_page_layer", lambda page: calls.append(1) or "LAYER")
+            mp.setattr(
+                tables, "_reconstruct_table_from_text_layer", lambda layer, table: None
+            )
+            tbl = "<table><tr><td>label</td><td>value</td></tr></table>"
+            md = tbl + "\n\n" + tbl  # two complete 2-column tables on one page
+            page = MagicMock(spec=pdfium.PdfPage)
+            tables._repair_page_tables(md, page)
+        assert len(calls) == 1
