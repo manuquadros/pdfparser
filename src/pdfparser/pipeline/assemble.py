@@ -63,6 +63,7 @@ from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import (
     _close_unclosed_tables,
     _collapse_repeated_rows_md,
+    _DocumentLayers,
     _recover_dropped_tables,
     _repair_tables_from_text_layer,
 )
@@ -631,16 +632,21 @@ def lightonocr_pdf_to_html(
         # re-OCR for the document's table crops.
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
-        pages_md = _recover_dropped_tables(pdf_path, pages_md, ocr_regions)
-        # Rebuild a two-column table the OCR mangled (off-by-one header, dropped cells)
-        # from the deterministic PDF text layer, keeping the OCR's cell formatting.
-        pages_md = _repair_tables_from_text_layer(pdf_path, pages_md)
-        pages_md = _recover_dropped_figures(pdf_path, pages_md, ocr_region)
-        # Recover short tails the OCR truncated, from the PDF text layer.  Runs
-        # *after* table/figure recovery so an appended tail can neither feed the
-        # table coverage gate's adjacent-token check nor make a figure number look
-        # already-emitted.  No-op on a PDF without a usable text layer.
-        pages_md = _reconcile_text_layer(pdf_path, pages_md)
+        # The four post-OCR passes all read the PDF text layer; hold one open document
+        # with a shared per-page _PageLayer cache across them so a page is extracted
+        # once, not once per pass.
+        with _DocumentLayers.open(pdf_path) as layers:
+            pages_md = _recover_dropped_tables(layers, pages_md, ocr_regions)
+            # Rebuild a two-column table the OCR mangled (off-by-one header, dropped
+            # cells) from the deterministic PDF text layer, keeping the OCR's cell
+            # formatting.
+            pages_md = _repair_tables_from_text_layer(layers, pages_md)
+            pages_md = _recover_dropped_figures(layers, pages_md, ocr_region)
+            # Recover short tails the OCR truncated, from the PDF text layer.  Runs
+            # *after* table/figure recovery so an appended tail can neither feed the
+            # table coverage gate's adjacent-token check nor make a figure number look
+            # already-emitted.  No-op on a PDF without a usable text layer.
+            pages_md = _reconcile_text_layer(layers, pages_md)
         encode_image = (
             _file_image_writer(image_dir) if image_dir is not None else _base64_src
         )

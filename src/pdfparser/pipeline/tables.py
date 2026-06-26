@@ -563,6 +563,48 @@ def _page_layer(page: pdfium.PdfPage) -> _PageLayer:
     return _PageLayer(page_text, char_boxes, char_rotations, norm, idx_map)
 
 
+class _DocumentLayers:
+    """One open ``PdfDocument`` plus a lazy per-page :class:`_PageLayer` cache.
+
+    The post-OCR text-layer passes — table recovery/repair (this module), figure
+    recovery (``recover_figures``) and reconciliation (``reconcile``) — each used to
+    re-open the PDF and re-extract a page's text layer independently.  Holding one
+    document open across the whole phase and memoizing each page's ``_PageLayer`` means
+    a page several passes touch is extracted once, not once per pass (each extraction
+    is the thousands-of-native-calls char-by-char walk in :func:`_page_layer`).
+
+    The cache is lazy: ``page_layer`` triggers extraction only when a pass actually
+    needs a page's geometry, so a page no pass localizes against (e.g. one with no
+    table and no missing figure) is never walked.  Used as a context manager so the
+    native document handle is released; ownership of the passed-in document transfers
+    to the cache (``__exit__`` closes it)."""
+
+    def __init__(self, pdf: pdfium.PdfDocument) -> None:
+        self.pdf = pdf
+        self._layers: dict[int, _PageLayer] = {}
+
+    @classmethod
+    def open(cls, pdf_path: Path | str) -> _DocumentLayers:
+        return cls(pdfium.PdfDocument(str(pdf_path)))
+
+    def __enter__(self) -> _DocumentLayers:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.pdf.close()
+
+    def __len__(self) -> int:
+        return len(self.pdf)
+
+    def page_layer(self, index: int) -> _PageLayer:
+        """The page's text layer, extracted on first request and cached thereafter."""
+        layer = self._layers.get(index)
+        if layer is None:
+            layer = _page_layer(self.pdf[index])
+            self._layers[index] = layer
+        return layer
+
+
 def _glyph_centers(
     page_norm: str, idx_map: list[int], char_boxes: list[_Box | None]
 ) -> list[tuple[float, float] | None]:
@@ -672,7 +714,9 @@ class _RegionPlan:
     crop: Image.Image
 
 
-def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionPlan]]:
+def _plan_page_tables(
+    md: str, layers: _DocumentLayers, page_index: int
+) -> tuple[str, list[_RegionPlan]]:
     """Localize each table region on the page and render its re-OCR crop, dropping
     regions the page already captured in full (the coverage gate) or that cannot be
     localized.  Pure CPU work — no OCR.  Returns the page markdown with open tables
@@ -686,8 +730,9 @@ def _plan_page_tables(md: str, page: pdfium.PdfPage) -> tuple[str, list[_RegionP
     if not regions:
         return md, []
 
-    layer = _page_layer(page)
+    layer = layers.page_layer(page_index)
     centers = _glyph_centers(layer.norm, layer.idx_map, layer.char_boxes)
+    page = layers.pdf[page_index]
     page_size = page.get_size()
 
     plans: list[_RegionPlan] = []
@@ -941,39 +986,32 @@ def _reconstruct_table_from_text_layer(
 
 
 def _repair_tables_from_text_layer(
-    pdf_path: Path | str, pages_md: list[str]
+    layers: _DocumentLayers, pages_md: list[str]
 ) -> list[str]:
     """Replace a two-column table the OCR mangled with a deterministic text-layer
     reconstruction, when that recovers more rows (the OCR was truncated/off-by-one); a
     healthy table keeps its better-formatted OCR markup.  One entry per input page."""
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        out: list[str] = []
-        for i, md in enumerate(pages_md):
-            if "<table" not in md.lower():
-                out.append(md)
-                continue
-            out.append(_repair_page_tables(md, pdf[i]))
-        return out
-    finally:
-        pdf.close()
+    out: list[str] = []
+    for i, md in enumerate(pages_md):
+        if "<table" not in md.lower():
+            out.append(md)
+            continue
+        out.append(_repair_page_tables(md, layers, i))
+    return out
 
 
-def _repair_page_tables(md: str, page: pdfium.PdfPage) -> str:
+def _repair_page_tables(md: str, layers: _DocumentLayers, page_index: int) -> str:
     # Extract the page text layer lazily and at most once: _TABLE_RE.sub calls repair
     # for every complete <table>, and the extraction is thousands of native calls — so
-    # share it across a page's 2-column tables, but skip it entirely on a page whose
-    # tables are all non-2-column (the common case) or whose <table> is unclosed (no
-    # _TABLE_RE match), where no reconstruction is ever attempted.
-    layer: _PageLayer | None = None
-
+    # share it (via the document-level cache) across a page's 2-column tables, but skip
+    # it entirely on a page whose tables are all non-2-column (the common case) or whose
+    # <table> is unclosed (no _TABLE_RE match), where no reconstruction is ever
+    # attempted.
     def repair(m: re.Match[str]) -> str:
-        nonlocal layer
         table = m.group()
         if _table_columns(table) != 2:  # the repair only understands label|value tables
             return table
-        if layer is None:
-            layer = _page_layer(page)
+        layer = layers.page_layer(page_index)
         recon = _reconstruct_table_from_text_layer(layer, table)
         # Compare against the *collapsed* OCR table: a decode-loop explosion inflates
         # its raw <tr> count (collapsed only later in _assemble_html), which would
@@ -988,7 +1026,7 @@ def _repair_page_tables(md: str, page: pdfium.PdfPage) -> str:
 
 
 def _recover_dropped_tables(
-    pdf_path: Path | str,
+    layers: _DocumentLayers,
     pages_md: list[str],
     ocr_regions: Callable[[list[Image.Image]], list[str]],
 ) -> list[str]:
@@ -1000,28 +1038,24 @@ def _recover_dropped_tables(
     process them concurrently, then spliced back per page.  Pages without a table —
     and regions the gate found already complete — incur no OCR at all.  Order and
     length match ``pages_md`` so the caller's page-to-image alignment is preserved."""
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        closed_md: list[str] = []
-        per_page_plans: list[list[_RegionPlan]] = []
-        for i, md in enumerate(pages_md):
-            if "<table" not in md.lower():
-                closed_md.append(md)
-                per_page_plans.append([])
-                continue
-            page_md, plans = _plan_page_tables(md, pdf[i])
-            closed_md.append(page_md)
-            per_page_plans.append(plans)
+    closed_md: list[str] = []
+    per_page_plans: list[list[_RegionPlan]] = []
+    for i, md in enumerate(pages_md):
+        if "<table" not in md.lower():
+            closed_md.append(md)
+            per_page_plans.append([])
+            continue
+        page_md, plans = _plan_page_tables(md, layers, i)
+        closed_md.append(page_md)
+        per_page_plans.append(plans)
 
-        flat = [plan for plans in per_page_plans for plan in plans]
-        if not flat:
-            return closed_md
-
-        crop_mds = iter(ocr_regions([plan.crop for plan in flat]))
-        for i, plans in enumerate(per_page_plans):
-            if plans:
-                pairs = [(plan, next(crop_mds)) for plan in plans]
-                closed_md[i] = _apply_page_results(closed_md[i], pairs)
+    flat = [plan for plans in per_page_plans for plan in plans]
+    if not flat:
         return closed_md
-    finally:
-        pdf.close()
+
+    crop_mds = iter(ocr_regions([plan.crop for plan in flat]))
+    for i, plans in enumerate(per_page_plans):
+        if plans:
+            pairs = [(plan, next(crop_mds)) for plan in plans]
+            closed_md[i] = _apply_page_results(closed_md[i], pairs)
+    return closed_md

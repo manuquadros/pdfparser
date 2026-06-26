@@ -328,12 +328,12 @@ def plos_run(ocr_model: object) -> object:
     real_gate = tables._region_fully_captured
     spy = SimpleNamespace(batches=[], gate_skips=0, html="")
 
-    def recover_with_spy(pdf_path, pages_md, ocr_regions):  # type: ignore[no-untyped-def]
+    def recover_with_spy(layers, pages_md, ocr_regions):  # type: ignore[no-untyped-def]
         def counting(regions):  # type: ignore[no-untyped-def]
             spy.batches.append(len(regions))
             return ocr_regions(regions)
 
-        return real_recover(pdf_path, pages_md, counting)
+        return real_recover(layers, pages_md, counting)
 
     def gate_with_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
         skipped = real_gate(*args, **kwargs)

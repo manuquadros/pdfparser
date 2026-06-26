@@ -23,10 +23,10 @@ alignment, and deliberately left for the gates to decline.
 import re
 import unicodedata
 from collections import Counter
-from pathlib import Path
 
 import pypdfium2 as pdfium
 
+from pdfparser.pipeline.tables import _DocumentLayers
 from pdfparser.pipeline.text import _looks_like_figure_caption, _split_md_blocks
 
 # Tail/head anchors are this many tokens; 6 is distinctive enough that a prose
@@ -288,23 +288,33 @@ def _reconcile_page(page_md: str, layer_raw: str, furniture: set[str]) -> str:
     return "\n\n".join(out)
 
 
-def _reconcile_text_layer(pdf_path: Path | str, pages_md: list[str]) -> list[str]:
+def _reconcile_text_layer(layers: _DocumentLayers, pages_md: list[str]) -> list[str]:
     """Recover short OCR truncations across a document; one entry per input page.
 
     A born-digital PDF's text layer is read once per page, running furniture is
     learned from cross-page recurrence, and each page is reconciled against its own
     layer.  Pages whose layer is empty (scanned, or no text) pass through unchanged.
-    Order and length match ``pages_md``."""
-    pdf = pdfium.PdfDocument(str(pdf_path))
+    Order and length match ``pages_md``.
+
+    Reads the cheap text-view (``get_text_range``) per page rather than the cached
+    ``_PageLayer`` (the char-by-char walk): reconciliation runs on every document and
+    needs only the raw text, so forcing full-layer extraction of every page here would
+    cost far more than it saves."""
+    page_texts = [_page_raw_text(layers.pdf, p) for p in range(len(pages_md))]
+    furniture = _recurring_furniture(page_texts)
+    return [
+        _reconcile_page(md, layer, furniture)
+        for md, layer in zip(pages_md, page_texts, strict=True)
+    ]
+
+
+def _page_raw_text(pdf: pdfium.PdfDocument, p: int) -> str:
+    """The page's text-view layer, closing the native text-page handle (pdfium's
+    ``PdfTextPage`` has no context-manager protocol, so close explicitly)."""
+    if p >= len(pdf):
+        return ""
+    textpage = pdf[p].get_textpage()
     try:
-        layers = [
-            pdf[p].get_textpage().get_text_range() if p < len(pdf) else ""
-            for p in range(len(pages_md))
-        ]
-        furniture = _recurring_furniture(layers)
-        return [
-            _reconcile_page(md, layer, furniture)
-            for md, layer in zip(pages_md, layers, strict=True)
-        ]
+        return str(textpage.get_text_range())
     finally:
-        pdf.close()
+        textpage.close()

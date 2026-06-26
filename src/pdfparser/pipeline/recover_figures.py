@@ -31,9 +31,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
-from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtime
 
-import pypdfium2 as pdfium
+import pypdfium2 as pdfium  # noqa: TC002 — beartype reads annotations at runtime
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 from pdfparser.pipeline.classify import _leading_pages_to_skip_md
@@ -44,9 +43,9 @@ from pdfparser.pipeline.figures import (
 )
 from pdfparser.pipeline.tables import (
     _Box,
+    _DocumentLayers,
     _group_lines,
     _normalize,
-    _page_text_and_boxes,
     _scaled_crop,
     _union,
 )
@@ -95,7 +94,14 @@ def _textlayer_caption_pages(pdf: pdfium.PdfDocument) -> dict[int, list[int]]:
     page indices carrying it, so a missing number can be localized to its page."""
     pages: dict[int, list[int]] = {}
     for i in range(len(pdf)):
-        text = pdf[i].get_textpage().get_text_range()
+        # Cheap text-view scan for caption labels; the box-aligned char-array layer
+        # (_PageLayer) is overkill here, so don't force its full extraction.  Close the
+        # native handle (pdfium's PdfTextPage has no context-manager protocol).
+        textpage = pdf[i].get_textpage()
+        try:
+            text = textpage.get_text_range()
+        finally:
+            textpage.close()
         for m in _FIG_CAPTION_LABEL_RE.finditer(text):
             pages.setdefault(int(m.group(1)), []).append(i)
     return {num: sorted(set(ps)) for num, ps in pages.items()}
@@ -129,8 +135,9 @@ def _figure_crop_box(
     page_size: tuple[float, float],
 ) -> tuple[_Box, float] | None:
     """Locate the crop spanning figure ``num`` and its caption from a page's
-    text/box arrays (``_page_text_and_boxes`` output, so the per-page extraction is
-    shared across that page's missing figures).
+    text/box arrays (a ``_PageLayer``'s ``page_text``/``char_boxes``/``char_rotations``,
+    shared via the document-level cache across that page's missing figures and the
+    table passes).
 
     Returns the crop box (PDF points) and the caption label's top ``y`` (used to
     order intra-page placement), or ``None`` when the caption label is not found.
@@ -321,23 +328,25 @@ def _splice_figures_into_page(
 
 
 def _attempt_page_figure(
-    pdf: pdfium.PdfDocument,
+    layers: _DocumentLayers,
     p: int,
     num: int,
-    page_text_boxes: Callable[[int], tuple[str, list[_Box | None], list[int | None]]],
     ocr_region: Callable[[Image.Image], str],
     page_md: str,
 ) -> tuple[float, str] | None:
     """Localize, crop and re-OCR figure ``num`` on page ``p``; return its
     ``(caption_top, figure_block)`` or ``None`` if this page yields no figure
     (a running caption reference localizes none above it)."""
-    page_size = pdf[p].get_size()
-    text, boxes, rotations = page_text_boxes(p)
-    located = _figure_crop_box(text, boxes, rotations, num, page_size)
+    page = layers.pdf[p]
+    page_size = page.get_size()
+    layer = layers.page_layer(p)
+    located = _figure_crop_box(
+        layer.page_text, layer.char_boxes, layer.char_rotations, num, page_size
+    )
     if located is None:
         return None
     region, cap_top = located
-    crop_md = ocr_region(_scaled_crop(pdf[p], region, page_size))
+    crop_md = ocr_region(_scaled_crop(page, region, page_size))
     recovered = _extract_recovered_figure(crop_md, num)
     if recovered is None:
         return None
@@ -349,7 +358,7 @@ def _attempt_page_figure(
 
 
 def _recover_dropped_figures(
-    pdf_path: Path | str,
+    layers: _DocumentLayers,
     pages_md: list[str],
     ocr_region: Callable[[Image.Image], str],
 ) -> list[str]:
@@ -367,39 +376,26 @@ def _recover_dropped_figures(
     above the caption and are skipped).  Leading pages ``_assemble_html`` will drop
     are not attempted, so no re-OCR is spent on a figure that would be discarded."""
     emitted = _emitted_figure_numbers(pages_md)
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        truth = _textlayer_caption_pages(pdf)
-        missing = sorted(num for num in truth if num not in emitted)
-        if not missing:
-            return pages_md
-        skip = _leading_pages_to_skip_md(pages_md)
-
-        text_cache: dict[int, tuple[str, list[_Box | None], list[int | None]]] = {}
-
-        def page_text_boxes(p: int) -> tuple[str, list[_Box | None], list[int | None]]:
-            if p not in text_cache:
-                text_cache[p] = _page_text_and_boxes(pdf[p].get_textpage())
-            return text_cache[p]
-
-        pages_md = list(pages_md)
-        recovered_by_page: dict[int, list[tuple[float, str]]] = {}
-        for num in missing:
-            for p in truth[num]:
-                if p < skip:
-                    continue
-                found = _attempt_page_figure(
-                    pdf, p, num, page_text_boxes, ocr_region, pages_md[p]
-                )
-                if found is None:
-                    continue
-                recovered_by_page.setdefault(p, []).append(found)
-                break
-
-        for p, figs in recovered_by_page.items():
-            pages_md[p] = _splice_figures_into_page(
-                pages_md[p], figs, pdf[p].get_size()[1]
-            )
+    truth = _textlayer_caption_pages(layers.pdf)
+    missing = sorted(num for num in truth if num not in emitted)
+    if not missing:
         return pages_md
-    finally:
-        pdf.close()
+    skip = _leading_pages_to_skip_md(pages_md)
+
+    pages_md = list(pages_md)
+    recovered_by_page: dict[int, list[tuple[float, str]]] = {}
+    for num in missing:
+        for p in truth[num]:
+            if p < skip:
+                continue
+            found = _attempt_page_figure(layers, p, num, ocr_region, pages_md[p])
+            if found is None:
+                continue
+            recovered_by_page.setdefault(p, []).append(found)
+            break
+
+    for p, figs in recovered_by_page.items():
+        pages_md[p] = _splice_figures_into_page(
+            pages_md[p], figs, layers.pdf[p].get_size()[1]
+        )
+    return pages_md

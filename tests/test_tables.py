@@ -1139,11 +1139,12 @@ class TestTextLayerTableRepair:
             "<tr><td>bond lengths (Å)</td><td>0.011</td></tr>"
             "</table>"
         )
-        import pypdfium2 as pdfium
+        from pdfparser.pipeline.tables import _DocumentLayers
 
-        pages = ["" for _ in range(len(pdfium.PdfDocument(str(pdf))))]
-        pages[2] = broken
-        out = _repair_tables_from_text_layer(str(pdf), pages)[2]
+        with _DocumentLayers.open(str(pdf)) as layers:
+            pages = ["" for _ in range(len(layers))]
+            pages[2] = broken
+            out = _repair_tables_from_text_layer(layers, pages)[2]
         run = lambda a, b: f"<td>{a}</td><td>{b}</td>"  # noqa: E731
         # the empty header cell is restored: CgKARI_NADP⁺ alone in column 2
         assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in out
@@ -1181,11 +1182,12 @@ class TestTextLayerTableRepair:
             "<tr><td>unique reflections</td><td>37991</td></tr>"
             "<tr><td>redundancy</td><td>4.2 (3.4)</td></tr>" + loop + "</table>"
         )
-        import pypdfium2 as pdfium
+        from pdfparser.pipeline.tables import _DocumentLayers
 
-        pages = ["" for _ in range(len(pdfium.PdfDocument(str(pdf))))]
-        pages[2] = broken
-        out = _repair_tables_from_text_layer(str(pdf), pages)[2]
+        with _DocumentLayers.open(str(pdf)) as layers:
+            pages = ["" for _ in range(len(layers))]
+            pages[2] = broken
+            out = _repair_tables_from_text_layer(layers, pages)[2]
         # the loop-inflated table is still replaced by the correct reconstruction
         assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in out
         assert re.search(r"wavelength \(Å\)</td><td>0\.97934", out)
@@ -1208,11 +1210,15 @@ class TestRepairLazyExtraction:
 
         calls: list[int] = []
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(tables, "_page_layer", lambda page: calls.append(1))
+            mp.setattr(
+                tables,
+                "_page_layer",
+                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+            )
             # a 3-column table: the repair only understands label|value (2-col) tables
             md = "<table><tr><td>a</td><td>b</td><td>c</td></tr></table>"
-            page = MagicMock(spec=pdfium.PdfPage)
-            assert tables._repair_page_tables(md, page) == md
+            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            assert tables._repair_page_tables(md, layers, 0) == md
         assert calls == []
 
     def test_extraction_runs_once_across_two_column_tables(self) -> None:
@@ -1225,12 +1231,46 @@ class TestRepairLazyExtraction:
 
         calls: list[int] = []
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(tables, "_page_layer", lambda page: calls.append(1) or "LAYER")
+            mp.setattr(
+                tables,
+                "_page_layer",
+                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+            )
             mp.setattr(
                 tables, "_reconstruct_table_from_text_layer", lambda layer, table: None
             )
             tbl = "<table><tr><td>label</td><td>value</td></tr></table>"
             md = tbl + "\n\n" + tbl  # two complete 2-column tables on one page
-            page = MagicMock(spec=pdfium.PdfPage)
-            tables._repair_page_tables(md, page)
+            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            tables._repair_page_tables(md, layers, 0)
         assert len(calls) == 1
+
+
+class TestDocumentLayersCache:
+    """_DocumentLayers shares one _PageLayer per page across the post-OCR passes: the
+    char-by-char extraction runs once per page index however many passes localize
+    against it, and pages no pass touches are never extracted."""
+
+    def test_page_layer_extracted_once_across_passes(self) -> None:
+        from unittest.mock import MagicMock
+
+        import pypdfium2 as pdfium
+        import pytest
+
+        from pdfparser.pipeline import tables
+
+        calls: list[int] = []
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                tables,
+                "_page_layer",
+                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+            )
+            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            # the table pass and the figure pass both localize against page 0
+            first = layers.page_layer(0)
+            second = layers.page_layer(0)
+            other = layers.page_layer(1)
+        assert first is second  # memoized, same instance handed back
+        assert other is not first
+        assert calls == [1, 1]  # once for page 0, once for page 1 — never re-extracted
