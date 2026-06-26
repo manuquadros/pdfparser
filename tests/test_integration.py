@@ -4,7 +4,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from helpers import (
     _abstract,
     _body,
@@ -1106,6 +1105,23 @@ class TestJafcTruncatedPageRecovery:
         # The pH-activity prose that followed Table 2 on the page was dropped with the
         # truncation; the re-OCR brings it back.
         assert "highest enzyme activity at pH 8" in jafc_html
+
+    def test_table_2_rebuilt_from_text_layer(self, jafc_html: str) -> None:
+        # The OCR mangles Table 2 the same way every run (drops the empty header cell,
+        # shifting the first rows off by one and losing the wavelength value); the
+        # text-layer repair rebuilds it deterministically, so these are hard assertions.
+        table = next(
+            t
+            for t in re.findall(r"<table\b.*?</table>", jafc_html, re.DOTALL)
+            if "Data Collection and Structural" in t
+        )
+        # the empty header cell is restored: CgKARI_NADP⁺ alone in column 2
+        assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in table
+        # the off-by-one is fixed: 6JX2 is the PDB code's value, not wavelength's
+        assert "<td>PDB code</td><td>6JX2</td>" in table
+        assert re.search(r"wavelength \(Å\)</td><td>0\.97934", table)
+        # the dropped tail (Ramachandran-plot stats) is recovered
+        assert all(w in table for w in ("favored", "allowed", "outliers"))
 
     def test_table_2_has_no_decode_loop_explosion(self, jafc_html: str) -> None:
         # The page-level re-OCR (full-window retry on the truncated Table 2 page) can

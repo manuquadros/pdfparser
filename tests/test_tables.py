@@ -1,5 +1,7 @@
 """Tests for table caption/footnote colocation, localization, re-OCR gate."""
 
+import re
+
 from helpers import _body, _run_lighton, _tables_text
 
 
@@ -1007,3 +1009,184 @@ class TestUnclosedTableClosing:
         html = _run_lighton([page1, page2])
         assert "Downstream prose that follows" in _body(html)
         assert "Downstream prose that follows" not in _tables_text(html)
+
+
+class TestTextLayerTableRepair:
+    """A two-column stats table the OCR mangles (drops the empty header cell, shifting
+    the first rows off by one and losing a value; truncates the tail) is rebuilt from
+    the deterministic PDF text layer, keeping the OCR's cell formatting by match
+    (plans/render-review-fixes.md §2 — the 31298526 Table 2)."""
+
+    @staticmethod
+    def _glyphs(text: str, x0: float, y: float, cw: float = 5.0):
+        # build (char, x0, x1, y) glyphs; a space advances x by a wide gap, no glyph
+        out, x = [], float(x0)
+        for ch in text:
+            if ch == " ":
+                x += cw
+                continue
+            out.append((ch, x, x + cw, float(y)))
+            x += cw + 1.0
+        return out
+
+    def test_glyph_cell_text_spaces_words_keeps_numbers(self) -> None:
+        from pdfparser.pipeline.tables import _glyph_cell_text
+
+        assert _glyph_cell_text(self._glyphs("PDB code", 0, 100)) == "PDB code"
+        assert _glyph_cell_text(self._glyphs("37991", 0, 100)) == "37991"
+        # a digit run the gap heuristic over-split (a glyph placed past the gap) rejoins
+        glyphs = self._glyphs("0.08", 0, 100) + [("1", 60.0, 63.0, 100.0)]
+        assert _glyph_cell_text(glyphs) == "0.081"
+
+    def test_rows_to_cells_header_divider_and_footnote_stop(self) -> None:
+        from pdfparser.pipeline.tables import _group_glyph_rows, _rows_to_cells
+
+        glyphs = (
+            self._glyphs("CgKARI", 80, 200)  # value-only row (empty label) at the top
+            + self._glyphs("PDB code", 10, 188)
+            + self._glyphs("6JX2", 80, 188)  # a label|value data row, value col
+            + self._glyphs("wavelength", 10, 176)
+            + self._glyphs("0.97934", 80, 176)
+            + self._glyphs("space group", 10, 164)
+            + self._glyphs("P21", 80, 164)
+            + self._glyphs("a footnote sentence well over the length limit", 10, 140)
+        )
+        cells = _rows_to_cells(_group_glyph_rows(glyphs))
+        assert cells[0] == ("", "CgKARI")  # empty label, value column
+        assert ("PDB code", "6JX2") in cells
+        assert ("wavelength", "0.97934") in cells
+        # the long value-less footnote (below the data) stops the table
+        assert not any("footnote" in lab for lab, _ in cells)
+
+    def test_format_cell_recovers_ocr_subscripts(self) -> None:
+        from pdfparser.pipeline.tables import _cell_format_map, _format_cell
+
+        ocr = (
+            "<table><tr><td><em>R</em><sub>sym</sub> or <em>R</em><sub>merge</sub></td>"
+            "<td>9.4</td></tr></table>"
+        )
+        fmt = _cell_format_map(ocr)
+        # the plain reconstructed label matches the OCR cell (spaces ignored)
+        assert _format_cell("Rsym or Rmerge", fmt) == (
+            "<em>R</em><sub>sym</sub> or <em>R</em><sub>merge</sub>"
+        )
+        assert _format_cell("not in the table", fmt) == "not in the table"
+
+    def test_leading_caption_rows_extracted(self) -> None:
+        from pdfparser.pipeline.tables import _leading_caption_rows
+
+        table = (
+            "<table>"
+            '<tr><th colspan="2">Table 2. Data Collection Statistics</th></tr>'
+            "<tr><td>PDB code</td><td>6JX2</td></tr></table>"
+        )
+        rows, text = _leading_caption_rows(table)
+        assert rows == [
+            '<tr><th colspan="2">Table 2. Data Collection Statistics</th></tr>'
+        ]
+        assert "data collection statistics" in text
+
+    def test_rows_to_cells_keeps_mid_table_divider_in_caption(self) -> None:
+        # A mid-table value-less divider whose label is a substring of the caption
+        # ("Refinement" ⊂ "… Structural Refinement Statistics") must NOT be dropped as a
+        # caption fragment — only the wrapped fragments *above* the first data row are.
+        # This exercises the column filter via the public rows_to_cells output shape.
+        from pdfparser.pipeline.tables import _group_glyph_rows, _rows_to_cells
+
+        glyphs = (
+            self._glyphs("Refinement Statistics", 60, 220)  # caption fragment (top)
+            + self._glyphs("resolution", 10, 200)
+            + self._glyphs("2.6", 80, 200)  # first data row
+            + self._glyphs("Refinement", 10, 188)  # a mid-table divider (value-less)
+            + self._glyphs("R factor", 10, 176)
+            + self._glyphs("0.17", 80, 176)
+        )
+        cells = _rows_to_cells(_group_glyph_rows(glyphs))
+        # the divider survives in the raw cells; the caption-fragment filter (scoped to
+        # above the body) is what would otherwise endanger it — see
+        # _reconstruct_table_from_text_layer.
+        assert ("Refinement", "") in cells
+
+    def test_repair_fixes_31298526_table_2_deterministically(self) -> None:
+        # End-to-end on the real PDF text layer (no GPU): a broken off-by-one Table 2
+        # (the OCR shape) is rebuilt correctly and deterministically.  Skips if the
+        # fixture PDF is absent.
+        import pathlib
+
+        from pdfparser.pipeline.tables import _repair_tables_from_text_layer
+
+        pdf = pathlib.Path(__file__).parent / "fixtures" / "31298526.pdf"
+        if not pdf.exists():
+            import pytest
+
+            pytest.skip(f"fixture PDF not found: {pdf}")
+        # a condensed broken Table 2: off-by-one header (PDB code|CgKARI),
+        # and a handful of anchor labels — enough to localize the column.
+        broken = (
+            "<table>"
+            '<tr><th colspan="2">Table 2. Data Collection and Structural Refinement '
+            "Statistics</th></tr>"
+            "<tr><th>PDB code</th><th>CgKARI_NADP⁺</th></tr>"
+            "<tr><td>wavelength (Å)</td><td>6JX2</td></tr>"
+            "<tr><td>space group</td>"
+            "<td>P2<sub>1</sub>2<sub>1</sub>2<sub>1</sub></td></tr>"
+            "<tr><td>resolution range (Å)</td><td>78.9–2.6</td></tr>"
+            "<tr><td>unique reflections</td><td>37991</td></tr>"
+            "<tr><td><em>R</em><sub>sym</sub> or <em>R</em><sub>merge</sub></td>"
+            "<td>9.4 (30.5)</td></tr>"
+            "<tr><td>redundancy</td><td>4.2 (3.4)</td></tr>"
+            "<tr><td>no. reflections</td><td>35327</td></tr>"
+            "<tr><td>bond lengths (Å)</td><td>0.011</td></tr>"
+            "</table>"
+        )
+        import pypdfium2 as pdfium
+
+        pages = ["" for _ in range(len(pdfium.PdfDocument(str(pdf))))]
+        pages[2] = broken
+        out = _repair_tables_from_text_layer(str(pdf), pages)[2]
+        run = lambda a, b: f"<td>{a}</td><td>{b}</td>"  # noqa: E731
+        # the empty header cell is restored: CgKARI_NADP⁺ alone in column 2
+        assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in out
+        # the off-by-one is fixed: 6JX2 is the PDB code, wavelength gets its own value
+        assert run("PDB code", "6JX2") in out
+        assert re.search(r"wavelength \(Å\)</td><td>0\.97934", out)
+        assert "6JX2" not in out.split("wavelength")[1][:40]
+        # the dropped tail is recovered, and OCR sub/sup formatting is reused on a match
+        assert all(w in out for w in ("favored", "allowed", "outliers"))
+        assert "<sub>sym</sub>" in out  # R_sym formatting from a matched cell
+        # the title row is preserved
+        assert "Data Collection and Structural Refinement Statistics" in out
+
+    def test_repair_fires_despite_decode_loop_inflation(self) -> None:
+        # The page-level OCR can decode-loop on this dense table, inflating its raw <tr>
+        # count past the reconstruction's (collapsed only later in _assemble_html).  The
+        # substitution gate must compare against the *collapsed* OCR rows, or the loop
+        # masks the off-by-one table and the repair never fires (the live-only bug).
+        import pathlib
+
+        from pdfparser.pipeline.tables import _repair_tables_from_text_layer
+
+        pdf = pathlib.Path(__file__).parent / "fixtures" / "31298526.pdf"
+        if not pdf.exists():
+            import pytest
+
+            pytest.skip(f"fixture PDF not found: {pdf}")
+        loop = "".join("<tr><td>RAMS Deviations</td><td></td></tr>" for _ in range(50))
+        broken = (
+            "<table>"
+            "<tr><td>PDB code</td><td>CgKARI_NADP⁺</td></tr>"
+            "<tr><td>wavelength (Å)</td><td>6JX2</td></tr>"
+            "<tr><td>space group</td><td>P21 21 21</td></tr>"
+            "<tr><td>resolution range (Å)</td><td>78.9–2.6</td></tr>"
+            "<tr><td>unique reflections</td><td>37991</td></tr>"
+            "<tr><td>redundancy</td><td>4.2 (3.4)</td></tr>" + loop + "</table>"
+        )
+        import pypdfium2 as pdfium
+
+        pages = ["" for _ in range(len(pdfium.PdfDocument(str(pdf))))]
+        pages[2] = broken
+        out = _repair_tables_from_text_layer(str(pdf), pages)[2]
+        # the loop-inflated table is still replaced by the correct reconstruction
+        assert "<tr><td></td><td>CgKARI_NADP⁺</td></tr>" in out
+        assert re.search(r"wavelength \(Å\)</td><td>0\.97934", out)
+        assert out.count("RAMS Deviations") <= 1
