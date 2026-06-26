@@ -419,6 +419,49 @@ class TestLightonAssembly:
         assert "The cued abstract paragraph." in html[start:end]
         assert "The body begins here." in _body(html)
 
+    def test_keywords_relocated_to_panel_colon_outside_bold(self) -> None:
+        # OCR emits the keyword label with the colon *outside* the bold
+        # ("**Keywords**:" → "<strong>Keywords</strong>:").  It terminates the
+        # abstract, then is relocated from the body head to the Metadata panel — the
+        # same destination the colon-inside shape already reaches.
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract prose here.\n\n"
+            "**Keywords**: alpha, beta, gamma\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        start = html.find("<section class='abstract'>")
+        abstract = html[start : html.find("</section>", start)]
+        assert "alpha, beta, gamma" in _metadata(html)
+        assert "alpha, beta, gamma" not in _body(html)
+        assert "Keywords" not in abstract
+        assert "The body begins here." in _body(html)
+
+    def test_keywords_relocated_to_panel_colon_inside_bold(self) -> None:
+        # The colon-inside shape ("**Keywords:**" → "<strong>Keywords:</strong>")
+        # reaches the panel as before — the broadened capture must not regress it.
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract prose here.\n\n"
+            "**Keywords:** alpha, beta, gamma\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        assert "alpha, beta, gamma" in _metadata(html)
+        assert "alpha, beta, gamma" not in _body(html)
+
+    def test_non_frontmatter_bold_label_kept_in_body(self) -> None:
+        # The relocation is keyed on the label *name* (keywords/abbreviations/…), so
+        # a body paragraph merely opening with an unrelated bold label stays in place.
+        md = (
+            "# T\n\n## Abstract\n\nThe abstract prose here.\n\n"
+            "**Summary**: this leading clause is genuine body prose, not metadata.\n\n"
+            "## Introduction\n\nThe body begins here."
+        )
+        html = _run_lighton([md])
+        assert "this leading clause is genuine body prose" in _body(html)
+        # Nothing was relocated, so no Metadata panel is created at all.
+        assert "<details class='metadata'>" not in html
+
     def test_leading_superscript_routed_to_footnote_before_refs(self) -> None:
         md = (
             "# T\n\n## Abstract\n\nAbstract.\n\n## Body\n\n"

@@ -297,6 +297,14 @@ class TestAdPageExclusion:
         assert "B Protein alignments" not in _body(ad_prefix_html)
         assert "<p>B</p>" not in _body(ad_prefix_html)
 
+    def test_keywords_relocated_to_panel_not_body(self, ad_prefix_html: str) -> None:
+        # The keyword label terminates the abstract, then is relocated from the body
+        # head to the Metadata panel — even when OCR emits the colon outside the bold
+        # ("<strong>Keywords</strong>:"), the shape that previously stranded it in body.
+        kw = "enzyme kinetics, functional identification"
+        assert kw in _metadata(ad_prefix_html)
+        assert kw not in _body(ad_prefix_html)
+
 
 @pytest.fixture(scope="session")
 def plos_run(ocr_model: object) -> object:
@@ -1058,6 +1066,17 @@ class TestJafcAbstractAndByline:
         for line in ("Received: May 25, 2019", "Published: July 12, 2019"):
             assert line in panel
             assert line not in body
+
+    def test_keywords_relocated_to_panel_not_body(self, jafc_html: str) -> None:
+        # The "KEYWORDS: …" label (colon outside the bold) terminates the inline
+        # abstract, then is relocated from the body head to the Metadata panel rather
+        # than stranded as the first body paragraph before INTRODUCTION.
+        kw = "ketol-acid reductoisomerase"
+        panel = _metadata(jafc_html)
+        body = _body(jafc_html)
+        assert "KEYWORDS" in panel
+        assert kw in panel
+        assert "<strong>KEYWORDS" not in body
 
     def test_paragraphs_after_citation_superscript_not_merged(
         self, jafc_html: str

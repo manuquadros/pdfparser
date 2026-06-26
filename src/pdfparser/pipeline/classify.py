@@ -436,7 +436,13 @@ _LEADING_BANNER_RE = re.compile(
     + r")\s*</strong>\s*",
     re.IGNORECASE,
 )
-_BOLD_LABEL_CAPTURE_RE = re.compile(r"^<strong>([^<]+):</strong>")
+# Captures a bold label's name with the colon inside *or* outside the bold
+# ("<strong>Keywords:</strong>" vs "<strong>Keywords</strong>:") — OCR emits both
+# shapes for the same label, and matching colon-inside only stranded the
+# colon-outside keyword line in the body instead of relocating it to the panel.
+_BOLD_LABEL_CAPTURE_RE = re.compile(
+    r"^<strong>([^<]+):</strong>|^<strong>([^<]+)</strong>\s*:"
+)
 # A glossary the journal prints as a column-bottom footnote on the first page —
 # "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
 # mid-section, where it splits the surrounding paragraph in two; the pre-classify
@@ -1248,7 +1254,10 @@ def _bold_label_in(inner: str, labels: frozenset[str]) -> bool:
     """True when ``inner`` opens with a ``**Label:**`` bold label whose name is in
     ``labels`` — the shared shape of the metadata-label checks below."""
     m = _BOLD_LABEL_CAPTURE_RE.match(inner)
-    return m is not None and m.group(1).strip().lower() in labels
+    if m is None:
+        return False
+    name = m.group(1) if m.group(1) is not None else m.group(2)
+    return name.strip().lower() in labels
 
 
 def _is_publication_metadata_label(inner: str) -> bool:
