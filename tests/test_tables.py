@@ -1,10 +1,6 @@
 """Tests for table caption/footnote colocation, localization, re-OCR gate."""
 
-from helpers import (
-    _body,
-    _run_lighton,
-    _tables_text,
-)
+from helpers import _body, _run_lighton, _tables_text
 
 
 class TestTableCaptionColocation:

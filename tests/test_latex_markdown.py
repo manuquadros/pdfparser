@@ -107,6 +107,24 @@ class TestLatexToHtml:
         # Coverage we get for free from pylatexenc that the old hand map lacked.
         assert _latex_to_html(r"$T_\beta + \nabla$") == "<em>T</em><sub>β</sub> + ∇"
 
+    def test_supplementary_label_s_not_section_sign(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # The model misreads a supplementary label's leading "S" as the section
+        # command (\S); "\S<digit>" means the letter S ("S4 Fig."), not "§", and the
+        # plain identifier must not be math-variable italicised.
+        assert _latex_to_html(r"$\S4$ Fig.") == "S4 Fig."
+        assert _latex_to_html(r"$\S 4$ Fig.") == "S4 Fig."
+        assert _latex_to_html(r"$\S1$ Raw images.") == "S1 Raw images."
+
+    def test_standalone_section_command_still_section_sign(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A standalone "\S" (no following digit) is a real footnote/section marker and
+        # still converts to "§" — the supplementary-label rule must not swallow it.
+        assert _latex_to_html(r"$\S$") == "§"
+        assert _latex_to_html(r"$^{1,\S}$") == "<sup>1,§</sup>"
+
     def test_arg_macro_that_raises_does_not_crash(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 

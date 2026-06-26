@@ -32,11 +32,10 @@ from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtim
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
-from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
-
 from pdfparser.pipeline.markdown import _render_inline
 from pdfparser.pipeline.render import _downscale_to_long_side
 from pdfparser.pipeline.text import _visible_text
+from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
 _TABLE_RE = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
 _OPEN_TABLE_RE = re.compile(r"<table\b", re.IGNORECASE)

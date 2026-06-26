@@ -69,6 +69,14 @@ _SUPERSCRIPT_MAP = {
 # ``\name`` token and looked up whole, so a command can never eat the head of a
 # longer one ("\to" vs "\top", "\sim" vs "\simeq").
 _LATEX_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
+# "\S" immediately before a digit is the model misreading the leading "S" of a
+# supplementary-material label ("S4 Fig.", "S1 Raw images.") as the section command —
+# it means the letter S, not "§".  A whole span the model wrapped in math mode
+# ("$\S4$") is rewritten to the plain identifier ("S4") at the top level so it skips
+# math-variable italicization; an embedded "\S<digit>" is still rewritten to "S" inside
+# the span.  A standalone "\S" (a real footnote/section marker) still converts to "§".
+_LATEX_S_LABEL_SPAN_RE = re.compile(r"(?<!\\)\$\\S ?(\d[\w.]*)\$")
+_LATEX_S_LABEL_RE = re.compile(r"\\S ?(?=\d)")
 _L2T = LatexNodes2Text()
 # pylatexenc returns "" for a few common symbol macros (version-dependent), which
 # would leak the raw "\ddagger"/"\S" into author/affiliation footnote markers.
@@ -259,6 +267,7 @@ def _latex_span_to_html(content: str) -> str:
     content = _LATEX_WRAP_RE.sub(r"\1", content)
     content = _LATEX_VERT_RE.sub("‖", content)
     content = _LATEX_DEGREE_RE.sub("°", content)
+    content = _LATEX_S_LABEL_RE.sub("S", content)
     content = _LATEX_COMMAND_RE.sub(
         lambda m: _latex_command_to_unicode(m.group(0)), content
     )
@@ -297,4 +306,7 @@ def _latex_to_html(text: str) -> str:
             return html
         return space + html
 
+    # Unwrap a supplementary-label span ("$\S4$" → "S4") before the generic span pass,
+    # so the identifier stays plain rather than being math-variable italicised.
+    text = _LATEX_S_LABEL_SPAN_RE.sub(r"S\1", text)
     return _LATEX_SPAN_RE.sub(replace, text)
