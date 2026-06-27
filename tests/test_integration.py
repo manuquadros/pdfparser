@@ -241,6 +241,21 @@ class TestAdPageExclusion:
         assert "PtTRII" in prose
         assert "PITRI" not in prose
 
+    def test_numbered_subsections_normalized_to_consistent_level(
+        self, ad_prefix_html: str
+    ) -> None:
+        # The OCR jitters ##/### levels: section 3's subsections 3.1-3.3 came as
+        # <h3> but 3.4/3.5 as <h2>.  Heading-level normalization re-levels every
+        # dotted-number subsection by its depth, so all of 3.1-3.5 render as <h3>
+        # and the top-level numbered sections (3. Results, 4. Discussion) as <h2>.
+        body = _body(ad_prefix_html)
+        for n in range(1, 6):
+            assert f"<h3>3.{n}." in body
+        assert "<h2>3. Results</h2>" in body
+        assert "<h2>4. Discussion</h2>" in body
+        # no numbered subsection leaked to <h2> (the pre-fix jitter)
+        assert "<h2>3.4." not in body and "<h2>3.5." not in body
+
     def test_figures_embedded_by_detector(self, ad_prefix_html: str) -> None:
         # LightOnOCR-bbox emits a crop box per figure (incl. the Fig 2 alignment
         # the old engine OCRed into a token wall); each is cropped and embedded.

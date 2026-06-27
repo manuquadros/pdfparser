@@ -28,6 +28,7 @@ from pdfparser.pipeline.classify import (
     _extract_named_metadata_sections,
     _extract_stray_metadata,
     _leading_pages_to_skip_md,
+    _normalize_heading_levels,
     _recover_headingless_abstract,
     _split_abstract_citation,
     _strip_running_furniture,
@@ -587,6 +588,10 @@ def _assemble_html(
     # classifier left atop the body — recovered once the leading front matter is gone.
     if not abstract:
         abstract, body = _recover_headingless_abstract(body)
+    # Re-level body section headings the OCR's ##/### jitter left inconsistent, using
+    # only high-confidence signals (section numbering, canonical section names) so a
+    # real section is never demoted.  Runs last, once the body's heading set is settled.
+    body = _normalize_heading_levels(body)
     # A copyright/journal-citation clause the OCR ran onto the abstract's end is front
     # matter; move it to the panel so it doesn't read as abstract prose.
     abstract, abstract_citation = _split_abstract_citation(abstract)

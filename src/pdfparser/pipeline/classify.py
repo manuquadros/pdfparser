@@ -762,7 +762,12 @@ def _byline_html(inner: str) -> str:
     inner = re.sub(r"<br\s*/?>", "; ", inner).strip()
     inner = _BYLINE_EMPHASIS_RE.sub("", inner)
     if "<sup>" not in inner:
-        inner = _BYLINE_MARKER_RE.sub("<sup>*</sup>", inner)
+        # A *trailing* '*' run is the unclosed-bold mis-pair leftover (the real marker
+        # was consumed into the emphasis pairing), so it stands for a single marker;
+        # collapse it first.  An *inline* run is a genuine marker whose count can
+        # distinguish authors ('*' vs '**'), so the wrap then keeps the run verbatim.
+        inner = re.sub(r"\*+$", "*", inner)
+        inner = _BYLINE_MARKER_RE.sub(lambda m: f"<sup>{m.group()}</sup>", inner)
     return inner
 
 
@@ -940,6 +945,89 @@ def _heading_title(part: str) -> str | None:
     if heading is None:
         return None
     return _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+
+
+# Canonical top-level section names that are *never* subsections — used to anchor a
+# mis-leveled body section heading back to <h2>.  Two deliberate exclusions keep the
+# conservative pass from ever promoting a real subsection:
+#   - ambiguous back-matter ("Author Contributions", "Notes", "ORCID", "Funding") that
+#     appears as an <h3> under an "Author Information" section; and
+#   - the bare single-word IMRaD names "Methods"/"Results"/"Discussion", which a paper
+#     can nest as a subsection (e.g. "Results"/"Discussion" subsections under a combined
+#     "Results and Discussion", or a "Methods" subsection under "Study Design") — only
+#     the *compound* forms ("Materials and Methods", "Results and Discussion") are
+#     unambiguously top-level.
+# The article title is a unique string, never one of these, so this never demotes a
+# title that classify left in body.
+_TOP_LEVEL_SECTION_NAMES = frozenset(
+    {
+        "abstract",
+        "introduction",
+        "results and discussion",
+        "conclusion",
+        "conclusions",
+        "materials and methods",
+        "experimental section",
+        "experimental procedures",
+        "acknowledgment",
+        "acknowledgments",
+        "acknowledgement",
+        "acknowledgements",
+        "references",
+    }
+)
+# A section-numbered heading ("2. Materials and Methods", "2.1. Plant materials"): the
+# dotted-number depth sets the level deterministically (depth 1 -> <h2>, 2 -> <h3>, …).
+# Two guards keep a leading *quantity* from reading as a section number — the
+# conservative pass must never re-level a real heading off a false match:
+#   - a *mandatory* trailing separator [.)] (a section number is "2." / "(2)" / "3.4.";
+#     a quantity "0.5 M NaCl" / "5 mM Buffer" has none before the title word), and
+#   - a non-zero leading component [1-9] (sections start at 1; "0.5 …"/"0.1% …" do not).
+# Components are 1-2 digits so a bare year ("2019 …") or isotope ("3D …") can't match.
+_HEADING_NUMBER_RE = re.compile(r"^\(?([1-9]\d?(?:\.\d{1,2})*)[.)]\s+\S")
+
+
+def _normalized_heading_level(inner: str, level: int) -> int:
+    """The level a body heading *should* render at, from high-confidence signals only;
+    otherwise the OCR's own ``level`` (never a guess — see
+    ``_normalize_heading_levels``)."""
+    title = _visible_text(inner).strip()
+    m = _HEADING_NUMBER_RE.match(title)
+    if m is not None:
+        depth = m.group(1).count(".") + 1
+        return min(1 + depth, 4)
+    folded = _SECTION_NUMBER_RE.sub("", _visible_text_folded(inner))
+    if folded in _TOP_LEVEL_SECTION_NAMES:
+        return 2
+    return level
+
+
+def _normalize_heading_levels(body: list[str]) -> list[str]:
+    """Re-level body section headings the OCR leveled inconsistently, using only
+    high-confidence signals so a real section is never demoted:
+
+    - a dotted section number sets the level by its depth (``2.`` -> ``<h2>``,
+      ``2.1.`` -> ``<h3>``, ``2.1.1`` -> ``<h4>``) — fixes a sibling subsection the
+      model jittered up a level (31051047 ``3.4``/``3.5`` emitted as ``<h2>``);
+    - a canonical top-level section name (Introduction, Results, References, …) is
+      anchored to ``<h2>`` — fixes a section the model leveled as ``<h1>``/``<h3>``.
+
+    Every other heading keeps the OCR's level (its reading order is always right; only
+    the depth jitters), so an unrecognized real section — a journal-specific section
+    name, an unnumbered subsection — is left alone rather than guessed at and possibly
+    demoted.  Reading order is unchanged; only the ``<hN>`` tag of a heading block."""
+    out: list[str] = []
+    for part in body:
+        heading = _heading_inner(part)
+        if heading is None:
+            out.append(part)
+            continue
+        level, inner = heading
+        new_level = _normalized_heading_level(inner, level)
+        out.append(
+            part if new_level == level else f"<h{new_level}>{inner}</h{new_level}>"
+        )
+    return out
 
 
 def _is_metadata_heading(part: str) -> bool:

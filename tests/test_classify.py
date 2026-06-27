@@ -293,6 +293,117 @@ class TestByline:
         inner = "Yan Zhou<sup>1,*</sup>, Yifeng Wei<sup>2,*</sup>"
         assert _byline_html(inner) == inner
 
+    def test_byline_inline_double_marker_count_preserved(self) -> None:
+        # An *inline* '**' is a genuine distinct marker (e.g. '*' vs '**' on different
+        # authors) and its count is kept; only a *trailing* '**' is the unclosed-bold
+        # mis-pair artifact and collapses to a single marker.
+        from pdfparser.pipeline.classify import _byline_html
+
+        assert _byline_html("Author A**, Author B*") == (
+            "Author A<sup>**</sup>, Author B<sup>*</sup>"
+        )
+        assert _byline_html("Author A*, Author B**") == (
+            "Author A<sup>*</sup>, Author B<sup>*</sup>"  # trailing ** = artifact
+        )
+
+
+class TestHeadingLevelNormalization:
+    """Body section headings the OCR leveled inconsistently are re-leveled from
+    high-confidence signals only (section numbering, canonical section names); every
+    other heading keeps the OCR's level so a real section is never demoted."""
+
+    def test_section_number_depth_sets_level(self) -> None:
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        # depth 1 -> h2, depth 2 -> h3, depth 3 -> h4
+        body = [
+            "<h3>2. Materials and Methods</h3>",  # over-nested by the OCR
+            "<h2>2.1. Plant materials</h2>",  # under-nested by the OCR
+            "<h2>2.1.1. Sampling</h2>",
+        ]
+        out = _normalize_heading_levels(body)
+        assert out[0] == "<h2>2. Materials and Methods</h2>"
+        assert out[1] == "<h3>2.1. Plant materials</h3>"
+        assert out[2] == "<h4>2.1.1. Sampling</h4>"
+
+    def test_sibling_subsection_jitter_fixed(self) -> None:
+        # the 31051047 motivating bug: 3.4/3.5 emitted as <h2> beside 3.1-3.3 <h3>
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = ["<h3>3.3. Foo</h3>", "<h2>3.4. Bar</h2>", "<h2>3.5. Baz</h2>"]
+        assert _normalize_heading_levels(body) == [
+            "<h3>3.3. Foo</h3>",
+            "<h3>3.4. Bar</h3>",
+            "<h3>3.5. Baz</h3>",
+        ]
+
+    def test_canonical_section_name_anchored_to_h2(self) -> None:
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = [
+            "<h3>Introduction</h3>",
+            "<h1>References</h1>",
+            "<h3>Materials and Methods</h3>",
+        ]
+        assert _normalize_heading_levels(body) == [
+            "<h2>Introduction</h2>",
+            "<h2>References</h2>",
+            "<h2>Materials and Methods</h2>",
+        ]
+
+    def test_bare_imrad_names_not_promoted(self) -> None:
+        # "Methods"/"Results"/"Discussion" can be real subsections (e.g. under a
+        # combined "Results and Discussion", or a "Methods" subsection of "Study
+        # Design"), so the bare single-word forms are NOT anchored to <h2> — only the
+        # unambiguous compound forms are.  Guards against promoting a real subsection.
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = ["<h3>Methods</h3>", "<h3>Results</h3>", "<h3>Discussion</h3>"]
+        assert _normalize_heading_levels(body) == body
+
+    def test_unknown_heading_keeps_ocr_level(self) -> None:
+        # an unnumbered, non-canonical heading (a journal-specific section, an
+        # ambiguous back-matter name) is left at the OCR's level, never guessed at
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = [
+            "<h2>Metal Binding Mode of CgKARI</h2>",
+            "<h3>Author Contributions</h3>",  # subsection under "Author Information"
+            "<h2>Case Study Description</h2>",
+        ]
+        assert _normalize_heading_levels(body) == body
+
+    def test_year_like_number_not_read_as_section(self) -> None:
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        # "2019 …" must not read as section number 2019 and force <h2>
+        assert _normalize_heading_levels(["<h3>2019 in Review</h3>"]) == [
+            "<h3>2019 in Review</h3>"
+        ]
+
+    def test_leading_quantity_not_read_as_section_number(self) -> None:
+        # A heading opening with a measurement ("0.5 M NaCl Wash", "5 mM Buffer") must
+        # not read as a dotted section number and get re-leveled: the number lacks a
+        # trailing separator and (for "0.5") starts with zero, so neither matches.
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = ["<h2>0.5 M NaCl Wash</h2>", "<h3>5 mM Sodium Phosphate Buffer</h3>"]
+        assert _normalize_heading_levels(body) == body
+        # a genuine dotted/paren section number (always with a trailing separator) is
+        # still re-leveled by depth
+        assert _normalize_heading_levels(["<h2>2.1. Plant materials</h2>"]) == [
+            "<h3>2.1. Plant materials</h3>"
+        ]
+        assert _normalize_heading_levels(["<h3>(2) Methods</h3>"]) == [
+            "<h2>(2) Methods</h2>"
+        ]
+
+    def test_non_heading_blocks_untouched(self) -> None:
+        from pdfparser.pipeline.classify import _normalize_heading_levels
+
+        body = ["<p>1. A numbered list item, not a heading.</p>", "<table></table>"]
+        assert _normalize_heading_levels(body) == body
+
 
 class TestDegenerateRepetition:
     """A figure the model fails to box can be OCRed into a repeated-token wall;
