@@ -710,14 +710,14 @@ class TestTableNormalization:
     the PDF text layer so the same content matches across both."""
 
     def test_superscript_and_micro_fold_to_text_layer_form(self) -> None:
-        from pdfparser.pipeline.tables import _normalize
+        from pdfparser.pipeline.layers import _normalize
 
         assert _normalize("Mg²⁺") == _normalize("Mg2+") == "mg2"
         # micro sign vs Greek mu, and superscript ⁻¹ (a U+2212 minus) vs ASCII -1
         assert _normalize("µg L⁻¹") == _normalize("μg L-1")
 
     def test_index_map_recovers_source_range(self) -> None:
-        from pdfparser.pipeline.tables import _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
 
         text = "A: Mg²⁺ ok"
         norm, idx_map = _normalize_with_map(text)
@@ -761,7 +761,8 @@ class TestTableLocalization:
         return text, boxes, rotations
 
     def test_bbox_covers_table_rows_excludes_prose(self) -> None:
-        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
+        from pdfparser.pipeline.tables import _locate_bbox
 
         # A 5-row table at the top, then a wide gap, then dense prose.  Only the
         # heading row is a (unique) anchor; growth must still reach the trailing
@@ -795,7 +796,8 @@ class TestTableLocalization:
         assert bottom <= 680 and top >= 688
 
     def test_returns_none_when_no_anchor_matches(self) -> None:
-        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
+        from pdfparser.pipeline.tables import _locate_bbox
 
         text, boxes, rotations = self._layout([("Effect of EDTA on activity", 700, 50)])
         norm, idx_map = _normalize_with_map(text)
@@ -805,7 +807,8 @@ class TestTableLocalization:
         )
 
     def test_repeated_anchor_is_ambiguous_and_skipped(self) -> None:
-        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
+        from pdfparser.pipeline.tables import _locate_bbox
 
         # "alpha beta" occurs twice, so it cannot seed the box on its own.
         text, boxes, rotations = self._layout(
@@ -848,7 +851,8 @@ class TestTableLocalization:
         return text, boxes, rotations
 
     def test_sideways_table_located_on_reading_axis_excludes_prose(self) -> None:
-        from pdfparser.pipeline.tables import _locate_bbox, _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
+        from pdfparser.pipeline.tables import _locate_bbox
 
         # A 270°-rotated table occupies three vertical column-strips on the right;
         # an upright body heading sits in the left column.  Localization must run
@@ -888,7 +892,8 @@ class TestCoverageGate:
     def _centers(
         lines: list[tuple[str, float | int, float | int]],
     ) -> tuple[str, list[tuple[float, float] | None]]:
-        from pdfparser.pipeline.tables import _glyph_centers, _normalize_with_map
+        from pdfparser.pipeline.layers import _normalize_with_map
+        from pdfparser.pipeline.tables import _glyph_centers
 
         text, boxes, _ = TestTableLocalization._layout(lines)
         norm, idx_map = _normalize_with_map(text)
@@ -1149,7 +1154,7 @@ class TestTextLayerTableRepair:
             "<tr><td>bond lengths (Å)</td><td>0.011</td></tr>"
             "</table>"
         )
-        from pdfparser.pipeline.tables import _DocumentLayers
+        from pdfparser.pipeline.layers import _DocumentLayers
 
         with _DocumentLayers.open(str(pdf)) as layers:
             pages = ["" for _ in range(len(layers))]
@@ -1192,7 +1197,7 @@ class TestTextLayerTableRepair:
             "<tr><td>unique reflections</td><td>37991</td></tr>"
             "<tr><td>redundancy</td><td>4.2 (3.4)</td></tr>" + loop + "</table>"
         )
-        from pdfparser.pipeline.tables import _DocumentLayers
+        from pdfparser.pipeline.layers import _DocumentLayers
 
         with _DocumentLayers.open(str(pdf)) as layers:
             pages = ["" for _ in range(len(layers))]
@@ -1217,17 +1222,17 @@ class TestRepairLazyExtraction:
         import pytest
 
         from pdfparser.pipeline import tables
+        from pdfparser.pipeline.layers import _DocumentLayers, _PageLayer
 
         calls: list[int] = []
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
-                tables,
-                "_page_layer",
-                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+                "pdfparser.pipeline.layers._page_layer",
+                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
             )
             # a 3-column table: the repair only understands label|value (2-col) tables
             md = "<table><tr><td>a</td><td>b</td><td>c</td></tr></table>"
-            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
             assert tables._repair_page_tables(md, layers, 0) == md
         assert calls == []
 
@@ -1238,20 +1243,20 @@ class TestRepairLazyExtraction:
         import pytest
 
         from pdfparser.pipeline import tables
+        from pdfparser.pipeline.layers import _DocumentLayers, _PageLayer
 
         calls: list[int] = []
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
-                tables,
-                "_page_layer",
-                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+                "pdfparser.pipeline.layers._page_layer",
+                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
             )
             mp.setattr(
                 tables, "_reconstruct_table_from_text_layer", lambda layer, table: None
             )
             tbl = "<table><tr><td>label</td><td>value</td></tr></table>"
             md = tbl + "\n\n" + tbl  # two complete 2-column tables on one page
-            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
             tables._repair_page_tables(md, layers, 0)
         assert len(calls) == 1
 
@@ -1267,16 +1272,15 @@ class TestDocumentLayersCache:
         import pypdfium2 as pdfium
         import pytest
 
-        from pdfparser.pipeline import tables
+        from pdfparser.pipeline.layers import _DocumentLayers, _PageLayer
 
         calls: list[int] = []
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
-                tables,
-                "_page_layer",
-                lambda page: calls.append(1) or tables._PageLayer("", [], [], "", []),
+                "pdfparser.pipeline.layers._page_layer",
+                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
             )
-            layers = tables._DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
             # the table pass and the figure pass both localize against page 0
             first = layers.page_layer(0)
             second = layers.page_layer(0)

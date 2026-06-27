@@ -494,8 +494,8 @@ class TestRecoverDroppedFigures:
         assert _column_bounds(lines, cap_box, 110.0, 600.0) == (300.0, 600.0)
 
     def test_attempt_page_figure_declines_on_crop_ocr_failure(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
         from pdfparser.pipeline.recover_figures import _attempt_page_figure
-        from pdfparser.pipeline.tables import _DocumentLayers
 
         # A transient GPU OOM in the crop re-OCR must decline that figure (return None),
         # not abort the document. Figure 1's caption localizes deterministically on

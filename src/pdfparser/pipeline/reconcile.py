@@ -26,7 +26,7 @@ from collections import Counter
 
 import pypdfium2 as pdfium
 
-from pdfparser.pipeline.tables import _DocumentLayers
+from pdfparser.pipeline.layers import _DocumentLayers
 from pdfparser.pipeline.text import (
     _TABLE_TAG_RE,
     _looks_like_figure_caption,
@@ -101,7 +101,7 @@ def _norm_mapped(raw: str) -> tuple[str, list[int]]:
     has one trailing entry (``len(raw)``) so an end-exclusive bound at the string
     end resolves.
 
-    Deliberately distinct from ``tables._normalize_with_map`` (which shares only
+    Deliberately distinct from ``layers._normalize_with_map`` (which shares only
     the index-map shape): that folds to a lossy alnum-only *match key* (NFKD,
     lower-cased, punctuation dropped), whereas this keeps case, dashes, and
     punctuation so the projected raw slice is faithful to splice back."""

@@ -50,6 +50,7 @@ from pdfparser.pipeline.figures import (
     _union_box,
 )
 from pdfparser.pipeline.latex import _latex_to_html
+from pdfparser.pipeline.layers import _DocumentLayers
 from pdfparser.pipeline.markdown import _md_to_html_blocks, _render_inline_html
 from pdfparser.pipeline.merge import (
     _colocate_table_captions,
@@ -65,7 +66,6 @@ from pdfparser.pipeline.render import _render_page_images
 from pdfparser.pipeline.tables import (
     _close_unclosed_tables,
     _collapse_repeated_rows_md,
-    _DocumentLayers,
     _recover_dropped_tables,
     _repair_tables_from_text_layer,
 )

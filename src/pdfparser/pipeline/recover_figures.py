@@ -42,14 +42,8 @@ from pdfparser.pipeline.figures import (
     _opens_with_panel_label,
     _safe_ocr_region,
 )
-from pdfparser.pipeline.tables import (
-    _Box,
-    _DocumentLayers,
-    _group_lines,
-    _normalize,
-    _scaled_crop,
-    _union,
-)
+from pdfparser.pipeline.layers import _Box, _DocumentLayers, _normalize
+from pdfparser.pipeline.tables import _group_lines, _scaled_crop, _union
 from pdfparser.pipeline.text import _split_md_blocks
 
 # A figure caption *label* at the start of a text line: "FIG 1", "Figure 4.",
