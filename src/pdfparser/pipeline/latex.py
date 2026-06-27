@@ -317,6 +317,11 @@ def _latex_to_html(text: str) -> str:
     # literal-section-sign form of the same misread ("§4 Fig." → "S4 Fig.").  Both run
     # here, before span processing, so they only see an OCR-literal "§" — never one the
     # span pass itself produces from a standalone "\S" footnote marker.
-    text = _LATEX_S_LABEL_SPAN_RE.sub(r"S\1", text)
+    # The captured label can carry an '_' ("$\S4_2$" → "S4_2"); it lands in the
+    # pre-markdown stream, so escape it like every other literal emitted there
+    # (_MD_EMPHASIS_ESCAPE), or the downstream inline parser re-reads it as emphasis.
+    text = _LATEX_S_LABEL_SPAN_RE.sub(
+        lambda m: "S" + m.group(1).translate(_MD_EMPHASIS_ESCAPE), text
+    )
     text = _LITERAL_S_LABEL_RE.sub(r"\1S", text)
     return _LATEX_SPAN_RE.sub(replace, text)

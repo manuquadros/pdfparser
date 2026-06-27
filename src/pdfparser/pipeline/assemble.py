@@ -52,7 +52,6 @@ from pdfparser.pipeline.figures import (
 from pdfparser.pipeline.latex import _latex_to_html
 from pdfparser.pipeline.markdown import _md_to_html_blocks, _render_inline_html
 from pdfparser.pipeline.merge import (
-    _TABLE_OPEN_RE,
     _colocate_table_captions,
     _colocate_table_footnotes,
     _join_split_table_caption_labels,
@@ -71,6 +70,7 @@ from pdfparser.pipeline.tables import (
     _repair_tables_from_text_layer,
 )
 from pdfparser.pipeline.text import (
+    _TABLE_TAG_RE,
     _looks_like_figure_caption,
     _opens_with_caption_label,
     _opens_with_table_label,
@@ -194,7 +194,11 @@ def _is_caption_continuation(block: str) -> bool:
         return False
     for line in block.splitlines():
         s = line.lstrip()
-        if s.startswith(("#", "|", "<table")) or _parse_figure_placeholder(s):
+        if (
+            s.startswith(("#", "|"))
+            or _TABLE_TAG_RE.match(s)
+            or _parse_figure_placeholder(s)
+        ):
             return False
     return not _opens_with_caption_label(block)
 
@@ -325,7 +329,10 @@ def _parse_page_blocks(md: str) -> list[_Block]:
 
 
 def _is_table_md(block: _Block | None) -> bool:
-    return isinstance(block, _MdBlock) and _TABLE_OPEN_RE.match(block.text) is not None
+    return (
+        isinstance(block, _MdBlock)
+        and _TABLE_TAG_RE.match(block.text.lstrip()) is not None
+    )
 
 
 def _is_table_caption_md(block: _Block | None) -> bool:

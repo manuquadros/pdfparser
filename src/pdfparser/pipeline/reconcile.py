@@ -27,7 +27,11 @@ from collections import Counter
 import pypdfium2 as pdfium
 
 from pdfparser.pipeline.tables import _DocumentLayers
-from pdfparser.pipeline.text import _looks_like_figure_caption, _split_md_blocks
+from pdfparser.pipeline.text import (
+    _TABLE_TAG_RE,
+    _looks_like_figure_caption,
+    _split_md_blocks,
+)
 
 # Tail/head anchors are this many tokens; 6 is distinctive enough that a prose
 # anchor rarely collides spuriously in a single page's layer.
@@ -51,9 +55,6 @@ _WS_RE = re.compile(r"\s+")
 # Distinct from classify._DIGITS_RE: that strips a folio digit (``sub("")``) from
 # an HTML part; this masks every digit run (``sub("#")``) on a raw layer line.
 _DIGIT_RUN_RE = re.compile(r"\d+")
-# A table tag anywhere in a block — including a continuation fragment a blank line
-# split off (``</table>``, ``<tr>…``) that does not carry the opening ``<table``.
-_TABLE_TAG_RE = re.compile(r"</?(?:table|tr|td|th|tbody|thead)\b", re.I)
 # A figure/table caption label opening a block or a recovered gap.
 _LABEL_START_RE = re.compile(r"^(?:Fig(?:ure)?|Table|Scheme)\b", re.I)
 # Trailing/inline page furniture that must not be recovered as prose.

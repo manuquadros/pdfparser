@@ -22,6 +22,7 @@ Leaf module: touches the PDF (render + text layer) and the GPU (via the injected
 
 from __future__ import annotations
 
+import html
 import math
 import re
 import unicodedata
@@ -906,7 +907,10 @@ def _cell_format_map(table_html: str) -> dict[str, str]:
 
 
 def _format_cell(plain: str, fmt: dict[str, str]) -> str:
-    return fmt.get(_normalize(plain).replace(" ", ""), plain)
+    # The format-map branch is already escaped HTML from the OCR cell; only the raw
+    # text-layer fallback needs escaping, or a value carrying '<'/'>'/'&' (a "<0.001"
+    # statistic, an "&") injects markup / breaks the <td>.
+    return fmt.get(_normalize(plain).replace(" ", "")) or html.escape(plain)
 
 
 def _leading_caption_rows(table_html: str) -> tuple[list[str], str]:

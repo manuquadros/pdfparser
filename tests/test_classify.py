@@ -880,6 +880,26 @@ class TestLightonAssembly:
         assert not any("KEYWORDS" in a for a in meta.abstract)
         assert any("KEYWORDS" in b for b in meta.body)
 
+    def test_inline_abstract_label_alone_emits_no_empty_paragraph(self) -> None:
+        # The OCR sometimes emits the inline abstract label as its own block; the
+        # remainder is empty.  The window must still open (the next block is the
+        # abstract body) but no stray "<p></p>" leaks into the abstract section.
+        from pdfparser.pipeline.classify import _classify_parts
+
+        meta = _classify_parts(
+            [
+                "<h1>T</h1>",
+                "<h2>X</h2>",
+                "<p><strong>ABSTRACT:</strong></p>",
+                "<p>The abstract body follows on the next block.</p>",
+                "<h2>Introduction</h2>",
+                "<p>Body.</p>",
+            ]
+        )
+        assert "<p></p>" not in meta.abstract
+        assert meta.abstract == ["<p>The abstract body follows on the next block.</p>"]
+        assert any("Body." in b for b in meta.body)
+
     def test_frontmatter_unchanged_when_body_opens_with_section(self) -> None:
         # First block is already a body section heading → nothing precedes it →
         # order left intact.

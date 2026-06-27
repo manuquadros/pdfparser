@@ -175,6 +175,29 @@ class TestSplitFigureCaption:
         assert "Results" not in figcap
 
 
+class TestSplitTableFragmentClassification:
+    """``_split_md_blocks`` breaks a ``<table>`` on an internal blank line into a tail
+    fragment opening ``<tr>``/``</table>`` with no ``<table``; the caption/table
+    predicates must recognise it as a table, not fold it into a figcaption."""
+
+    def test_caption_continuation_rejects_split_table_fragment(self) -> None:
+        from pdfparser.pipeline.assemble import _is_caption_continuation
+
+        assert not _is_caption_continuation("<tr><td>1</td></tr>\n</table>")
+        assert not _is_caption_continuation("</table>")
+        assert not _is_caption_continuation("<tbody>\n<tr><td>x</td></tr>")
+        # genuine continuation prose is still a continuation
+        assert _is_caption_continuation("Continued legend describing panel B.")
+
+    def test_is_table_md_recognises_split_table_fragment(self) -> None:
+        from pdfparser.pipeline.assemble import _is_table_md, _MdBlock
+
+        assert _is_table_md(_MdBlock("<table>\n<tr><td>a</td></tr>"))
+        assert _is_table_md(_MdBlock("<tr><td>b</td></tr>\n</table>"))
+        assert not _is_table_md(_MdBlock("Just a paragraph."))
+        assert not _is_table_md(None)
+
+
 class TestFigureLabelPredicates:
     def test_bare_figure_label(self) -> None:
         from pdfparser.pipeline.figures import _is_bare_figure_label

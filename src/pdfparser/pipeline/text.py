@@ -52,6 +52,12 @@ _TABLE_CAPTION_RE = re.compile(
     r"\w+"
     r"(?:\s*[.:)–—-]|\s*\|\s*[A-Z(]|\s+[A-Z(]|\s*\*{0,2}\s*$)"
 )
+# A table tag anywhere in a block — the opening ``<table>`` *or* a continuation
+# fragment ``_split_md_blocks`` strands when a blank line splits a table
+# (``</table>``, ``<tr>…`` carry no opening ``<table``).  Shared by reconcile (a
+# table-like block is skipped for prose recovery) and assemble (a split tail is not
+# caption prose / is a table block).
+_TABLE_TAG_RE = re.compile(r"</?(?:table|tr|td|th|tbody|thead)\b", re.IGNORECASE)
 
 
 _BLOCK_SPLIT_RE = re.compile(r"\n[ \t]*\n")

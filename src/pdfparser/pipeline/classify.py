@@ -906,6 +906,16 @@ def _classify_heading(
     state.body.append(f"<h2>{inner}</h2>" if is_demoted_h1 else part)
 
 
+def _open_inline_abstract(state: _ClassifyState, remainder: str) -> None:
+    # Open the abstract window even when the label stood alone (remainder empty): the
+    # following paragraph is the abstract body.  Appending the empty remainder would
+    # leak a stray "<p></p>" into the rendered abstract box (the sibling banner branch
+    # in _classify_paragraph guards this the same way).
+    state.in_abstract = True
+    if remainder:
+        state.abstract.append(f"<p>{remainder}</p>")
+
+
 def _classify_paragraph(state: _ClassifyState, part: str) -> None:
     inner_p = _plain_p_text(part)
     # Strip a leading publication banner ("**OPEN ACCESS**") the OCR bolded onto
@@ -927,8 +937,7 @@ def _classify_paragraph(state: _ClassifyState, part: str) -> None:
     # the abstract window (like the heading path) so a multi-paragraph abstract's
     # continuation is captured too, closing at the next bold label / heading.
     if inner_p is not None and (m := _INLINE_ABSTRACT_RE.match(inner_p)):
-        state.abstract.append(f"<p>{inner_p[m.end() :].lstrip()}</p>")
-        state.in_abstract = True
+        _open_inline_abstract(state, inner_p[m.end() :].lstrip())
         return
     if state.in_abstract:
         if inner_p is not None and not _BOLD_LABEL_EITHER_COLON_RE.match(inner_p):

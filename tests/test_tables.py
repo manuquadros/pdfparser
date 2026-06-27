@@ -1072,6 +1072,16 @@ class TestTextLayerTableRepair:
         )
         assert _format_cell("not in the table", fmt) == "not in the table"
 
+    def test_format_cell_escapes_text_layer_fallback(self) -> None:
+        from pdfparser.pipeline.tables import _format_cell
+
+        # A rebuilt value the OCR never produced (no format-map entry) is raw
+        # text-layer text; "<"/">"/"&" must be escaped or it injects markup / breaks
+        # the <td> (a "<0.001" statistic, an "a & b").
+        assert _format_cell("<0.001", {}) == "&lt;0.001"
+        assert _format_cell("a & b", {}) == "a &amp; b"
+        assert _format_cell("< 2.0", {}) == "&lt; 2.0"
+
     def test_leading_caption_rows_extracted(self) -> None:
         from pdfparser.pipeline.tables import _leading_caption_rows
 

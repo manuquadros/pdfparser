@@ -117,6 +117,15 @@ class TestLatexToHtml:
         assert _latex_to_html(r"$\S 4$ Fig.") == "S4 Fig."
         assert _latex_to_html(r"$\S1$ Raw images.") == "S1 Raw images."
 
+    def test_supplementary_label_escapes_underscore(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # The captured label can carry a literal "_" ("$\S4_2$") which lands in the
+        # pre-markdown stream; it is escaped to the HTML entity so the downstream
+        # inline parser does not re-read it as emphasis (the documented "*"/"_"
+        # pre-markdown-escape invariant).
+        assert _latex_to_html(r"$\S4_2$ Data.") == "S4&#95;2 Data."
+
     def test_standalone_section_command_still_section_sign(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 
