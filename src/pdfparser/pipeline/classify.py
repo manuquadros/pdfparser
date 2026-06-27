@@ -742,11 +742,28 @@ def _looks_like_personal_name(plain: str) -> bool:
     )
 
 
+_BYLINE_EMPHASIS_RE = re.compile(r"</?(?:strong|em)>")
+_BYLINE_MARKER_RE = re.compile(r"\*+")
+
+
 def _byline_html(inner: str) -> str:
     """Authors as inline HTML, ``<br>``-separated affiliation runs joined with
     "; ".  Superscript/marker tags are kept (rendered as superscripts in the
-    header), unlike ``_byline_text`` which flattens them for the byline predicate."""
-    return re.sub(r"<br\s*/?>", "; ", inner).strip()
+    header), unlike ``_byline_text`` which flattens them for the byline predicate.
+
+    A byline is bold/italic by *layout*, not intent, and its corresponding-author
+    asterisks are footnote markers, not emphasis — but the OCR emits the line wrapped
+    in ``**…**`` with the markers as bare ``*``, which markdown-it mis-pairs the
+    opening ``**`` against, leaving a spurious ``<em>`` and a stray ``**``
+    (``…ChangWoo Lee</em>**``).  So drop the layout emphasis (which also clears that
+    mis-pairing) and re-cast each surviving literal ``*`` as a superscript marker.  A
+    byline whose markers already arrived as ``<sup>`` (the ``$^{1,*}$`` LaTeX shape)
+    carries no bare ``*`` and is left untouched."""
+    inner = re.sub(r"<br\s*/?>", "; ", inner).strip()
+    inner = _BYLINE_EMPHASIS_RE.sub("", inner)
+    if "<sup>" not in inner:
+        inner = _BYLINE_MARKER_RE.sub("<sup>*</sup>", inner)
+    return inner
 
 
 def _byline_text(inner: str) -> str:

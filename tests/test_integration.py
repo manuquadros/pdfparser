@@ -403,15 +403,23 @@ class TestPlosSidebarMetadata:
         assert "<h1>PLOS ONE</h1>" not in header
 
     def test_byline_has_no_stray_or_misnested_markup(self, plos_html: str) -> None:
-        # The author line is bolded with literal '*' equal-contribution markers
-        # ("**… Jang\\*, ChangWoo Lee\\***").  The inline parser must form balanced
-        # emphasis — no leftover '**' and no mis-ordered "<em>…</strong></em>" /
-        # redundant "<em><em>" the old hand-rolled regex produced.
+        # The author line is bolded with '*' corresponding-author markers
+        # ("**… Jang*, ChangWoo Lee***").  The byline render strips the layout bold
+        # and re-casts the markers as superscripts — no leftover '**', no mis-ordered
+        # "<em>…</strong></em>" / redundant "<em><em>", and no bold wrapper.
         header = plos_html[: plos_html.find("</header>")]
         assert "ChangWoo Lee" in header
         assert "**" not in header
         assert "</strong></em>" not in header
         assert "<em><em>" not in header
+        # the byline paragraph (the <p> after the <h1> title) carries no layout
+        # emphasis and renders the surviving marker as a superscript.  Scoped to the
+        # byline because the title legitimately italicises a species name.
+        after_title = header[header.find("</h1>") :]
+        byline = after_title[after_title.find("<p>") : after_title.find("</p>") + 4]
+        assert "ChangWoo Lee<sup>*</sup>" in byline
+        assert "<em>" not in byline
+        assert "<strong>" not in byline
 
     def test_body_opens_with_introduction_prose(self, plos_html: str) -> None:
         # With the sidebar relocated, the body proper opens at the Introduction —

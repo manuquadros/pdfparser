@@ -266,6 +266,33 @@ class TestByline:
         assert "<em>" not in header
         assert ",," not in header
 
+    def test_byline_has_no_stray_or_misnested_markup(self) -> None:
+        # PLOS prints the byline bold and tags corresponding authors with '*'; the
+        # OCR emits the line bold-wrapped with bare-'*' markers, which markdown-it
+        # mis-pairs into a stray '**' + spurious <em> (…ChangWoo Lee</em>**).  The
+        # byline render strips the layout bold and re-casts the markers as <sup>.
+        from pdfparser.pipeline.classify import _byline_html
+
+        for inner in (
+            # the clean OCR shape: bold-wrapped, markers escaped to literal '*'
+            "<strong>Kiet N. Tran, Sei-Heon Jang*, ChangWoo Lee*</strong>",
+            # the mis-paired OCR shape markdown-it produced from bare-'*' markers
+            "<em><em>Kiet N. Tran, Sei-Heon Jang</em>, ChangWoo Lee</em>**",
+        ):
+            out = _byline_html(inner)
+            assert "<em>" not in out
+            assert "<strong>" not in out
+            assert "**" not in out
+            assert "ChangWoo Lee<sup>*</sup>" in out
+
+    def test_byline_latex_superscript_markers_left_intact(self) -> None:
+        # a byline whose markers already arrived as <sup> (the $^{1,*}$ LaTeX shape)
+        # carries no bare '*', so the marker re-cast must not touch it
+        from pdfparser.pipeline.classify import _byline_html
+
+        inner = "Yan Zhou<sup>1,*</sup>, Yifeng Wei<sup>2,*</sup>"
+        assert _byline_html(inner) == inner
+
 
 class TestDegenerateRepetition:
     """A figure the model fails to box can be OCRed into a repeated-token wall;
