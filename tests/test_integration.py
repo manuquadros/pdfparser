@@ -477,6 +477,16 @@ class TestPlosSidebarMetadata:
         assert "<h3>Purification of SpRDH</h3>" in body
         assert "<h2>Purification of SpRDH</h2>" in body
 
+    def test_reference_tail_not_stranded_outside_list(self, plos_html: str) -> None:
+        # A page break dropped reference 33's head/number, stranding its tail
+        # ("…dehydrogenase is independent of the oxidative fermentation. Biosci
+        # Biotechnol Biochem…") as a loose <p>; it must be folded into the
+        # bibliography <ol>, not left as a paragraph between numbered entries.
+        body = _body(plos_html)
+        assert "dehydrogenase is independent of the oxidative fermentation" in body
+        # the stranded tail is inside the list, never a bare <p> right after the </ol>
+        assert not re.search(r"</ol>\s*<p>dehydrogenase is independent", body)
+
 
 @pytest.mark.integration
 class TestPlosFigureCrops:

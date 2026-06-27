@@ -73,6 +73,7 @@ from pdfparser.pipeline.text import (
     _looks_like_figure_caption,
     _opens_with_caption_label,
     _opens_with_table_label,
+    _plain_p_text,
     _split_md_blocks,
     _visible_text,
 )
@@ -515,6 +516,18 @@ _NUMBERED_REF_P_RE = re.compile(r"^<p>\s*(\d{1,3})[.)\]]?\s+([A-Z].*)</p>$", re.
 _OL_BLOCK_RE = re.compile(r"^<ol\b[^>]*>.*</ol>$", re.IGNORECASE | re.DOTALL)
 
 
+def _is_reference_continuation(block: str) -> bool:
+    """A bibliography entry's tail the OCR stranded after a page break: a plain ``<p>``,
+    not itself a numbered entry, opening mid-sentence (lowercase) — the head (and its
+    number) was dropped at the break, so it lands loose between the list and the next
+    entry's ``<ol>``.  Used only right after an ``<ol>`` in the references section."""
+    inner = _plain_p_text(block)
+    if inner is None or _NUMBERED_REF_P_RE.match(block):
+        return False
+    head = _visible_text(inner).lstrip()
+    return bool(head) and head[0].islower()
+
+
 def _consolidate_numbered_references(parts: list[str]) -> list[str]:
     """Fold period-less numbered reference entries into one ``<ol>``.
 
@@ -533,6 +546,20 @@ def _consolidate_numbered_references(parts: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(parts):
+        # A page-break-stranded entry tail (its number dropped) lands as a loose <p>
+        # after the list; fold it back into the last <li> so it reads inside the
+        # bibliography rather than as a stray paragraph between numbered entries.
+        if (
+            i > ref_start
+            and out
+            and _OL_BLOCK_RE.match(out[-1])
+            and _is_reference_continuation(parts[i])
+        ):
+            inner = _plain_p_text(parts[i])
+            cut = out[-1].rfind("</p>")
+            out[-1] = f"{out[-1][:cut]} {inner}{out[-1][cut:]}"
+            i += 1
+            continue
         m = _NUMBERED_REF_P_RE.match(parts[i])
         if i > ref_start and m is not None:
             first_num = m.group(1)

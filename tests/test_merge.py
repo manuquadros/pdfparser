@@ -231,6 +231,38 @@ class TestNumberedReferenceConsolidation:
         out = _consolidate_numbered_references(parts)
         assert out[0] == "<p>9 Samples were collected from Site A and analyzed.</p>"
 
+    def test_stranded_entry_tail_folded_into_last_li(self) -> None:
+        from pdfparser.pipeline.assemble import _consolidate_numbered_references
+
+        # A page break dropped an entry's head/number, stranding its tail as a loose
+        # lowercase <p> after the <ol>; it is folded into the last <li> so it reads
+        # inside the bibliography, not as a stray paragraph.
+        parts = [
+            "<h2>References</h2>",
+            "<ol>\n<li>\n<p>Sukpipat W. xylitol dehydrogenase. J Biosci Bioeng.</p>"
+            "\n</li>\n</ol>",
+            "<p>dehydrogenase is independent of the oxidative fermentation. "
+            "Biosci Biotechnol Biochem. 2001; 65(1):115.</p>",
+        ]
+        out = _consolidate_numbered_references(parts)
+        assert len(out) == 2  # the stray <p> is gone, merged into the <ol>
+        assert "J Biosci Bioeng. dehydrogenase is independent" in out[1]
+        assert out[1].count("<li>") == 1
+
+    def test_capital_led_entry_after_ol_not_folded(self) -> None:
+        from pdfparser.pipeline.assemble import _consolidate_numbered_references
+
+        # A capital-led <p> after the <ol> is a new entry (author surname), not a
+        # continuation — it must not be swallowed into the previous list item.
+        parts = [
+            "<h2>References</h2>",
+            "<ol>\n<li>\n<p>Sukpipat W. Some title. J Biosci Bioeng.</p>\n</li>\n</ol>",
+            "<p>Onuț-Brännström I. Sharing of photobionts. Sci Rep. 2018.</p>",
+        ]
+        out = _consolidate_numbered_references(parts)
+        assert len(out) == 3  # left as its own block
+        assert out[2].startswith("<p>Onuț-Brännström")
+
 
 class TestCaptionMergeBarrier:
     """A figure/table caption is never absorbed as a paragraph continuation,
