@@ -177,6 +177,55 @@ class TestRunningFurniture:
         assert _strip_running_furniture(parts) == ["<h2>3.4 Enzymatic activities</h2>"]
 
 
+class TestCaptureLicenseFooter:
+    """A recurring copyright/open-access license footer the furniture strip drops is
+    captured once for the Metadata panel; a one-off copyright is left alone."""
+
+    _CC = (
+        "<p>© 2019 The Author(s). This is an open access article published by "
+        "Portland Press Limited and distributed under the Creative Commons "
+        "Attribution License 4.0 (CC BY).</p>"
+    )
+
+    def test_recurring_license_captured_once(self) -> None:
+        from pdfparser.pipeline.classify import _capture_license_footer
+
+        parts = [self._CC, "<p>Body prose.</p>", self._CC, self._CC]
+        assert _capture_license_footer(parts) == self._CC
+
+    def test_single_occurrence_not_captured(self) -> None:
+        from pdfparser.pipeline.classify import _capture_license_footer
+
+        # one copy is not running furniture (the strip leaves it in the body), so it
+        # must not be pulled — that would duplicate it into the panel
+        assert _capture_license_footer([self._CC, "<p>Body.</p>"]) is None
+
+    def test_non_license_prose_ignored(self) -> None:
+        from pdfparser.pipeline.classify import _capture_license_footer
+
+        # a "© 2019" mention without a license phrase is not a license footer
+        parts = ["<p>© 2019 someone, all rights here.</p>"] * 2
+        assert _capture_license_footer(parts) is None
+
+    def test_recurring_license_relocated_to_panel_end_to_end(self) -> None:
+        # the furniture strip drops the per-page repeats from the body (≥3 for a
+        # sentence-like line); the captured copy must surface in the Metadata panel,
+        # exactly once, not vanish entirely
+        cc = (
+            "© 2019 The Author(s). This is an open access article distributed under "
+            "the Creative Commons Attribution License (CC BY)."
+        )
+        pages = [
+            f"# T\n\n## Abstract\n\nA.\n\n## Body\n\nProse one.\n\n{cc}",
+            f"Prose two continues here.\n\n{cc}",
+            f"Prose three continues here as well.\n\n{cc}",
+        ]
+        html = _run_lighton(pages)
+        assert "Creative Commons Attribution License" in _metadata(html)
+        assert "Creative Commons Attribution License" not in _body(html)
+        assert html.count("Creative Commons Attribution License") == 1
+
+
 class TestByline:
     """The block after the title becomes the header byline only when it
     positively looks like authors; otherwise it stays in the body."""

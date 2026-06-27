@@ -23,6 +23,7 @@ from pdfparser.pipeline.classify import (
     _REF_HEADING_RE,
     _REF_SECTION_RE,
     _UNICODE_SUP_MARKER_RE,
+    _capture_license_footer,
     _classify_parts,
     _extract_front_matter,
     _extract_named_metadata_sections,
@@ -655,7 +656,15 @@ def _assemble_html(
     meta = _classify_parts(parts)
 
     abstract = _merge_split_paragraphs_stable(meta.abstract)
-    body = _merge_split_paragraphs_stable(_strip_running_furniture(meta.body))
+    # One copy of a recurring copyright/open-access license footer, captured before the
+    # furniture strip drops the per-page repeats, so it lands in the panel not nowhere.
+    license_footer = _capture_license_footer(meta.body)
+    stripped_body = _strip_running_furniture(meta.body)
+    # Relocate it only if the strip actually dropped it; a footer the strip kept (too
+    # few repeats to count as furniture) stays in the body — capturing would duplicate.
+    if license_footer is not None and license_footer in stripped_body:
+        license_footer = None
+    body = _merge_split_paragraphs_stable(stripped_body)
     body = _consolidate_numbered_references(body)
     body = _insert_footnotes_before_refs(body, meta.footnotes)
     leading_metadata, body = _extract_front_matter(body)
@@ -671,6 +680,8 @@ def _assemble_html(
     # matter; move it to the panel so it doesn't read as abstract prose.
     abstract, abstract_citation = _split_abstract_citation(abstract)
     metadata = leading_metadata + named_metadata + stray_metadata + abstract_citation
+    if license_footer is not None:
+        metadata = metadata + [license_footer]
 
     return _document_shell(
         title_html=meta.title_html or "Untitled",

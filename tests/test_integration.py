@@ -931,6 +931,14 @@ class TestBioscienceReportsRunningHeader:
         assert "Hydroxyethylsulfonate" not in _body(bsr_html)
         assert "<strong>OPEN ACCESS</strong>" not in bsr_html
 
+    def test_license_footer_relocated_to_panel(self, bsr_html: str) -> None:
+        # "© 2019 The Author(s). … (CC BY)." recurs on every page; the furniture strip
+        # drops the per-page repeats, but the article's license is front matter — one
+        # copy must land in the Metadata panel (not be discarded entirely), and never
+        # in the body.
+        assert "Creative Commons Attribution License" in _metadata(bsr_html)
+        assert "Creative Commons Attribution License" not in _body(bsr_html)
+
     def test_title_and_references_intact(self, bsr_html: str) -> None:
         header = bsr_html[bsr_html.find("<header>") : bsr_html.find("</header>")]
         assert "sulfoacetaldehyde reductase" in header

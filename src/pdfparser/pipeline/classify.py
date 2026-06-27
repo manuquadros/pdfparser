@@ -616,6 +616,31 @@ def _is_standalone_page_number(part: str) -> bool:
     )
 
 
+# A copyright / open-access license footer ("© 2019 The Author(s). … (CC BY).") the
+# journal prints on every page.  _strip_running_furniture rightly drops the per-page
+# repeats from the body, but the article's license is front matter worth keeping, so
+# one copy is captured into the Metadata panel first (see _capture_license_footer).
+_LICENSE_FOOTER_RE = re.compile(
+    r"©\s*\d{4}\b.*?(?:open[\s-]?access|creative commons|\bcc by\b|licen[sc]ed under)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _capture_license_footer(parts: list[str]) -> str | None:
+    """One copy of a *recurring* copyright/open-access license footer, for the Metadata
+    panel, or ``None`` when there is none.  Only a footer that repeats (≥2 blocks) is
+    captured — it is the per-page furniture ``_strip_running_furniture`` then removes
+    from the body, so taking one copy relocates it rather than losing it; a
+    single-occurrence copyright is left in place (it is not running furniture)."""
+    matches = [
+        part
+        for part in parts
+        if (inner := _plain_p_text(part)) is not None
+        and _LICENSE_FOOTER_RE.search(_visible_text(inner))
+    ]
+    return matches[0] if len(matches) > 1 else None
+
+
 def _strip_running_furniture(parts: list[str]) -> list[str]:
     """Drop short, recurring header/footer lines (page-number-insensitive) and
     standalone page-number blocks.
