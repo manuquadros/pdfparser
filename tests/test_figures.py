@@ -34,6 +34,30 @@ class TestSplitFigureCaption:
         # paragraph (it appears only inside the figcaption, never in a <p>).
         assert "<p>Protein alignments of TRI and TRII" not in html
 
+    def test_following_heading_echoed_onto_caption_tail_stripped(self) -> None:
+        # The model sometimes echoes the next section heading onto the tail of a
+        # figure's last panel description (no '#', no terminal punctuation), then emits
+        # the real heading too.  The echo must not be baked into the figcaption — the
+        # heading text belongs only to the <h2> that follows.
+        img = _fake_image(1190, 1540)
+        md = (
+            "# T\n\n## Abstract\n\nA.\n\n## Body\n\nIntro prose.\n\n"
+            "![image](i.png)100,100,900,600\n\n"
+            "Figure 4. Crystal structures of *BkTauF*\n\n"
+            "(A) Quaternary structure of *BkTauF*.\n\n"
+            "(B) Subunit structure shown in ribbon. helices in orange, blue, and "
+            "green, respectively. Crystal structure of BkTauF\n\n"
+            "## Crystal structures of *BkTauF*\n\n"
+            "Crystal structures were solved at high resolution."
+        )
+        html = _run_lighton([md], image=img)
+        figcap = html[html.find("<figcaption>") : html.find("</figcaption>") + 13]
+        # the echo is gone from the caption (it ends on the closed legend sentence)…
+        assert "respectively." in figcap
+        assert "Crystal structure of BkTauF" not in figcap
+        # …while the real heading still renders as its own <h2>
+        assert "<h2>Crystal structures of <em>BkTauF</em></h2>" in html
+
     def test_panel_labels_between_split_boxes_dropped(self) -> None:
         # The motivating Fig 2 case: the model split the figure into two panel
         # boxes and emitted the bare "A"/"B" panel labels as their own blocks; the

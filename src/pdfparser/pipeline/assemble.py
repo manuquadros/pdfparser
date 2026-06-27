@@ -139,6 +139,45 @@ def _starts_figure(block: str) -> bool:
     return bool(block) and _parse_figure_placeholder(block.splitlines()[0]) is not None
 
 
+# A caption's final clause: the run after its last sentence terminator, with no
+# terminator of its own (a heading the OCR echoed onto the caption trails off without
+# punctuation, unlike a closed legend sentence).
+_SENTENCE_TAIL_RE = re.compile(r"[.!?]\s+([^.!?]+?)\s*$")
+# This stream is raw markdown (pre-HTML), so a heading is "## Title", not "<h2>…".
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+_WORD_RE = re.compile(r"\w+")
+_HEADING_ECHO_MIN_TOKENS = 3
+
+
+def _strip_trailing_heading_echo(caption: str, next_block: str) -> str:
+    """Drop a section heading the OCR echoed onto the end of a caption.
+
+    The model sometimes emits a section heading twice — once glued (no ``#``, no
+    terminal punctuation) onto the tail of a figure's last panel description, and once
+    as the real heading block that follows (``…green, respectively. Crystal structure
+    of BkTauF`` before a ``# Crystal structures of BkTauF``).  The panel fold then bakes
+    the echo into the ``<figcaption>``.  When the caption's final clause duplicates the
+    *immediately-following* heading block — at least three words, almost all of them
+    (all but one, to tolerate a singular/plural slip) in that heading — strip the
+    clause.  Keyed on the real heading text, so a genuine trailing legend sentence
+    (which shares few words with the next heading) is left intact."""
+    heading = _MD_HEADING_RE.match(next_block.strip())
+    if heading is None:
+        return caption
+    stripped = caption.rstrip()
+    m = _SENTENCE_TAIL_RE.search(stripped)
+    if m is None:
+        return caption
+    tail_tokens = set(_WORD_RE.findall(m.group(1).lower()))
+    head_tokens = set(_WORD_RE.findall(heading.group(1).lower()))
+    if (
+        len(tail_tokens) >= _HEADING_ECHO_MIN_TOKENS
+        and len(tail_tokens - head_tokens) <= 1
+    ):
+        return stripped[: m.start(1)].rstrip()
+    return caption
+
+
 def _is_caption_continuation(block: str) -> bool:
     """A block that continues a caption: running prose, not the start of a new
     structural element (another float, a heading, a table).
@@ -272,6 +311,11 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         ):
             k += 1
             caption = f"{caption} {raw_blocks[k].strip()}"
+        # A folded panel/legend block can carry a duplicate of the *next* section
+        # heading the OCR glued onto its tail; drop that echo so the heading isn't
+        # repeated inside the figcaption (the real heading still follows as its block).
+        if caption is not None and k + 1 < len(raw_blocks):
+            caption = _strip_trailing_heading_echo(caption, raw_blocks[k + 1])
         blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
         k += 1
     return blocks
