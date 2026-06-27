@@ -45,7 +45,7 @@ class TestRunningFurniture:
     page numbers — are dropped; real repeated sentences are kept."""
 
     def test_page_numbered_footer_removed(self) -> None:
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = [
             "<p>Biotechnology and Applied Biochemistry 601</p>",
@@ -56,7 +56,7 @@ class TestRunningFurniture:
         assert out == ["<p>Real body sentence one.</p>"]
 
     def test_repeated_real_sentence_kept(self) -> None:
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = ["<p>This is a sentence.</p>", "<p>This is a sentence.</p>"]
         assert _strip_running_furniture(parts) == parts
@@ -64,7 +64,7 @@ class TestRunningFurniture:
     def test_short_enumerated_labels_kept(self) -> None:
         # "Fig 1"/"Fig 2" share a digit-stripped key but must not be removed —
         # only substantial recurring text (a journal footer) is furniture.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = ["<p>Fig 1</p>", "<p>body</p>", "<p>Fig 2</p>"]
         assert _strip_running_furniture(parts) == parts
@@ -73,7 +73,7 @@ class TestRunningFurniture:
         # A bare author-surname running foot ("Clark" on alternating pages) is
         # short but digit-free, so the digit-strip collision the length floor
         # guards against can't happen — it must still be recognised as furniture.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = [
             "<p>Clark</p>",
@@ -86,7 +86,7 @@ class TestRunningFurniture:
         # OCR transcribes the running journal line as a heading on a sparse page
         # (last page / after references); it must still count as furniture and be
         # stripped, not survive as an <h1>.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = [
             "<p>Biotechnology and Applied Biochemistry 601</p>",
@@ -101,7 +101,7 @@ class TestRunningFurniture:
         # looks like a finished sentence; recurring on 3+ pages, it is furniture
         # and must be stripped — otherwise it interleaves between a paragraph's
         # halves and blocks their cross-page merge.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         head = "<p>A ribitol dehydrogenase from <em>Sphingomonas</em> sp.</p>"
         parts = [head, "<p>Body one.</p>", head, "<p>Body two.</p>", head]
@@ -112,7 +112,7 @@ class TestRunningFurniture:
         # The same abbreviation-terminated line appearing only twice stays: two
         # occurrences are too few to outweigh its sentence-like shape, matching
         # the repeated-real-sentence guard.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         head = "<p>A ribitol dehydrogenase from <em>Sphingomonas</em> sp.</p>"
         parts = [head, "<p>Body one.</p>", head]
@@ -123,7 +123,7 @@ class TestRunningFurniture:
         # SpRDH" under both Methods and Results) recurs but never appears as a
         # plain paragraph, so it is structure, not a running header, and must
         # survive in both places.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = [
             "<h3>Purification of SpRDH</h3>",
@@ -137,7 +137,7 @@ class TestRunningFurniture:
         # only as a heading on several pages — its paragraph form differs (it also
         # carries a DOI line), so keys never match — is stripped because its
         # *verbatim* text recurs and carries digits.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         cit = "<h2>Bioscience Reports (2019) 39 BSR20190715</h2>"
         parts = [cit, "<p>Body one.</p>", cit, "<p>Body two.</p>", cit]
@@ -150,7 +150,7 @@ class TestRunningFurniture:
         # Two distinct numbered headings ("Step 1: …" / "Step 2: …") collapse to one
         # digit-stripped key but their verbatim texts differ, so neither is a running
         # head; both must survive (they only appear as headings, never paragraphs).
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = [
             "<h2>Step 1: Purification of Xylanase</h2>",
@@ -164,14 +164,14 @@ class TestRunningFurniture:
         # OCR sometimes isolates the folio into its own block, away from the
         # journal line, so digit-stripped recurrence can't catch it; a number-only
         # block is the page number itself and must be dropped.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = ["<p>601</p>", "<p>Real body sentence one.</p>", "<h2>602</h2>"]
         assert _strip_running_furniture(parts) == ["<p>Real body sentence one.</p>"]
 
     def test_section_number_kept(self) -> None:
         # A numbered section heading ("3.4 …") is not a bare folio and stays.
-        from pdfparser.pipeline.classify import _strip_running_furniture
+        from pdfparser.pipeline.furniture import _strip_running_furniture
 
         parts = ["<h2>3.4 Enzymatic activities</h2>", "<p>4</p>"]
         assert _strip_running_furniture(parts) == ["<h2>3.4 Enzymatic activities</h2>"]
@@ -188,20 +188,20 @@ class TestCaptureLicenseFooter:
     )
 
     def test_recurring_license_captured_once(self) -> None:
-        from pdfparser.pipeline.classify import _capture_license_footer
+        from pdfparser.pipeline.furniture import _capture_license_footer
 
         parts = [self._CC, "<p>Body prose.</p>", self._CC, self._CC]
         assert _capture_license_footer(parts) == self._CC
 
     def test_single_occurrence_not_captured(self) -> None:
-        from pdfparser.pipeline.classify import _capture_license_footer
+        from pdfparser.pipeline.furniture import _capture_license_footer
 
         # one copy is not running furniture (the strip leaves it in the body), so it
         # must not be pulled — that would duplicate it into the panel
         assert _capture_license_footer([self._CC, "<p>Body.</p>"]) is None
 
     def test_non_license_prose_ignored(self) -> None:
-        from pdfparser.pipeline.classify import _capture_license_footer
+        from pdfparser.pipeline.furniture import _capture_license_footer
 
         # a "© 2019" mention without a license phrase is not a license footer
         parts = ["<p>© 2019 someone, all rights here.</p>"] * 2
@@ -459,12 +459,12 @@ class TestDegenerateRepetition:
     such a paragraph is dropped from the body, real prose is kept."""
 
     def test_token_wall_flagged(self) -> None:
-        from pdfparser.pipeline.classify import _is_degenerate_repetition
+        from pdfparser.pipeline.furniture import _is_degenerate_repetition
 
         assert _is_degenerate_repetition("AaTRI, " * 40) is True
 
     def test_real_prose_not_flagged(self) -> None:
-        from pdfparser.pipeline.classify import _is_degenerate_repetition
+        from pdfparser.pipeline.furniture import _is_degenerate_repetition
 
         prose = (
             "The enzyme catalyzes the stereospecific oxidation of the substrate"
@@ -1292,7 +1292,7 @@ class TestLightonAssembly:
         assert _front_matter_len(body) == 2
 
     def test_ends_like_sentence_sees_past_trailing_citation(self) -> None:
-        from pdfparser.pipeline.classify import _ends_like_sentence
+        from pdfparser.pipeline.furniture import _ends_like_sentence
 
         # _ends_like_sentence (used for running-furniture detection) must also look
         # past a trailing citation superscript, or a recurring line ending in one is

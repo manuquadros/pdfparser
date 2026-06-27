@@ -52,7 +52,7 @@ _IMG_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)[\d,]*")
 _MD_RE = re.compile(r"[*_`#>|]+")
 _DASH_RE = re.compile(r"[‐-―−]")
 _WS_RE = re.compile(r"\s+")
-# Distinct from classify._DIGITS_RE: that strips a folio digit (``sub("")``) from
+# Distinct from furniture._DIGITS_RE: that strips a folio digit (``sub("")``) from
 # an HTML part; this masks every digit run (``sub("#")``) on a raw layer line.
 _DIGIT_RUN_RE = re.compile(r"\d+")
 # A figure/table caption label opening a block or a recovered gap.
@@ -139,7 +139,7 @@ def _layer_furniture_key(line: str) -> str:
     only by page number, date, or volume (``…org 1 February 2020 Volume 8``) keys
     consistently.
 
-    Named apart from ``classify._furniture_key`` (which keys HTML parts and
+    Named apart from ``furniture._furniture_key`` (which keys HTML parts and
     *strips* the folio digit) to keep the two recurrence heuristics from being
     mistaken for one — this masks every digit run on a raw text-layer line."""
     return _DIGIT_RUN_RE.sub("#", _norm(line)).lower()

@@ -23,7 +23,6 @@ from pdfparser.pipeline.classify import (
     _REF_HEADING_RE,
     _REF_SECTION_RE,
     _UNICODE_SUP_MARKER_RE,
-    _capture_license_footer,
     _classify_parts,
     _extract_front_matter,
     _extract_named_metadata_sections,
@@ -32,7 +31,6 @@ from pdfparser.pipeline.classify import (
     _normalize_heading_levels,
     _recover_headingless_abstract,
     _split_abstract_citation,
-    _strip_running_furniture,
 )
 from pdfparser.pipeline.figures import (
     _FIGURE_MERGE_GAP_FRAC,
@@ -48,6 +46,10 @@ from pdfparser.pipeline.figures import (
     _parse_figure_placeholder,
     _safe_crop,
     _union_box,
+)
+from pdfparser.pipeline.furniture import (
+    _capture_license_footer,
+    _strip_running_furniture,
 )
 from pdfparser.pipeline.latex import _latex_to_html
 from pdfparser.pipeline.layers import _DocumentLayers
