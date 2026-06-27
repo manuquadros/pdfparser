@@ -1548,7 +1548,7 @@ class TestLightonAssembly:
         assert "In this work, conducted jointly" in body
 
     def test_affiliation_line_predicate(self) -> None:
-        from pdfparser.pipeline.classify import _is_affiliation_line
+        from pdfparser.pipeline.affiliations import _is_affiliation_line
 
         assert _is_affiliation_line(
             "Daniel D. Clark From the Department of Chemistry and Biochemistry, "
