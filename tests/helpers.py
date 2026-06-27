@@ -119,3 +119,19 @@ def _header_h1(html: str) -> str:
     m = re.search(r"<header>.*?<h1>(.*?)</h1>", html, re.DOTALL)
     assert m, "header <h1> not found"
     return m.group(1)
+
+
+def _header(html: str) -> str:
+    """The raw <header>…</header> slice (title + byline), markup intact."""
+    start = html.find("<header>")
+    assert start >= 0, "header not found"
+    return html[start : html.find("</header>", start)]
+
+
+def _byline(html: str) -> str:
+    """The byline <p> (the paragraph after the <h1> title) inside the header.
+
+    Scoped past the title because the title legitimately italicises a species name,
+    so a header-wide `<em>` check would false-positive on it."""
+    after_title = _header(html)[_header(html).find("</h1>") :]
+    return after_title[after_title.find("<p>") : after_title.find("</p>") + 4]
