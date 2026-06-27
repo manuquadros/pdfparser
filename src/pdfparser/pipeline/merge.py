@@ -431,6 +431,75 @@ def _claim_table_caption(
     return None
 
 
+# A table whose first header cell is a panel sub-header ("A. Effect of EDTA …",
+# "B. ICP-MS analysis") — the shape a composite multi-panel table takes when the
+# model splits its panels into separate <table>s on the internal blank line between
+# them (which _split_md_blocks then breaks into separate blocks).
+_TH_CELL_RE = re.compile(r"<th\b[^>]*>(.*?)</th>", re.IGNORECASE | re.DOTALL)
+_PANEL_LABEL_RE = re.compile(r"^([A-Z])\.\s")
+
+
+def _table_panel_letter(table_html: str) -> str | None:
+    """The single-letter panel label a table's first ``<th>`` opens with ("A" for
+    ``<th>A. Effect of EDTA …</th>``), or ``None`` when it carries no panel header."""
+    m = _TH_CELL_RE.search(table_html)
+    if m is None:
+        return None
+    label = _PANEL_LABEL_RE.match(_visible_text(m.group(1)).strip())
+    return label.group(1) if label else None
+
+
+def _merge_panel_tables(first: str, second: str) -> str:
+    """Concatenate the inner rows of two panel ``<table>``s under the first's opening
+    tag, so the two panels render as one table (the shared caption is folded onto it
+    later by ``_colocate_table_captions``)."""
+    open_end = first.index(">") + 1
+    first_inner = first[open_end : first.rindex("</table>")]
+    second_inner = second[second.index(">") + 1 : second.rindex("</table>")]
+    return f"{first[:open_end]}{first_inner}{second_inner}</table>"
+
+
+def _merge_split_panel_tables(parts: list[str]) -> list[str]:
+    """Re-fuse a composite multi-panel table the model split into adjacent ``<table>``
+    blocks (one per panel) on the blank line between panels.
+
+    A run of adjacent **captionless** tables whose first ``<th>`` carries *sequential*
+    panel labels (A, then B, then C, …) is one logical table — only a composite table's
+    panels label their header rows that way and sit back-to-back — so they are merged
+    into the first block.  Gated tightly (captionless + sequential single-letter
+    headers) so two genuinely distinct adjacent tables are never fused.  Runs before
+    ``_colocate_table_captions`` so the single "Table N …" caption attaches to the
+    merged table, not just its first panel."""
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        letter = (
+            _table_panel_letter(part)
+            if _TABLE_OPEN_RE.match(part) and "<caption" not in part.lower()
+            else None
+        )
+        if letter is not None:
+            merged = part
+            expect = chr(ord(letter) + 1)
+            j = i + 1
+            while (
+                j < len(parts)
+                and _TABLE_OPEN_RE.match(parts[j])
+                and "<caption" not in parts[j].lower()
+                and _table_panel_letter(parts[j]) == expect
+            ):
+                merged = _merge_panel_tables(merged, parts[j])
+                expect = chr(ord(expect) + 1)
+                j += 1
+            out.append(merged)
+            i = j
+            continue
+        out.append(part)
+        i += 1
+    return out
+
+
 def _colocate_table_captions(parts: list[str]) -> list[str]:
     """Fold a free-standing "Table N …" caption into its ``<table>`` as a
     ``<caption>`` first child so it renders with the table rather than drifting

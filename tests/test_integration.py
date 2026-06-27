@@ -702,6 +702,24 @@ class TestPlosTableFormatting:
         )
         assert "&lt;sup&gt;" not in plos_html
 
+    def test_table2_panels_merged_under_one_caption(self, plos_html: str) -> None:
+        # Table 2 is a composite table with two panels ("A. Effect of EDTA…",
+        # "B. ICP-MS analysis"); the model splits them into two adjacent <table>s on
+        # the blank line between panels.  They must re-fuse into one table carrying the
+        # single "Table 2. Metal ion analysis." caption — not a captionless orphan B.
+        i = plos_html.find("Table 2. Metal ion analysis")
+        assert i != -1
+        # locate the <table> that owns the caption and its matching close
+        tbl_open = plos_html.rfind("<table", 0, i)
+        tbl_close = plos_html.find("</table>", i)
+        table = plos_html[tbl_open : tbl_close + len("</table>")]
+        # both panels live inside that single table block
+        assert "A. Effect of EDTA" in table
+        assert "B. ICP-MS analysis" in table
+        assert "Zn²⁺" in table  # panel B's data is under the same caption
+        # exactly one caption for the composite table
+        assert table.count("<caption>") == 1
+
 
 @pytest.fixture(scope="session")
 def frontiers_html(ocr_model: object) -> str:

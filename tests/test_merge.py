@@ -424,6 +424,75 @@ class TestInlineTableTitleHoist:
         assert _colocate_table_captions(parts) == parts
 
 
+class TestMergeSplitPanelTables:
+    """A composite multi-panel table the model split into per-panel <table>s (on the
+    blank line between panels) is re-fused when the panels carry sequential A./B./…
+    header labels and the later panels are captionless."""
+
+    _A = (
+        "<table>\n  <thead>\n"
+        "    <tr><th>A. Effect of EDTA on SpRDH activity</th><th></th></tr>\n"
+        "  </thead>\n  <tbody>\n    <tr><td>None</td><td>100</td></tr>\n"
+        "  </tbody>\n</table>"
+    )
+    _B = (
+        "<table>\n  <thead>\n"
+        "    <tr><th>B. ICP-MS analysis</th><th></th></tr>\n"
+        "  </thead>\n  <tbody>\n    <tr><td>Zn²⁺</td><td>&lt; 1.0</td></tr>\n"
+        "  </tbody>\n</table>"
+    )
+
+    def test_sequential_panel_tables_merged(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_panel_tables
+
+        out = _merge_split_panel_tables([self._A, self._B])
+        assert len(out) == 1
+        # one <table> wrapper, both panels' content inside it
+        assert out[0].count("<table") == 1
+        assert out[0].count("</table>") == 1
+        assert "A. Effect of EDTA" in out[0]
+        assert "B. ICP-MS analysis" in out[0]
+        assert "Zn²⁺" in out[0]  # panel B's data survives
+
+    def test_caption_then_merged_table_keeps_one_caption(self) -> None:
+        from pdfparser.pipeline.merge import (
+            _colocate_table_captions,
+            _merge_split_panel_tables,
+        )
+
+        # the real pipeline order: a free-standing caption, then the two panels
+        parts = ["<p>Table 2. Metal ion analysis.</p>", self._A, self._B]
+        merged = _merge_split_panel_tables(parts)
+        out = _colocate_table_captions(merged)
+        joined = "".join(out)
+        assert joined.count("<caption>") == 1
+        assert "<caption>Table 2. Metal ion analysis.</caption>" in joined
+        assert joined.count("<table") == 1
+
+    def test_distinct_adjacent_tables_not_fused(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_panel_tables
+
+        # ordinary column headers (no A./B. panel labels) → left as two tables
+        t1 = "<table><thead><tr><th>Gene</th><th>Length</th></tr></thead></table>"
+        t2 = "<table><thead><tr><th>Metal</th><th>Conc.</th></tr></thead></table>"
+        assert _merge_split_panel_tables([t1, t2]) == [t1, t2]
+
+    def test_non_sequential_panel_letters_not_fused(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_panel_tables
+
+        # A then C (a gap) is not a contiguous panel run → not merged
+        c = self._B.replace("B. ICP-MS analysis", "C. Something else")
+        assert _merge_split_panel_tables([self._A, c]) == [self._A, c]
+
+    def test_captioned_second_table_not_absorbed(self) -> None:
+        from pdfparser.pipeline.merge import _merge_split_panel_tables
+
+        # if the second panel-letter table already carries its own caption it is a
+        # distinct table, not a panel to fuse
+        b = self._B.replace("<table>", "<table><caption>Table 3. Other</caption>")
+        assert _merge_split_panel_tables([self._A, b]) == [self._A, b]
+
+
 class TestReflowWrappedParagraph:
     """When LightOnOCR preserves a column's visual line wrapping, a paragraph
     arrives as soft-wrapped lines inside one <p>: words break across the wrap

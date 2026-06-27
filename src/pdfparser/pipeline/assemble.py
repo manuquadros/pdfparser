@@ -55,6 +55,7 @@ from pdfparser.pipeline.merge import (
     _colocate_table_captions,
     _colocate_table_footnotes,
     _join_split_table_caption_labels,
+    _merge_split_panel_tables,
     _merge_split_paragraphs_stable,
 )
 from pdfparser.pipeline.model import OcrModel, _ocr_page, _ocr_pages, load_ocr_model
@@ -615,6 +616,9 @@ def _assemble_html(
 
     parts = [part for page in per_page_parts for part in page]
     parts = _join_split_table_caption_labels(parts)
+    # Re-fuse a composite table the model split into per-panel <table>s before caption
+    # colocation, so the single "Table N …" caption attaches to the merged table.
+    parts = _merge_split_panel_tables(parts)
     parts = _colocate_table_captions(parts)
     # Before classify so a table's footnotes stay with it rather than being swept
     # into the article footnote section, and before merge so the table is a
