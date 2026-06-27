@@ -254,7 +254,12 @@ its delimiters (:func:`~pdfparser.pipeline.latex._is_inline_math_span`).  Curren
 is protected by the same test: it is digit-led (``$5``), so a stray ``$…$``
 pairing over "$5 … $10" is left verbatim, and a span carrying a complete HTML tag
 is rejected outright — the pre-markdown stream still holds raw ``<sup>``/``<td>``
-whose ``<``/``>`` would otherwise read as a math relation.
+whose ``<``/``>`` would otherwise read as a math relation.  A reduced span also
+italicises a standalone single letter as a variable (``$x = 22$`` →
+``<em>x</em> = 22``; :func:`~pdfparser.pipeline.latex._italicize_math_variables`),
+with one carve-out that is itself an "is this X or Y?" call: a letter in *unit
+position* — trailing a numeric magnitude, ``5 V``, ``9.8 m/s²`` — is a unit symbol,
+not a variable, and stays upright.
 
 OCR decoding is greedy (:func:`~pdfparser.pipeline.model._ocr_page`).  OCR wants
 the single most-likely transcription, and a deterministic decode avoids
@@ -278,9 +283,10 @@ fold that closes the encoding gap — superscripts, the micro sign, the assorted
 dashes — between OCR'd cell and text-layer glyph) to seed a bounding box, which
 is then grown line-by-line through the table's rows and **halted at the wider gap
 to body prose** (the threshold is the table's own median line spacing, robust to a
-single wide internal row-group break).  The text layer's *content* is never read
-into the document; it only supplies coordinates, so the model stays the sole
-reader.  Two biases mirror the figure logic: localization may **over-shoot into
+single wide internal row-group break).  For this localization pass the text
+layer's *content* is never read into the document; it only supplies coordinates, so
+the model stays the sole reader — with one deliberate exception, the deterministic
+table rebuild below.  Two biases mirror the figure logic: localization may **over-shoot into
 surrounding prose** — mostly harmless, because only ``<table>`` blocks are lifted
 from the crop's re-OCR and the prose discarded — and a region is replaced only when
 the re-OCR returns *at least as many non-empty cells* as the original, so a crop
@@ -298,12 +304,40 @@ with no text layer (scanned PDFs) simply fail to localize and keep the full-page
 table — a geometric/CV detector would be the fallback for either case if it ever
 matters.
 
+One table defeats even a perfect crop, and it forces the single real exception to
+the reader rule.  A dense two-column statistics table (label | value) that the OCR
+mis-reads *the same way on every run* — dropping the empty top-left header cell so
+every row shifts a column and a value falls off the end, then truncating the tail —
+cannot be repaired by re-OCR, because a tighter crop just re-rolls the identical
+error (measured 5/5 runs on one fixture).  The only fix is deterministic, so
+:func:`~pdfparser.pipeline.tables._repair_tables_from_text_layer` rebuilds that
+table's *content* straight from the PDF text layer — reading the layer's words, not
+just its coordinates, the one place B-prime's "OCR is the sole reader" rule is
+broken on purpose, and a wider carve-out than the geometry-only localization above.
+It is fenced in tightly: only a two-column table qualifies; the rebuild replaces the
+OCR's only when it yields *more* rows (compared against the OCR table after
+collapsing any decode-loop explosion — see below — so an inflated table can't mask a
+truncated one); and the OCR's per-cell formatting is carried back by content-match,
+so ``R<sub>sym</sub>`` survives and only the cells the OCR dropped outright fall back
+to plain text.  The rule, then, holds everywhere except the narrow case where the
+model is provably, repeatably wrong and the text layer is provably right.
+
 Separately, a table that *overruns the bottom of a page* is transcribed without a
 closing ``</table>`` — the model stops mid-table at the page edge — so the next
 page's opening prose would render inside it.
 :func:`~pdfparser.pipeline.tables._close_unclosed_tables` balances the tags per
 page (the unit the model transcribes) before block-splitting, scoped to the pure
 core so it runs whether or not the re-OCR pass did.
+
+One more shape pathology is deterministic too: a *decode loop*.  On a dense table
+either OCR path can repeat a single row dozens of times (one fixture's table
+ballooned to ~110 rows).  :func:`~pdfparser.pipeline.tables._collapse_repeated_rows_md`
+collapses any run of more than ``_MAX_IDENTICAL_ROW_RUN`` byte-identical adjacent
+rows to one; like the tag-balancing it lives in the pure core and runs over every
+page table, so it covers both the page-level length-retry and the crop re-OCR paths.
+The lesson worth keeping: a table test has to bound *over*-generation, not just
+assert the table is present — that 110-row explosion still had balanced tags and the
+right caption, and slipped a presence-only assertion.
 
 Stage order is load-bearing.  In
 :func:`~pdfparser.pipeline.assemble._assemble_html` the clean-up runs in a fixed
@@ -314,3 +348,17 @@ the article's footnote section, and it must precede the merge so the table is a
 single float the cross-table paragraph merge can step over.  Classify pulls
 ``<sup>``-marked footnotes out of the body *before* the merge, so the merge only
 ever sees what classify left behind.  Reorder these at your peril.
+
+After that sequence settles the body, one last pass re-levels heading *depth*.  The
+OCR places every heading in the right reading order but jitters its ``<hN>`` level —
+a subsection emitted as ``<h2>``, a top-level section as ``<h1>``.
+:func:`~pdfparser.pipeline.classify._normalize_heading_levels` corrects depth from
+two high-confidence signals only: a dotted section number sets depth by its dotted
+depth (``2.`` → ``<h2>``, ``2.1.`` → ``<h3>``), and a canonical top-level section
+name (Introduction, Results, References …) anchors to ``<h2>``.  Every other heading
+keeps the OCR's level — the classifier's bias once more: an unrecognised real section
+(a journal-specific name, an unnumbered subsection) is left at its OCR depth rather
+than guessed at and possibly *demoted* out of the outline.  It runs last precisely
+because it needs the body in its final order.  The aggressive half — a casing regime
+and position-based inference — is deliberately deferred, so pure-title-case
+subsection jitter still slips through: a known, bounded limitation.
