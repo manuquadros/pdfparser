@@ -358,8 +358,11 @@ def plos_run(ocr_model: object) -> object:
     mp = pytest.MonkeyPatch()
     mp.setattr(assemble, "_recover_dropped_tables", recover_with_spy)
     # Count actual gate decisions, so the gate test can't be satisfied by a region
-    # that merely failed to localize (which also lowers the batch size).
-    mp.setattr(tables, "_region_fully_captured", gate_with_spy)
+    # that merely failed to localize (which also lowers the batch size).  Patch it in
+    # tables.recover, where _plan_page_tables resolves _region_fully_captured.
+    mp.setattr(
+        "pdfparser.pipeline.tables.recover._region_fully_captured", gate_with_spy
+    )
     _OUTPUT_DIR.mkdir(exist_ok=True)
     try:
         spy.html = lightonocr_pdf_to_html(

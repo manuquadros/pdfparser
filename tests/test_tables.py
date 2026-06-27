@@ -1251,8 +1251,11 @@ class TestRepairLazyExtraction:
                 "pdfparser.pipeline.layers._page_layer",
                 lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
             )
+            # _repair_page_tables resolves _reconstruct_table_from_text_layer in the
+            # rebuild submodule, so patch it there (not the tables package re-export).
             mp.setattr(
-                tables, "_reconstruct_table_from_text_layer", lambda layer, table: None
+                "pdfparser.pipeline.tables.rebuild._reconstruct_table_from_text_layer",
+                lambda layer, table: None,
             )
             tbl = "<table><tr><td>label</td><td>value</td></tr></table>"
             md = tbl + "\n\n" + tbl  # two complete 2-column tables on one page
