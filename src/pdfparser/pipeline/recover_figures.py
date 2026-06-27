@@ -40,6 +40,7 @@ from pdfparser.pipeline.figures import (
     _BBOX_NORM_MAX,
     _is_bare_figure_label,
     _opens_with_panel_label,
+    _safe_ocr_region,
 )
 from pdfparser.pipeline.tables import (
     _Box,
@@ -336,7 +337,9 @@ def _attempt_page_figure(
 ) -> tuple[float, str] | None:
     """Localize, crop and re-OCR figure ``num`` on page ``p``; return its
     ``(caption_top, figure_block)`` or ``None`` if this page yields no figure
-    (a running caption reference localizes none above it)."""
+    (a running caption reference localizes none above it, or the crop re-OCR fails
+    on a transient GPU OOM — recovery is best-effort, so a failed crop declines that
+    figure rather than aborting the document)."""
     page = layers.pdf[p]
     page_size = page.get_size()
     layer = layers.page_layer(p)
@@ -346,7 +349,9 @@ def _attempt_page_figure(
     if located is None:
         return None
     region, cap_top = located
-    crop_md = ocr_region(_scaled_crop(page, region, page_size))
+    crop_md = _safe_ocr_region(ocr_region, _scaled_crop(page, region, page_size))
+    if crop_md is None:
+        return None
     recovered = _extract_recovered_figure(crop_md, num)
     if recovered is None:
         return None

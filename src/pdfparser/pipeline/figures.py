@@ -485,6 +485,30 @@ def _trim_baked_caption(
     return caption_top if caption_top is not None else y1
 
 
+def _safe_ocr_region(
+    ocr_region: Callable[[Image.Image], str], image: Image.Image
+) -> str | None:
+    """Run an injected ``ocr_region`` re-OCR, degrading to ``None`` (logged) on any
+    failure instead of letting it abort the document.
+
+    ``ocr_region`` is an opaque network call to the vLLM server on a small shared
+    GPU, so a transient OOM or connection blip can raise mid-document.  The single-call
+    re-OCR sites that use this — figure-crop recovery — are best-effort refinements of
+    an already-usable result (the figure was already dropped), so one failure should
+    decline that single refinement, not crash the conversion.  The failure type is not
+    nameable here (the callable is injected), so the guard is necessarily broad; it logs
+    with a traceback so a real defect isn't silently masked.
+
+    (The composite baked-caption band trim in :func:`_trim_caption_band` applies the
+    same policy inline, because its fallback is the pixel-only trim rather than ``None``
+    and it issues *several* OCR calls — it can't reduce to this single-call form.)"""
+    try:
+        return ocr_region(image)
+    except Exception:
+        _log.warning("re-OCR of a sub-region failed; declining it", exc_info=True)
+        return None
+
+
 def _trim_caption_band(
     image: Image.Image,
     x0: int,

@@ -1,9 +1,11 @@
 """Tests for figure geometry, crop recovery, and <figure> assembly."""
 
+import logging
 import re
 from pathlib import Path
 
 import numpy as np
+import pytest
 from helpers import (
     _body,
     _fake_image,
@@ -490,6 +492,50 @@ class TestRecoverDroppedFigures:
         cap_box = (320.0, 100.0, 560.0, 110.0)
         lines = [(40.0, 50.0, 280.0, 60.0), (320.0, 50.0, 560.0, 60.0)]
         assert _column_bounds(lines, cap_box, 110.0, 600.0) == (300.0, 600.0)
+
+    def test_attempt_page_figure_declines_on_crop_ocr_failure(self) -> None:
+        from pdfparser.pipeline.recover_figures import _attempt_page_figure
+        from pdfparser.pipeline.tables import _DocumentLayers
+
+        # A transient GPU OOM in the crop re-OCR must decline that figure (return None),
+        # not abort the document. Figure 1's caption localizes deterministically on
+        # page 1 of this fixture (text layer + geometry, no GPU), so the crop is built
+        # and the injected re-OCR is actually reached and raised.
+        reached: list[int] = []
+
+        def boom(_image: Image.Image) -> str:
+            reached.append(1)
+            raise RuntimeError("CUDA out of memory")
+
+        with _DocumentLayers.open(Path("tests/fixtures/30592559.pdf")) as layers:
+            result = _attempt_page_figure(layers, 1, 1, boom, "")
+        assert reached == [1]  # the crop re-OCR was reached (localization succeeded)
+        assert result is None  # …and the failure was caught, not propagated
+
+
+class TestSafeOcrRegion:
+    """The shared best-effort re-OCR guard returns the OCR output on success and
+    degrades to ``None`` (logged) on a transient failure, so one crop OOM declines a
+    single refinement instead of aborting the whole conversion."""
+
+    def test_returns_ocr_output_on_success(self) -> None:
+        from pdfparser.pipeline.figures import _safe_ocr_region
+
+        assert _safe_ocr_region(lambda _i: "markdown", Image.new("RGB", (8, 8))) == (
+            "markdown"
+        )
+
+    def test_returns_none_and_logs_on_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from pdfparser.pipeline.figures import _safe_ocr_region
+
+        def boom(_image: Image.Image) -> str:
+            raise RuntimeError("CUDA out of memory")
+
+        with caplog.at_level(logging.WARNING):
+            assert _safe_ocr_region(boom, Image.new("RGB", (8, 8))) is None
+        assert "re-OCR" in caplog.text
 
 
 class TestTableFigureDedup:

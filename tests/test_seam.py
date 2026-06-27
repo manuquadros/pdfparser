@@ -365,6 +365,36 @@ class TestOcrSeam:
         assert ocr.model == "envmodel"
         ocr.close()
 
+    def test_load_ocr_model_stores_resolved_concurrency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline import model
+        from pdfparser.pipeline.model import load_ocr_model
+
+        # Concurrency is resolved once at load and stored on the model *and* used to
+        # size the httpx pool, so the pool cap and the _ocr_pages worker count can't
+        # desync (a late env change is then ignored by both).
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "6")
+        captured: dict[str, httpx.Limits] = {}
+        real_client = httpx.Client
+
+        def fake_client(**kwargs: object) -> httpx.Client:
+            captured["limits"] = kwargs["limits"]  # type: ignore[assignment]
+            return real_client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={"data": []})
+                ),
+                **kwargs,
+            )
+
+        monkeypatch.setattr(model.httpx, "Client", fake_client)
+        ocr = load_ocr_model(base_url="http://srv/v1", model="m")
+        assert ocr.concurrency == 6
+        assert captured["limits"].max_connections == 6
+        ocr.close()
+
     def test_load_ocr_model_closes_client_when_probe_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -446,6 +476,64 @@ class TestOcrTransientRetry:
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
         assert _ocr_page(_fake_image(8, 8), ocr) == "ok"
         assert len(calls) == 2
+
+    def test_remote_protocol_error_then_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        self._no_sleep(monkeypatch)
+        calls: list[int] = []
+
+        # A peer disconnect mid-response (RemoteProtocolError) is the canonical
+        # transient on a busy shared vLLM; it is a *sibling* of NetworkError under
+        # TransportError, not a subclass, so it must be retried explicitly rather than
+        # fall through to the re-raise.
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                raise httpx.RemoteProtocolError(
+                    "server disconnected without sending a complete response"
+                )
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "ok"
+        assert len(calls) == 2
+
+    def test_backoff_has_jitter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        from pdfparser.pipeline import model
+        from pdfparser.pipeline.model import _RETRY_BACKOFF_BASE_S, OcrModel, _ocr_page
+
+        delays = self._record_sleeps(monkeypatch)
+        # Pin the jitter term so the exact sleep is assertable; the point under test is
+        # that it is *added* to the deterministic exponential backoff, so several pages
+        # retrying in lockstep don't stampede the just-overloaded server in sync.
+        monkeypatch.setattr(model.random, "uniform", lambda _a, _b: 0.123)
+        calls: list[int] = []
+
+        # A 503 with no Retry-After header takes the backoff branch (not the honored
+        # Retry-After path, which stays jitter-free).
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(503, json={"error": "overloaded"})
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        assert _ocr_page(_fake_image(8, 8), ocr) == "ok"
+        # attempt-0 backoff (base * 2**0) plus the pinned jitter term
+        assert delays == [_RETRY_BACKOFF_BASE_S + 0.123]
 
     def test_retries_exhausted_reraises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
@@ -575,6 +663,44 @@ class TestOcrConcurrencyResolution:
         # a misconfigured deployment is surfaced, not silently defaulted
         with pytest.warns(UserWarning, match="not an integer"):
             assert _resolve_ocr_concurrency() == _DEFAULT_OCR_CONCURRENCY
+
+    def test_ocr_pages_uses_model_concurrency_not_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        import httpx
+
+        from pdfparser.pipeline import model
+        from pdfparser.pipeline.model import OcrModel, _ocr_pages
+
+        # Env raised *after* load must not change the worker count: it is taken from the
+        # value resolved at load time (OcrModel.concurrency), which also sized the httpx
+        # pool — so a late env change can't desync the workers from the pool cap.
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "9")
+        captured: list[int] = []
+        real_pool = model.ThreadPoolExecutor
+
+        def spy_pool(max_workers: int) -> ThreadPoolExecutor:
+            captured.append(max_workers)
+            return real_pool(max_workers=max_workers)
+
+        monkeypatch.setattr(model, "ThreadPoolExecutor", spy_pool)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(
+            client=client, base_url="http://srv/v1", model="m", concurrency=3
+        )
+        images = [_fake_image(8, 8) for _ in range(5)]
+        assert _ocr_pages(images, ocr) == ["ok"] * 5
+        # worker count is ocr.concurrency (3), floored by the image count — not the
+        # post-load env value (9)
+        assert captured == [3]
 
 
 class TestCli:
@@ -844,12 +970,11 @@ class TestServerContextWindow:
         assert _ocr_page(_fake_image(8, 8), ocr) == full
         assert calls[1] == 4096 - 1000 - _CONTEXT_SAFETY_MARGIN
 
-    def test_client_limits_track_concurrency(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_client_limits_track_concurrency(self) -> None:
         from pdfparser.pipeline.model import _client_limits
 
-        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "9")
-        limits = _client_limits()
+        # the pool is sized to exactly the resolved worker count, both caps (the
+        # env→worker-count resolution is exercised end-to-end by the load test below)
+        limits = _client_limits(9)
         assert limits.max_connections == 9
         assert limits.max_keepalive_connections == 9

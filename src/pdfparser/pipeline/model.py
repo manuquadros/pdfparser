@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import random
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -69,12 +70,18 @@ class OcrModel:
     ``load_ocr_model`` time from the ``/models`` response (or the env override), so
     the truncation-retry budget in ``_ocr_page`` is correct for the actual server
     without a per-page ``os.environ`` re-read.
+
+    ``concurrency`` is the resolved ``PDFPARSER_OCR_CONCURRENCY``, likewise read once
+    at load time — it sizes *both* the httpx pool (``_client_limits``) and the
+    ``_ocr_pages`` worker count, so reading it once here keeps the two in lock-step
+    (a re-read at call time could desync the workers from the pool cap).
     """
 
     client: httpx.Client
     base_url: str
     model: str
     context_len: int = _DEFAULT_MODEL_CONTEXT_LEN
+    concurrency: int = _DEFAULT_OCR_CONCURRENCY
 
     def close(self) -> None:
         self.client.close()
@@ -94,12 +101,13 @@ def _resolve_base_url(base_url: str | None) -> str:
     )
 
 
-def _client_limits() -> httpx.Limits:
+def _client_limits(workers: int) -> httpx.Limits:
     """Size the connection pool to the resolved OCR concurrency so a raised
     ``PDFPARSER_OCR_CONCURRENCY`` isn't capped below the worker count by httpx's
     default ``max_connections`` — the page pass issues that many POSTs at once over
-    the single shared client."""
-    workers = _resolve_ocr_concurrency()
+    the single shared client.  ``workers`` is resolved once in ``load_ocr_model`` and
+    stored on ``OcrModel.concurrency`` so the pool cap and the worker count can't
+    drift apart."""
     return httpx.Limits(max_connections=workers, max_keepalive_connections=workers)
 
 
@@ -123,7 +131,8 @@ def load_ocr_model(
     """
     base_url = _resolve_base_url(base_url)
     model = model or os.environ.get("PDFPARSER_VLLM_MODEL", _DEFAULT_MODEL)
-    client = httpx.Client(timeout=timeout, limits=_client_limits())
+    concurrency = _resolve_ocr_concurrency()
+    client = httpx.Client(timeout=timeout, limits=_client_limits(concurrency))
     try:
         response = client.get(f"{base_url}/models", timeout=_HEALTH_TIMEOUT_S)
         response.raise_for_status()
@@ -139,7 +148,11 @@ def load_ocr_model(
         payload = None
     context_len = _resolve_context_len(_parse_server_context_len(payload))
     return OcrModel(
-        client=client, base_url=base_url, model=model, context_len=context_len
+        client=client,
+        base_url=base_url,
+        model=model,
+        context_len=context_len,
+        concurrency=concurrency,
     )
 
 
@@ -193,14 +206,20 @@ def _is_retryable_ocr_error(exc: httpx.HTTPError) -> bool:
     """Whether a failed page POST is worth re-issuing.
 
     Retryable: a connection-level blip (``httpx.NetworkError`` — connect refused/reset,
-    a dropped read) or a vLLM overload/gateway status (``_RETRYABLE_STATUS``).  A
-    *timeout* (``httpx.TimeoutException``: read/connect/pool) is excluded on purpose —
-    it already spent the full per-request budget, so retrying re-spends it, and
-    ``_ocr_pages`` relies on a wedged page failing *without* retry so the pool tears
-    down promptly rather than after ~3× the timeout.  A 4xx (caller bug) is excluded
-    too — it re-fails identically.
+    a dropped read), a peer disconnect mid-response (``httpx.RemoteProtocolError``:
+    "server disconnected without sending a complete response" — the canonical transient
+    on a busy shared vLLM, and a *sibling* of ``NetworkError`` under ``TransportError``,
+    not a subclass, so it must be named explicitly or it falls through), or a vLLM
+    overload/gateway status (``_RETRYABLE_STATUS``).  All are idempotent under greedy
+    decode — the page reproduces.  A *timeout* (``httpx.TimeoutException``:
+    read/connect/pool) is excluded on purpose — it already spent the full per-request
+    budget, so retrying re-spends it, and ``_ocr_pages`` relies on a wedged page
+    failing *without* retry so the pool tears down promptly rather than after ~3× the
+    timeout.  A 4xx (caller bug) is excluded too — it re-fails identically — as is a
+    *client*-side ``LocalProtocolError``: that exclusion is why the check names
+    ``RemoteProtocolError`` explicitly, not the shared ``ProtocolError`` base.
     """
-    if isinstance(exc, httpx.NetworkError):
+    if isinstance(exc, (httpx.NetworkError, httpx.RemoteProtocolError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in _RETRYABLE_STATUS
@@ -210,7 +229,12 @@ def _is_retryable_ocr_error(exc: httpx.HTTPError) -> bool:
 def _retry_delay(exc: httpx.HTTPError, attempt: int) -> float:
     """Seconds to wait before the next attempt: honor a server-sent ``Retry-After`` on
     an overload status (so the client doesn't pile load back onto a busy server),
-    capped by ``_MAX_RETRY_AFTER_S``; otherwise exponential backoff."""
+    capped by ``_MAX_RETRY_AFTER_S``; otherwise exponential backoff with jitter.
+
+    The jitter matters under concurrency: without it, several pages that hit the same
+    503/connection blip in lockstep sleep the *identical* backoff and stampede back
+    onto the just-overloaded server together — the very thing the backoff exists to
+    prevent.  A small random offset decorrelates their retries."""
     if isinstance(exc, httpx.HTTPStatusError):
         raw = exc.response.headers.get("Retry-After")
         if raw is not None:
@@ -218,7 +242,9 @@ def _retry_delay(exc: httpx.HTTPError, attempt: int) -> float:
                 return min(max(0.0, float(raw)), _MAX_RETRY_AFTER_S)
             except ValueError:
                 pass  # HTTP-date form (rare from vLLM) → fall back to backoff
-    return _RETRY_BACKOFF_BASE_S * (2.0**attempt)
+    return _RETRY_BACKOFF_BASE_S * (2.0**attempt) + random.uniform(
+        0, _RETRY_BACKOFF_BASE_S
+    )
 
 
 def _request_ocr(encoded: str, ocr: OcrModel, max_new_tokens: int) -> httpx.Response:
@@ -337,11 +363,12 @@ def _ocr_pages(
     """OCR page images via the vLLM server, returning their markdown in page order.
 
     Requests are issued with up to ``concurrency`` in flight at once (``None`` ->
-    ``PDFPARSER_OCR_CONCURRENCY``/``_DEFAULT_OCR_CONCURRENCY``; an explicit value is
-    floored at 1, so ``concurrency=0`` means serial, not "use the default") over the
-    shared, thread-safe ``httpx.Client``.  Per-page OCR is independent, so results
-    are gathered back in input order and the page↔image alignment the pipeline
-    depends on is preserved.
+    ``ocr.concurrency``, the value resolved once at ``load_ocr_model`` time and used to
+    size the httpx pool — so the worker count and the pool cap stay in lock-step; an
+    explicit value is floored at 1, so ``concurrency=0`` means serial, not "use the
+    default") over the shared, thread-safe ``httpx.Client``.  Per-page OCR is
+    independent, so results are gathered back in input order and the page↔image
+    alignment the pipeline depends on is preserved.
 
     On a per-page error, the first failing page's exception propagates and the pool
     is torn down without waiting on still-running siblings (queued requests are
@@ -356,7 +383,7 @@ def _ocr_pages(
     """
     if not images:
         return []
-    limit = _resolve_ocr_concurrency() if concurrency is None else max(1, concurrency)
+    limit = ocr.concurrency if concurrency is None else max(1, concurrency)
     pool = ThreadPoolExecutor(max_workers=min(limit, len(images)))
     try:
         futures = [pool.submit(_ocr_page, img, ocr, max_new_tokens) for img in images]
