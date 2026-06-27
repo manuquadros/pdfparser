@@ -125,6 +125,23 @@ class TestLatexToHtml:
         assert _latex_to_html(r"$\S$") == "§"
         assert _latex_to_html(r"$^{1,\S}$") == "<sup>1,§</sup>"
 
+    def test_literal_section_sign_label_recovered_at_block_start(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # The model sometimes emits the *resolved* section sign ("§4 Fig.") rather than
+        # the "\S" command; a "§<digit>" at a line/block start (the label position) is
+        # the same misread S and is recovered, including a bold-wrapped label.
+        assert _latex_to_html("§4 Fig. The structure.") == "S4 Fig. The structure."
+        assert _latex_to_html("§1 Raw images.") == "S1 Raw images."
+        assert _latex_to_html("**§1 Raw images.**") == "**S1 Raw images.**"
+
+    def test_genuine_midsentence_section_sign_preserved(self) -> None:
+        from pdfparser.pipeline.latex import _latex_to_html
+
+        # A genuine section reference mid-sentence is not at a block start, so it is
+        # left intact — the label rule must not rewrite "§3" into "S3" here.
+        assert _latex_to_html("as described in §3 above") == "as described in §3 above"
+
     def test_arg_macro_that_raises_does_not_crash(self) -> None:
         from pdfparser.pipeline.latex import _latex_to_html
 

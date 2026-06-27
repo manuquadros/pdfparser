@@ -450,6 +450,17 @@ class TestPlosSidebarMetadata:
         body = _body(plos_html)
         assert "lichen-associated <em>Sphingomonas</em> sp.</p>" not in body
 
+    def test_supporting_info_labels_render_s_not_section_sign(
+        self, plos_html: str
+    ) -> None:
+        # The Supporting Information labels ("S1 Fig.", "S4 Fig.", "S1 Raw images.")
+        # carry a leading "S"; the model sometimes misreads it as the section sign,
+        # emitting "§4 Fig." either as "\S4" (math) or the literal "§4".  Whichever
+        # shape, no supplementary label may render as a section sign before a digit.
+        assert "Supporting information" in plos_html
+        assert re.search(r"S\d+\w*\s+(?:Fig|Raw images)", plos_html)
+        assert not re.search(r"§\s?\d", plos_html)
+
     def test_growth_paragraph_merged_across_interleaved_figure(
         self, plos_html: str
     ) -> None:

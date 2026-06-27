@@ -77,6 +77,12 @@ _LATEX_COMMAND_RE = re.compile(r"\\[a-zA-Z]+")
 # the span.  A standalone "\S" (a real footnote/section marker) still converts to "§".
 _LATEX_S_LABEL_SPAN_RE = re.compile(r"(?<!\\)\$\\S ?(\d[\w.]*)\$")
 _LATEX_S_LABEL_RE = re.compile(r"\\S ?(?=\d)")
+# The same misread, but the model emitted the *resolved* section sign character ("§4
+# Fig.") rather than the "\S" command.  Scoped to a line/block start (the label
+# position) + optional leading bold markers, so a genuine mid-sentence "§3" reference
+# is left intact while a supplementary label "§4 Fig." / "**§1 Raw images.**" is
+# recovered to "S4"/"S1".
+_LITERAL_S_LABEL_RE = re.compile(r"(?m)^(\*{0,2})§ ?(?=\d)")
 _L2T = LatexNodes2Text()
 # pylatexenc returns "" for a few common symbol macros (version-dependent), which
 # would leak the raw "\ddagger"/"\S" into author/affiliation footnote markers.
@@ -307,6 +313,10 @@ def _latex_to_html(text: str) -> str:
         return space + html
 
     # Unwrap a supplementary-label span ("$\S4$" → "S4") before the generic span pass,
-    # so the identifier stays plain rather than being math-variable italicised.
+    # so the identifier stays plain rather than being math-variable italicised; and the
+    # literal-section-sign form of the same misread ("§4 Fig." → "S4 Fig.").  Both run
+    # here, before span processing, so they only see an OCR-literal "§" — never one the
+    # span pass itself produces from a standalone "\S" footnote marker.
     text = _LATEX_S_LABEL_SPAN_RE.sub(r"S\1", text)
+    text = _LITERAL_S_LABEL_RE.sub(r"\1S", text)
     return _LATEX_SPAN_RE.sub(replace, text)
