@@ -10,7 +10,10 @@ import argparse
 import sys
 from pathlib import Path
 
+import httpx
+
 from pdfparser.pipeline import lightonocr_pdf_to_html
+from pdfparser.pipeline.model import _resolve_base_url
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,12 +54,24 @@ def main(argv: list[str] | None = None) -> int:
 
     output = args.output or args.pdf.with_suffix(".html")
 
-    html = lightonocr_pdf_to_html(
-        args.pdf,
-        base_url=args.vllm_url,
-        model=args.vllm_model,
-        image_dir=args.image_dir,
-    )
+    try:
+        html = lightonocr_pdf_to_html(
+            args.pdf,
+            base_url=args.vllm_url,
+            model=args.vllm_model,
+            image_dir=args.image_dir,
+        )
+    except httpx.HTTPError as exc:
+        # load_ocr_model raises this when the server is down — the likeliest failure
+        # a human hits.  Surface it as a one-line message, not a raw traceback.
+        url = _resolve_base_url(args.vllm_url)
+        print(
+            f"error: could not reach the vLLM server at {url} ({exc}). "
+            "Is it running? See deploy/vllm/run-server.sh.",
+            file=sys.stderr,
+        )
+        return 1
+
     output.write_text(html, encoding="utf-8")
     print(f"Wrote {output}")
     return 0

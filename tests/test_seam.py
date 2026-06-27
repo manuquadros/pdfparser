@@ -661,3 +661,195 @@ class TestCli:
             cli.main([str(tmp_path / "absent.pdf")])
         assert exc.value.code == 2
         assert not called
+
+    def test_unreachable_server_prints_message_returns_1(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import httpx
+
+        import pdfparser.__main__ as cli
+
+        pdf = self._make_pdf(tmp_path)
+
+        def boom(*a: object, **k: object) -> str:
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(cli, "lightonocr_pdf_to_html", boom)
+        # An unreachable server must yield a concise stderr message naming the resolved
+        # base URL and a non-zero exit, not a raw traceback or a written output file.
+        rc = cli.main([str(pdf), "--vllm-url", "http://down:9/v1"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "http://down:9/v1" in err
+        assert "connection refused" in err
+        assert not (tmp_path / "paper.html").exists()
+
+
+class TestServerContextWindow:
+    """The server's ``max_model_len`` (the truncation-retry budget) is resolved once
+    at load time from ``/models``, with the env var as override — not re-read from
+    ``os.environ`` per page."""
+
+    def test_parse_server_context_len_extracts_max_model_len(self) -> None:
+        from pdfparser.pipeline.model import _parse_server_context_len
+
+        payload = {"object": "list", "data": [{"id": "m", "max_model_len": 16384}]}
+        assert _parse_server_context_len(payload) == 16384
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            {},
+            {"data": []},
+            {"data": "nope"},
+            {"data": [{"id": "m"}]},  # no max_model_len (older server)
+            {"data": [{"id": "m", "max_model_len": 0}]},  # non-positive
+            {"data": [{"id": "m", "max_model_len": "8192"}]},  # wrong type
+        ],
+    )
+    def test_parse_server_context_len_none_on_missing_or_bad_shape(
+        self, payload: object
+    ) -> None:
+        from pdfparser.pipeline.model import _parse_server_context_len
+
+        assert _parse_server_context_len(payload) is None
+
+    def test_resolve_prefers_reported_over_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import _resolve_context_len
+
+        monkeypatch.delenv("PDFPARSER_VLLM_MAX_MODEL_LEN", raising=False)
+        assert _resolve_context_len(16384) == 16384
+
+    def test_resolve_falls_back_to_default_when_unreported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_MODEL_CONTEXT_LEN,
+            _resolve_context_len,
+        )
+
+        monkeypatch.delenv("PDFPARSER_VLLM_MAX_MODEL_LEN", raising=False)
+        assert _resolve_context_len(None) == _DEFAULT_MODEL_CONTEXT_LEN
+
+    def test_env_override_beats_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline.model import _resolve_context_len
+
+        monkeypatch.setenv("PDFPARSER_VLLM_MAX_MODEL_LEN", "5000")
+        assert _resolve_context_len(16384) == 5000
+
+    def test_bad_env_override_warns_and_falls_back_to_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import _resolve_context_len
+
+        monkeypatch.setenv("PDFPARSER_VLLM_MAX_MODEL_LEN", "lots")
+        with pytest.warns(UserWarning):
+            assert _resolve_context_len(16384) == 16384
+
+    def test_load_ocr_model_stores_reported_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        monkeypatch.delenv("PDFPARSER_VLLM_MAX_MODEL_LEN", raising=False)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [{"max_model_len": 16384}]})
+
+        TestOcrSeam._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1")
+        assert ocr.context_len == 16384
+        ocr.close()
+
+    def test_load_ocr_model_env_override_beats_reported_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        monkeypatch.setenv("PDFPARSER_VLLM_MAX_MODEL_LEN", "4096")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [{"max_model_len": 16384}]})
+
+        TestOcrSeam._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1")
+        assert ocr.context_len == 4096
+        ocr.close()
+
+    def test_load_ocr_model_defaults_window_when_unreported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import (
+            _DEFAULT_MODEL_CONTEXT_LEN,
+            load_ocr_model,
+        )
+
+        monkeypatch.delenv("PDFPARSER_VLLM_MAX_MODEL_LEN", raising=False)
+
+        # A bare-200 probe (no JSON body) must not crash resolution.
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        TestOcrSeam._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1")
+        assert ocr.context_len == _DEFAULT_MODEL_CONTEXT_LEN
+        ocr.close()
+
+    def test_ocr_page_retry_budget_uses_stored_window(self) -> None:
+        import json
+
+        import httpx
+
+        from pdfparser.pipeline.model import _CONTEXT_SAFETY_MARGIN, OcrModel, _ocr_page
+
+        # The truncation retry must size its max_tokens off the bundle's context_len,
+        # not a hardcoded/env-read default — proving the per-page os.environ re-read is
+        # gone and a non-default server window is honored.
+        calls: list[int] = []
+        truncated = "<table>cut"
+        full = truncated + " and the rest</table>"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            calls.append(body["max_tokens"])
+            content, reason = (
+                (truncated, "length") if len(calls) == 1 else (full, "stop")
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": content}, "finish_reason": reason}
+                    ],
+                    "usage": {"prompt_tokens": 1000},
+                },
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(
+            client=client, base_url="http://srv/v1", model="m", context_len=4096
+        )
+        assert _ocr_page(_fake_image(8, 8), ocr) == full
+        assert calls[1] == 4096 - 1000 - _CONTEXT_SAFETY_MARGIN
+
+    def test_client_limits_track_concurrency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import _client_limits
+
+        monkeypatch.setenv("PDFPARSER_OCR_CONCURRENCY", "9")
+        limits = _client_limits()
+        assert limits.max_connections == 9
+        assert limits.max_keepalive_connections == 9

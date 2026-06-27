@@ -23,12 +23,12 @@ from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 _DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 _DEFAULT_MODEL = "lightonocr"
 _OCR_MAX_NEW_TOKENS = 2048
-# The server's context window — input (page-image) tokens plus generated tokens.
-# Must match the vLLM ``--max-model-len`` (see ``deploy/vllm/``); override for a
-# server started with a different window.  Used to size the retry budget when a
-# page's generation truncates: a dense page (a large table plus prose) can exceed
-# ``_OCR_MAX_NEW_TOKENS`` and get cut off mid-output, silently dropping the rest of
-# the table and everything after it.
+# Fallback context window — input (page-image) tokens plus generated tokens — used
+# only when the server's ``/models`` response omits ``max_model_len`` *and* the
+# ``PDFPARSER_VLLM_MAX_MODEL_LEN`` override is unset (see ``_resolve_context_len``).
+# It sizes the retry budget when a page's generation truncates: a dense page (a large
+# table plus prose) can exceed ``_OCR_MAX_NEW_TOKENS`` and get cut off mid-output,
+# silently dropping the rest of the table and everything after it.
 _DEFAULT_MODEL_CONTEXT_LEN = 8192
 # Leave a little of the window unclaimed so the retry's ``max_tokens`` can't tip
 # prompt+output past the server limit (vLLM rejects such a request outright).
@@ -64,11 +64,17 @@ class OcrModel:
     Holds an ``httpx.Client`` (a connection pool), so close it when done — or use
     it as a context manager.  ``lightonocr_pdf_to_html`` closes the bundle it
     creates internally; a caller that passes its own ``ocr`` owns its lifecycle.
+
+    ``context_len`` is the server's token window (input + output), resolved once at
+    ``load_ocr_model`` time from the ``/models`` response (or the env override), so
+    the truncation-retry budget in ``_ocr_page`` is correct for the actual server
+    without a per-page ``os.environ`` re-read.
     """
 
     client: httpx.Client
     base_url: str
     model: str
+    context_len: int = _DEFAULT_MODEL_CONTEXT_LEN
 
     def close(self) -> None:
         self.client.close()
@@ -78,6 +84,23 @@ class OcrModel:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def _resolve_base_url(base_url: str | None) -> str:
+    """The vLLM endpoint root: the explicit arg, else ``PDFPARSER_VLLM_URL``, else the
+    built-in default; trailing slash stripped so ``f"{base_url}/…"`` stays clean."""
+    return (base_url or os.environ.get("PDFPARSER_VLLM_URL", _DEFAULT_BASE_URL)).rstrip(
+        "/"
+    )
+
+
+def _client_limits() -> httpx.Limits:
+    """Size the connection pool to the resolved OCR concurrency so a raised
+    ``PDFPARSER_OCR_CONCURRENCY`` isn't capped below the worker count by httpx's
+    default ``max_connections`` — the page pass issues that many POSTs at once over
+    the single shared client."""
+    workers = _resolve_ocr_concurrency()
+    return httpx.Limits(max_connections=workers, max_keepalive_connections=workers)
 
 
 def load_ocr_model(
@@ -98,17 +121,26 @@ def load_ocr_model(
         httpx.HTTPError: If the server is unreachable or unhealthy.  Callers that
             want to degrade gracefully (e.g. the integration fixture) catch this.
     """
-    base_url = (
-        base_url or os.environ.get("PDFPARSER_VLLM_URL", _DEFAULT_BASE_URL)
-    ).rstrip("/")
+    base_url = _resolve_base_url(base_url)
     model = model or os.environ.get("PDFPARSER_VLLM_MODEL", _DEFAULT_MODEL)
-    client = httpx.Client(timeout=timeout)
+    client = httpx.Client(timeout=timeout, limits=_client_limits())
     try:
-        client.get(f"{base_url}/models", timeout=_HEALTH_TIMEOUT_S).raise_for_status()
+        response = client.get(f"{base_url}/models", timeout=_HEALTH_TIMEOUT_S)
+        response.raise_for_status()
     except httpx.HTTPError:
         client.close()  # don't leak the pool when the probe fails
         raise
-    return OcrModel(client=client, base_url=base_url, model=model)
+    # The probe doubles as the context-window query (vLLM reports max_model_len in
+    # /models), so the truncation-retry budget matches the live server with no extra
+    # round trip.  A non-JSON body (a bare-200 mock / non-vLLM endpoint) falls back.
+    try:
+        payload: object = response.json()
+    except ValueError:
+        payload = None
+    context_len = _resolve_context_len(_parse_server_context_len(payload))
+    return OcrModel(
+        client=client, base_url=base_url, model=model, context_len=context_len
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -127,8 +159,34 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _model_context_len() -> int:
-    return _env_int("PDFPARSER_VLLM_MAX_MODEL_LEN", _DEFAULT_MODEL_CONTEXT_LEN)
+def _parse_server_context_len(payload: object) -> int | None:
+    """Extract ``max_model_len`` from a vLLM ``/models`` response body, or ``None`` if
+    the shape doesn't carry it (an older server, or a non-vLLM OpenAI-compatible
+    endpoint) so the caller falls back to the env override / default.  vLLM reports it
+    per served model under ``data[0]``."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not isinstance(first, dict):
+        return None
+    value = first.get("max_model_len")
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _resolve_context_len(reported: int | None) -> int:
+    """The server context window (the truncation-retry token budget): the
+    ``PDFPARSER_VLLM_MAX_MODEL_LEN`` override wins, else the value the server reported
+    via ``/models`` (``reported``), else the built-in default.  The override lets a
+    deployment whose server can't report ``max_model_len`` still tune the budget."""
+    if os.environ.get("PDFPARSER_VLLM_MAX_MODEL_LEN") is not None:
+        return _env_int(
+            "PDFPARSER_VLLM_MAX_MODEL_LEN",
+            reported if reported is not None else _DEFAULT_MODEL_CONTEXT_LEN,
+        )
+    return reported if reported is not None else _DEFAULT_MODEL_CONTEXT_LEN
 
 
 def _is_retryable_ocr_error(exc: httpx.HTTPError) -> bool:
@@ -256,7 +314,7 @@ def _ocr_page(
     content, finish_reason, prompt_tokens = _post_ocr_page(encoded, ocr, max_new_tokens)
     if finish_reason != "length" or prompt_tokens is None:
         return content
-    retry_budget = _model_context_len() - prompt_tokens - _CONTEXT_SAFETY_MARGIN
+    retry_budget = ocr.context_len - prompt_tokens - _CONTEXT_SAFETY_MARGIN
     if retry_budget <= max_new_tokens:
         return content
     retried, _, _ = _post_ocr_page(encoded, ocr, retry_budget)
