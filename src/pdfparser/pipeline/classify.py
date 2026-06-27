@@ -85,7 +85,10 @@ _SECTION_NUMBER_RE = re.compile(r"^\d+(?:[.)]\d*)*[.)]?\s+")
 # A plain <p> is positively front matter when it carries a metadata label
 # ("Keywords:", reuses _BOLD_LABEL_RE), opens with an affiliation/footnote
 # superscript marker, or is a submission/correspondence/copyright line.
-_LEADING_SUP_RE = re.compile(r"^[¹²³⁰-ⁿ*†‡§]")
+# Superscript-digit class is the canonical [¹²³⁰⁴-⁹] (¹²³ are Latin-1, ⁰⁴-⁹ are
+# U+2070/2074-2079) + footnote symbols — NOT [⁰-ⁿ], which spills past the digits
+# into ⁱⁿ⁺⁻⁼⁽⁾ and unassigned codepoints (see the digit-class gotcha in CLAUDE.md).
+_LEADING_SUP_RE = re.compile(r"^[¹²³⁰⁴-⁹*†‡§]")
 _FRONTMATTER_TEXT_RE = re.compile(
     r"^(?:received|accepted|published|revised|doi|https?://|©|copyright|e-?mail|"
     r"(?:address\s+for\s+)?correspond(?:ence|ing\s+author))\b",
@@ -530,8 +533,9 @@ _MAX_REPEAT_SHARE = 0.6
 _TOKEN_RE = re.compile(r"\w+")
 
 # Affiliation / corresponding-author markers that accompany author names:
-# superscript digits (¹²³, ⁰⁴–⁹), a <sup>, or footnote symbols.
-_AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰-ⁿ*†‡§]")
+# superscript digits (¹²³, ⁰⁴–⁹), a <sup>, or footnote symbols.  The digit class is
+# the canonical [¹²³⁰⁴-⁹], not [⁰-ⁿ] (which over-matches ⁱⁿ⁺⁻⁼⁽⁾ — see CLAUDE.md).
+_AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰⁴-⁹*†‡§]")
 # A comma / "and" / ";"-separated author segment: a short, capitalized,
 # digit-free name.
 _NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")
@@ -911,25 +915,31 @@ def _classify_parts(parts: list[str]) -> _Meta:
     )
 
 
+def _heading_title(part: str) -> str | None:
+    """A heading's section-number-stripped, case-folded title for label-membership
+    tests, or ``None`` when the block isn't a heading.  Shared by the metadata-heading
+    predicates so each tests the same normalized title against its own label set."""
+    heading = _heading_inner(part)
+    if heading is None:
+        return None
+    return _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+
+
 def _is_metadata_heading(part: str) -> bool:
     """A heading that is itself front matter ("Abbreviations", "Keywords") or a
     document-type label, as opposed to the heading that opens the body proper."""
-    heading = _heading_inner(part)
-    if heading is None:
-        return False
-    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
-    return title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
+    title = _heading_title(part)
+    return title is not None and (
+        title in _FRONTMATTER_HEADING_LABELS or title in _DOCUMENT_TYPE_LABELS
+    )
 
 
 def _is_named_metadata_heading(part: str) -> bool:
     """A heading naming a front-matter section ("Abbreviations", "Nomenclature",
     "Keywords") — the subset of metadata headings that can be located by name,
     excluding the document-type labels."""
-    heading = _heading_inner(part)
-    if heading is None:
-        return False
-    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
-    return title in _FRONTMATTER_HEADING_LABELS
+    title = _heading_title(part)
+    return title is not None and title in _FRONTMATTER_HEADING_LABELS
 
 
 def _is_publication_metadata_heading(part: str) -> bool:
@@ -937,11 +947,8 @@ def _is_publication_metadata_heading(part: str) -> bool:
     "Received" …).  LightOnOCR renders the PLOS-style first-page metadata sidebar
     as a run of such label headings, each followed by its value paragraph(s),
     rather than the bold ``**Label:**`` lines other journals' OCR produces."""
-    heading = _heading_inner(part)
-    if heading is None:
-        return False
-    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
-    return title in _PUBLICATION_METADATA_LABELS
+    title = _heading_title(part)
+    return title is not None and title in _PUBLICATION_METADATA_LABELS
 
 
 def _is_publication_value_heading(part: str) -> bool:
@@ -949,12 +956,10 @@ def _is_publication_value_heading(part: str) -> bool:
     "Editor", …), as opposed to a bare banner ("OPEN ACCESS").  Only such a heading
     owns the paragraph directly beneath it; a banner does not (see
     ``_PUBLICATION_BANNER_LABELS``)."""
-    heading = _heading_inner(part)
-    if heading is None:
-        return False
-    title = _SECTION_NUMBER_RE.sub("", _visible_text_folded(heading[1]))
+    title = _heading_title(part)
     return (
-        title in _PUBLICATION_METADATA_LABELS
+        title is not None
+        and title in _PUBLICATION_METADATA_LABELS
         and title not in _PUBLICATION_BANNER_LABELS
     )
 

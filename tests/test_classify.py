@@ -1522,3 +1522,36 @@ class TestDegenerateInputs:
         from pdfparser.pipeline.markdown import _md_to_html_blocks
 
         assert _md_to_html_blocks("<table><tr><td>x") == ["<table><tr><td>x"]
+
+
+class TestSuperscriptMarkerCharClass:
+    """The leading/author superscript-marker char-classes are the canonical
+    [¹²³⁰⁴-⁹] (superscript digits) plus footnote symbols — NOT [⁰-ⁿ], which over-
+    matches the non-digit superscripts ⁱⁿ⁺⁻⁼⁽⁾ (the CLAUDE.md digit-class gotcha)."""
+
+    def test_leading_sup_matches_real_markers(self) -> None:
+        from pdfparser.pipeline.classify import _LEADING_SUP_RE
+
+        # a superscript-digit affiliation marker and a footnote symbol
+        assert _LEADING_SUP_RE.match("¹ Department of Chemistry")
+        assert _LEADING_SUP_RE.match("⁵ Second affiliation")
+        assert _LEADING_SUP_RE.match("*Corresponding author")
+        assert _LEADING_SUP_RE.match("† Equal contribution")
+
+    def test_leading_sup_rejects_non_digit_superscripts(self) -> None:
+        from pdfparser.pipeline.classify import _LEADING_SUP_RE
+
+        # ⁿ (U+207F), ⁺ (U+207A) and ⁻ (U+207B) are not affiliation markers; the old
+        # [⁰-ⁿ] range matched them, the canonical [⁰⁴-⁹] does not
+        assert _LEADING_SUP_RE.match("ⁿ-hexane as solvent") is None
+        assert _LEADING_SUP_RE.match("⁺ charged residue") is None
+        assert _LEADING_SUP_RE.match("⁻ control lane") is None
+
+    def test_author_marker_ignores_superscript_exponent(self) -> None:
+        from pdfparser.pipeline.classify import _AUTHOR_MARKER_RE
+
+        # a real author marker (digit or <sup>) is found…
+        assert _AUTHOR_MARKER_RE.search("Jane Smith¹")
+        assert _AUTHOR_MARKER_RE.search("Jane Smith<sup>a</sup>")
+        # …but a superscript "ⁿ" exponent in a math expression is not a marker
+        assert _AUTHOR_MARKER_RE.search("the xⁿ term") is None
