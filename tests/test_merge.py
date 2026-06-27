@@ -578,3 +578,71 @@ class TestDehyphenateJoin:
         assert _dehyphenate_join("normal word", "continues here") == (
             "normal word continues here"
         )
+
+
+class TestMergePredicates:
+    """The named guards extracted out of ``_merge_split_paragraphs`` keep their
+    individual contracts (the full-function behaviour is covered above; these pin
+    each predicate so a future edit to one can't silently invert it)."""
+
+    def test_open_fragment_true_for_unterminated_prose(self) -> None:
+        from pdfparser.pipeline.merge import _is_open_fragment
+
+        inner = "This suggests that TRI and"
+        assert _is_open_fragment(f"<p>{inner}</p>", inner, inner, inner) is True
+
+    def test_open_fragment_false_for_terminated_and_for_caption_label(self) -> None:
+        from pdfparser.pipeline.merge import _is_open_fragment
+
+        done = "A complete sentence."
+        assert _is_open_fragment(f"<p>{done}</p>", done, done, done) is False
+        # a caption label is self-contained even without terminal punctuation
+        cap = "Figure 1"
+        assert _is_open_fragment(f"<p>{cap}</p>", cap, cap, cap) is False
+
+    def test_valid_continuation_true_for_lowercase_prose(self) -> None:
+        from pdfparser.pipeline.merge import _is_valid_continuation
+
+        cont = "TRII compete for the same substrate."
+        result = _is_valid_continuation(cont, cont, "suggests that TRI and", False)
+        assert result is True
+
+    def test_valid_continuation_rejects_capital_after_function_word(self) -> None:
+        from pdfparser.pipeline.merge import _is_valid_continuation
+
+        # a function-word tail + an ordinary (non-identifier) capital head is a
+        # dropped continuation, not the real one — refuse the merge
+        cont = "However the assay failed."
+        assert _is_valid_continuation(cont, cont, "we measured the", False) is False
+
+    def test_valid_continuation_in_refs_rejects_capital_head(self) -> None:
+        from pdfparser.pipeline.merge import _is_valid_continuation
+
+        cont = "Peck, S.C., et al. 2016."
+        # outside refs a capital head with no function-word tail merges…
+        assert _is_valid_continuation(cont, cont, "trailing doi 10.1", False) is True
+        # …inside refs the same head is the next bibliography entry, left alone
+        assert _is_valid_continuation(cont, cont, "trailing doi 10.1", True) is False
+
+    def test_skip_floats_collects_floats_and_legend_to_continuation(self) -> None:
+        from pdfparser.pipeline.merge import _skip_floats
+
+        parts = [
+            "<p>fragment</p>",
+            "<table><tr><td>x</td></tr></table>",
+            "<figure></figure>",
+            "<p>MW: molecular weight, NR: Not reported</p>",  # legend, not a float
+            "<p>continuation</p>",
+        ]
+        j, floats = _skip_floats(parts, 1)
+        assert j == 4
+        assert floats == parts[1:4]
+
+    def test_skip_floats_stops_at_float_budget(self) -> None:
+        from pdfparser.pipeline.merge import _MAX_FLOATS_TO_SKIP, _skip_floats
+
+        parts = ["<figure></figure>"] * (_MAX_FLOATS_TO_SKIP + 2)
+        j, floats = _skip_floats(parts, 0)
+        # only the budgeted floats are stepped over; the next is left as a barrier
+        assert j == _MAX_FLOATS_TO_SKIP
+        assert len(floats) == _MAX_FLOATS_TO_SKIP

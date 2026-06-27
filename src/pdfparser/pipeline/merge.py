@@ -66,6 +66,9 @@ _MIDSENTENCE_HEAD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*[A-Z]")
 # keeps a genuinely wrapped entry that resumes with a figure ("…, 2016, 12, …")
 # from matching.
 _NUMBERED_REF_HEAD_RE = re.compile(r"^\[?\d{1,3}[.)\]]?\s+[A-Z]")
+# A continuation opening with one of these is a page footnote, not prose (used by the
+# continuation guard); also the table-footnote marker set (``_is_footnote_label``).
+_FOOTNOTE_SYMBOLS = frozenset("*†‡§¶#")
 # A column/page break can strand a paragraph's continuation behind a whole float
 # cluster — observed as two figures plus a table between the two halves — so the
 # skip window must clear such a cluster.  The grammatical guards below (the
@@ -178,25 +181,112 @@ def _is_table_legend(part: str) -> bool:
     )
 
 
+def _is_open_fragment(part: str, inner: str, stripped: str, visible: str) -> bool:
+    """True when a plain ``<p>`` is an incomplete paragraph fragment eligible to
+    absorb a following continuation.
+
+    The fragment lacks terminal punctuation (the sentence-end test runs on
+    ``stripped`` — terminal punctuation can sit *inside* a closing inline tag,
+    "…carboxylase.</em>", or behind a trailing citation superscript,
+    "…humans.<sup>15–18</sup>", which ``_ends_sentence`` handles) and is none of the
+    self-contained block shapes that merely happen to end without a period:
+
+    - a bold front-matter label, or a figure/table caption label;
+    - a metadata footer (DOI / "Published online …" / correspondence) — complete
+      even unterminated; backstops the page-0 stray sweep;
+    - an affiliation/footnote line opening with a leading superscript marker
+      ("¹ Department of …, South Korea") — a multi-affiliation run overruns
+      ``_is_stray_metadata``'s length cap, so it is guarded directly or the abstract
+      that follows is glued on and hidden with it;
+    - a table abbreviation legend ("MW: molecular weight, NR: Not reported").
+    """
+    return (
+        not _ends_sentence(stripped)
+        and not _BOLD_LABEL_RE.match(inner)
+        and not _opens_with_caption_label(inner)
+        and not _is_stray_metadata(part)
+        and not _LEADING_SUP_RE.match(visible.lstrip())
+        and not _is_table_legend(part)
+    )
+
+
+def _skip_floats(parts: list[str], start: int) -> tuple[int, list[str]]:
+    """Step over the tables/figures (up to ``_MAX_FLOATS_TO_SKIP``) and any table
+    legend the OCR stranded between a fragment and its continuation, collecting them
+    to re-emit *after* the rejoined paragraph.
+
+    Returns the index of the first block that is neither a float nor a legend, and
+    the collected blocks.  A legend is furniture, not a float, so it does not consume
+    the float budget (else the legend is taken as the continuation and spliced into
+    the sentence)."""
+    j = start
+    floats: list[str] = []
+    skipped_floats = 0
+    while j < len(parts):
+        if _is_table_legend(parts[j]):
+            floats.append(parts[j])
+            j += 1
+        elif _FLOAT_RE.match(parts[j]) and skipped_floats < _MAX_FLOATS_TO_SKIP:
+            floats.append(parts[j])
+            skipped_floats += 1
+            j += 1
+        else:
+            break
+    return j, floats
+
+
+def _is_valid_continuation(
+    cont: str, cont_head: str, visible: str, in_refs: bool
+) -> bool:
+    """True when ``cont`` is a genuine continuation of an open fragment, not a new
+    block that merely follows it.
+
+    Rejects an enumeration item, a bold label, a caption label, and a page footnote
+    opening with a footnote marker ("¹http://…" or a "*"/"†" note — matched by
+    footnote *shape*, not by any leading superscript, so an isotope-led continuation
+    "³⁵S methionine …" still merges).  Two head-capital guards:
+
+    - after a function word the fragment is grammatically incomplete, so an
+      uppercase-led continuation (not a mid-token scientific identifier) is a dropped
+      continuation, not the real one — refuse it;
+    - in the references section a capital-led continuation is the next bibliography
+      entry (author surname, even an internal-capital "McKenzie"); a period-less
+      numbered marker ("9 Peck, …") opens a new entry too but leads with its digit,
+      so it is matched explicitly. Only a lowercase continuation is a wrapped entry."""
+    return (
+        not _ENUM_RE.match(cont)
+        and not _BOLD_LABEL_RE.match(cont)
+        and not _opens_with_caption_label(cont)
+        and not _UNICODE_SUP_MARKER_RE.match(cont_head)
+        and cont_head[:1] not in _FOOTNOTE_SYMBOLS
+        and not (
+            _FUNCTION_WORD_END_RE.search(visible)
+            and cont_head[:1].isupper()
+            and not _MIDSENTENCE_HEAD_RE.match(cont_head)
+        )
+        and not (
+            in_refs
+            and (cont_head[:1].isupper() or _NUMBERED_REF_HEAD_RE.match(cont_head))
+        )
+    )
+
+
 def _merge_split_paragraphs(parts: list[str]) -> list[str]:
     """Stitch paragraph fragments broken by two-column PDF layout.
 
-    When a plain ``<p>`` ends without terminal punctuation the next plain
-    ``<p>`` is treated as a continuation.  Intervening tables and figures
-    (up to ``_MAX_FLOATS_TO_SKIP``) are collected and re-emitted *after*
-    the merged paragraph so the float stays near its reference text.
+    When a plain ``<p>`` ends without terminal punctuation (``_is_open_fragment``)
+    the next plain ``<p>`` is treated as a continuation (``_is_valid_continuation``).
+    Intervening tables and figures (up to ``_MAX_FLOATS_TO_SKIP``) are collected by
+    ``_skip_floats`` and re-emitted *after* the merged paragraph so the float stays
+    near its reference text.
 
-    Headings, footnote paragraphs, enumeration items, and figure/table
-    captions act as merge barriers and are never absorbed into an adjacent
-    paragraph.
+    Headings, footnote paragraphs, enumeration items, and figure/table captions act
+    as merge barriers and are never absorbed into an adjacent paragraph.
 
-    Inside the references section the rule tightens: a bibliography entry rarely
-    ends in terminal punctuation (it trails off in a DOI — "…1997.00426.x"), so
-    the generic "no period ⇒ fragment" test would chain the whole list into one
-    paragraph.  There a new entry always opens with a capitalised author surname
-    while a genuinely wrapped entry resumes lowercase ("…quaternary structure" /
-    "and possible subunit cooperativity"), so a capital-led continuation is taken
-    as the next entry and left as its own block.
+    Inside the references section the rule tightens: a bibliography entry rarely ends
+    in terminal punctuation (it trails off in a DOI — "…1997.00426.x"), so the generic
+    "no period ⇒ fragment" test would chain the whole list into one paragraph; there a
+    capital-led continuation is taken as the next entry (``_is_valid_continuation``).
     """
     # Keyed on the references *heading*, not "<p>[1]": a body block opening "[1] …"
     # (a numbered list, an inline citation) must not switch the guard on early and
@@ -212,88 +302,14 @@ def _merge_split_paragraphs(parts: list[str]) -> list[str]:
         inner = _plain_p_text(part)
         if inner is not None:
             stripped = inner.rstrip()
-            # Terminal punctuation can sit *inside* a closing inline tag
-            # ("…carboxylase.</em>") or behind a trailing citation superscript
-            # ("…humans.<sup>15–18</sup>"), so the sentence-end test runs on the
-            # visible text past any such citation — matching the raw HTML would
-            # miss the period and wrongly treat a finished paragraph as a fragment.
             visible = _visible_text(stripped).rstrip()
-            if (
-                not _ends_sentence(stripped)
-                and not _BOLD_LABEL_RE.match(inner)
-                and not _opens_with_caption_label(inner)
-                # A self-contained metadata footer (DOI / "Published online …" /
-                # correspondence) is complete even when it ends without terminal
-                # punctuation, so it must not be absorbed as a fragment with the
-                # following body prose glued on.  Backstops the page-0 stray sweep.
-                and not _is_stray_metadata(part)
-                # An affiliation/footnote line opening with a leading superscript
-                # marker ("¹ Department of …, South Korea") is self-contained front
-                # matter even without terminal punctuation; a multi-affiliation run
-                # overruns _is_stray_metadata's length cap, so guard it directly or
-                # the abstract that follows is glued on and hidden with it.
-                and not _LEADING_SUP_RE.match(visible.lstrip())
-                # A table's abbreviation legend ("MW: molecular weight, NR: Not
-                # reported") ends without terminal punctuation but is not a sentence
-                # fragment, so it must not absorb the body prose resuming after it.
-                and not _is_table_legend(part)
-            ):
-                j = i + 1
-                floats: list[str] = []
-                # Step over the tables/figures between the split halves, plus any
-                # table legend the OCR stranded among them (else the legend is taken
-                # as the continuation and spliced into the sentence).  A legend is
-                # furniture, not a float, so it does not consume the float budget;
-                # both are re-emitted after the rejoined paragraph.
-                skipped_floats = 0
-                while j < len(parts):
-                    if _is_table_legend(parts[j]):
-                        floats.append(parts[j])
-                        j += 1
-                    elif (
-                        _FLOAT_RE.match(parts[j])
-                        and skipped_floats < _MAX_FLOATS_TO_SKIP
-                    ):
-                        floats.append(parts[j])
-                        skipped_floats += 1
-                        j += 1
-                    else:
-                        break
+            if _is_open_fragment(part, inner, stripped, visible):
+                j, floats = _skip_floats(parts, i + 1)
                 if j < len(parts):
                     cont = _plain_p_text(parts[j])
                     cont_head = _visible_text(cont).lstrip() if cont is not None else ""
-                    if (
-                        cont is not None
-                        and not _ENUM_RE.match(cont)
-                        and not _BOLD_LABEL_RE.match(cont)
-                        and not _opens_with_caption_label(cont)
-                        # A continuation opening with a footnote marker ("¹http://…"
-                        # or a "*"/"†" note) is a page footnote the classifier left in
-                        # place, not prose; gluing it in splices the footnote
-                        # mid-sentence.  Matched by footnote shape, not by any leading
-                        # superscript, so an isotope-led continuation ("³⁵S methionine
-                        # …") still merges.
-                        and not _UNICODE_SUP_MARKER_RE.match(cont_head)
-                        and cont_head[:1] not in _FOOTNOTE_SYMBOLS
-                        and not (
-                            _FUNCTION_WORD_END_RE.search(visible)
-                            and cont_head[:1].isupper()
-                            and not _MIDSENTENCE_HEAD_RE.match(cont_head)
-                        )
-                        # In the references section a capital-led continuation is the
-                        # next bibliography entry (author surname), even one with an
-                        # internal capital ("McKenzie", "DeForest"); only a lowercase
-                        # continuation is a genuinely wrapped entry, so no mid-sentence
-                        # exception applies here.  A period-less numbered marker
-                        # ("9 Peck, …") opens a new entry too but leads with its digit,
-                        # not a capital, so it is matched explicitly.
-                        and not (
-                            i >= ref_start
-                            and (
-                                cont_head[:1].isupper()
-                                or _NUMBERED_REF_HEAD_RE.match(cont_head)
-                            )
-                        )
+                    if cont is not None and _is_valid_continuation(
+                        cont, cont_head, visible, i >= ref_start
                     ):
                         joined = _dehyphenate_join(stripped, cont)
                         out.append(f"<p>{joined}</p>")
@@ -506,7 +522,6 @@ _TABLE_SOURCE_NOTE_RE = re.compile(
 # bound as classify's _SUP_MARKER_RE, but capturing the label so a trailing
 # footnote can be matched to the marker it annotates inside the table.
 _SUP_LABEL_RE = re.compile(r"<sup>([^<]{1,3})</sup>")
-_FOOTNOTE_SYMBOLS = frozenset("*†‡§¶#")
 
 
 def _is_footnote_label(label: str) -> bool:
