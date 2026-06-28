@@ -121,9 +121,12 @@ def _join_wrapped_lines(lines: list[str]) -> str:
     return out
 
 
-def _reflow_paragraph(p_html: str) -> list[str]:
+def _reflow_paragraph(p_html: str, inner: str) -> list[str]:
     """Reflow a soft-wrapped ``<p>`` block: de-hyphenate broken words and split
     where the model dropped a paragraph break onto a line boundary.
+
+    ``inner`` is the block's plain ``<p>`` content the caller already extracted (via
+    ``_plain_p_text``), so it is not re-derived here.
 
     A line that ends a sentence marks a paragraph break only when the next line's
     first word would have fit on it — i.e. the break was forced by the paragraph
@@ -132,7 +135,6 @@ def _reflow_paragraph(p_html: str) -> list[str]:
     or with explicit ``<br>`` hard breaks (affiliation lists, addresses), are
     left untouched.
     """
-    inner = p_html[len("<p>") : -len("</p>")]
     if "\n" not in inner or "<br" in inner:
         return [p_html]
     lines = inner.split("\n")
@@ -162,6 +164,9 @@ def _md_to_html_blocks(md_text: str) -> list[str]:
     i = 0
     while i < len(tokens):
         token = tokens[i]
+        # Defensive: a top-level walk should only ever land on a level-0 token (the
+        # depth tracking below consumes each nested group whole), but skip a stray
+        # nested token rather than mis-group it if the stream is ever unbalanced.
         if token.level != 0:
             i += 1
             continue
@@ -180,8 +185,8 @@ def _md_to_html_blocks(md_text: str) -> list[str]:
             continue
         if "<td" in html or "<th" in html:
             blocks.append(_render_cell_markdown(html))
-        elif _plain_p_text(html) is not None:
-            blocks.extend(_reflow_paragraph(html))
+        elif (inner := _plain_p_text(html)) is not None:
+            blocks.extend(_reflow_paragraph(html, inner))
         else:
             blocks.append(html)
     return blocks
