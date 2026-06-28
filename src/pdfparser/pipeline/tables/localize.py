@@ -104,6 +104,20 @@ def _median(values: list[float]) -> float:
     return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
 
 
+def _grow_run_down(gaps: list[float], start: int, threshold: float) -> int:
+    """Extend a line/row run toward page bottom while the gap to the next line stays
+    within ``threshold`` of the prose margin; return the new last index.
+
+    Shared by table-crop localization (``_locate_bbox``) and the text-layer rebuild's
+    below-table trim (``tables.rebuild._trim_rows_below_table``) so retuning the cut
+    can't desync the two.  ``gaps[i]`` is the gap between line/row ``i`` and ``i+1``,
+    so it has one fewer entry than the lines."""
+    hi = start
+    while hi < len(gaps) and gaps[hi] <= threshold:
+        hi += 1
+    return hi
+
+
 def _seed_rotation(rotations: list[int]) -> int:
     """The dominant quarter-turn among a region's seed glyphs (0 when none rotate).
 
@@ -214,8 +228,7 @@ def _locate_bbox(
     threshold = spacing * _GAP_FACTOR
     while lo > 0 and gaps[lo - 1] <= threshold:
         lo -= 1
-    while hi < len(lines) - 1 and gaps[hi] <= threshold:
-        hi += 1
+    hi = _grow_run_down(gaps, hi, threshold)
 
     # Legend allowance: a table's footnote/legend ("MW: molecular weight, …") sits
     # one line below the body, set off by a gap a little wider than the row gaps —

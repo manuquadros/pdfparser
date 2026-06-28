@@ -1023,14 +1023,15 @@ class TestTextLayerTableRepair:
     (plans/render-review-fixes.md §2 — the 31298526 Table 2)."""
 
     @staticmethod
-    def _glyphs(text: str, x0: float, y: float, cw: float = 5.0):
-        # build (char, x0, x1, y) glyphs; a space advances x by a wide gap, no glyph
+    def _glyphs(text: str, x0: float, y: float, cw: float = 5.0, gh: float = 8.0):
+        # build (char, x0, x1, y-center, y-bottom, y-top) glyphs around centre y with
+        # glyph height gh; a space advances x by a wide gap, no glyph
         out, x = [], float(x0)
         for ch in text:
             if ch == " ":
                 x += cw
                 continue
-            out.append((ch, x, x + cw, float(y)))
+            out.append((ch, x, x + cw, float(y), y - gh / 2, y + gh / 2))
             x += cw + 1.0
         return out
 
@@ -1040,7 +1041,7 @@ class TestTextLayerTableRepair:
         assert _glyph_cell_text(self._glyphs("PDB code", 0, 100)) == "PDB code"
         assert _glyph_cell_text(self._glyphs("37991", 0, 100)) == "37991"
         # a digit run the gap heuristic over-split (a glyph placed past the gap) rejoins
-        glyphs = self._glyphs("0.08", 0, 100) + [("1", 60.0, 63.0, 100.0)]
+        glyphs = self._glyphs("0.08", 0, 100) + [("1", 60.0, 63.0, 100.0, 96.0, 104.0)]
         assert _glyph_cell_text(glyphs) == "0.081"
 
     def test_rows_to_cells_header_divider_and_footnote_stop(self) -> None:
@@ -1082,7 +1083,8 @@ class TestTextLayerTableRepair:
             + self._glyphs("P212121", 80, 176)
             + self._glyphs("redundancy", 10, 164)
             + self._glyphs("4.2", 80, 164)
-            # body prose far below the table (gap 44 ≫ 1.5 × the 12-pt row spacing)
+            # body prose far below the table: edge whitespace 36pt ≫ 1.5 × the 4pt
+            # inter-row whitespace (12-pt pitch, 8-pt glyphs)
             + self._glyphs("The following paragraph discusses the structure", 10, 120)
             + self._glyphs("and continues with more body prose here", 10, 108)
         )
@@ -1093,9 +1095,41 @@ class TestTextLayerTableRepair:
         flat = " ".join(g[0] for row in trimmed for g in row)
         assert "paragraph" not in flat and "prose" not in flat
 
+    def test_trim_rows_below_table_drops_short_prose_at_modest_margin(self) -> None:
+        # Two regressions in one shape.  (1) Metric: a prose row a modest margin
+        # below a tight table reads as "within 1.5 × pitch" under the old
+        # centre-to-centre metric and is wrongly kept; the edge-to-edge whitespace
+        # metric (matching _locate_bbox) drops it — here the row pitch is 12 (4-pt
+        # whitespace, 8-pt glyphs) and the prose sits at pitch 16 (kept by 1.5×12=18 ≥
+        # 16, dropped by 1.5×4=6 < edge gap 8).  (2) Distinct contribution: the
+        # below-table line is short and value-less ("see main text", <
+        # _RECON_FOOTNOTE_LEN), so _rows_to_cells' footnote-stop would *not* remove it —
+        # only the gap-trim does.
+        from pdfparser.pipeline.tables import (
+            _group_glyph_rows,
+            _trim_rows_below_table,
+        )
+
+        glyphs = (
+            self._glyphs("PDB code", 10, 200)
+            + self._glyphs("6JX2", 80, 200)
+            + self._glyphs("wavelength", 10, 188)
+            + self._glyphs("0.97934", 80, 188)
+            + self._glyphs("redundancy", 10, 176)
+            + self._glyphs("4.2", 80, 176)
+            + self._glyphs("see main text", 10, 160)  # short, value-less, pitch 16
+        )
+        rows = _group_glyph_rows(glyphs)
+        seeds = [(10.0, 176.0, 200.0, 200.0)]  # spans the three data rows
+        trimmed = _trim_rows_below_table(rows, seeds)
+        assert len(trimmed) == 3
+        assert "main" not in " ".join(g[0] for row in trimmed for g in row)
+
     def test_trim_rows_below_table_keeps_contiguous_rows(self) -> None:
         # No wide gap → nothing is body prose → every row is kept (a trailing data row
-        # the anchors did not cover must still survive the trim).
+        # the anchors did not cover must still survive the trim).  The seed box overlaps
+        # the top two rows, so the seeded-region spacing median (gaps[lo:hi], not the
+        # whole-table fallback) drives the grow-down through the un-seeded third row.
         from pdfparser.pipeline.tables import (
             _group_glyph_rows,
             _trim_rows_below_table,

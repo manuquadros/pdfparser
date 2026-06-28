@@ -20,7 +20,9 @@ from pdfparser.pipeline.tables.localize import (
     _GAP_FACTOR,
     _anchor_texts,
     _collect_seeds,
+    _grow_run_down,
     _median,
+    _union,
 )
 from pdfparser.pipeline.tables.markup import (
     _CELL_RE,
@@ -43,7 +45,9 @@ _RECON_FOOTNOTE_LEN = 34  # a long value-less row past the body is a footnote: s
 # The space heuristic over-splits a digit run (a narrow "1" reads as a gap); rejoin a
 # space that sits between two digits/decimal points.
 _RECON_NUM_SPACE = re.compile(r"(?<=[\d.])\s+(?=[\d.])")
-_Glyph = tuple[str, float, float, float]  # char, x0, x1, y-center
+# char, x0, x1, y-center, y-bottom, y-top — the y-extents (not just the centre) let
+# the below-table trim measure edge-to-edge whitespace, matching _locate_bbox's gap.
+_Glyph = tuple[str, float, float, float, float, float]
 
 
 def _glyph_cell_text(seg: list[_Glyph]) -> str:
@@ -84,20 +88,27 @@ def _trim_rows_below_table(
     The glyph filter has only a top bound (the seeds' top), so it runs to page bottom;
     a 2-column page's body prose below the table would then be swept in as extra rows,
     inflating the rebuild past the OCR table and winning the row-count substitution
-    gate with a wrong table.  Grow down from the lowest seed row while the inter-row
-    gap stays within ``_GAP_FACTOR`` of the table's own line spacing — the same
-    gap-to-prose rule ``_locate_bbox`` uses — and cut at the wider margin to the
-    following prose."""
+    gate with a wrong table.  Mirror ``_locate_bbox``: take the rows the seed box
+    overlaps (cross-axis interval test, not a centre) as the table body, measure
+    spacing as the *edge-to-edge whitespace* of that seeded run — so ``_GAP_FACTOR``,
+    tuned for whitespace rather than centre-to-centre pitch, applies unchanged — then
+    grow down through the trailing data rows (the shared ``_grow_run_down``) while the
+    gap stays within the prose margin, cutting at the wider gap to body prose."""
     if len(rows) < 2 or not seeds:
         return rows
-    ys = [sum(g[3] for g in row) / len(row) for row in rows]
-    gaps = [ys[i] - ys[i + 1] for i in range(len(rows) - 1)]
-    seed_lo = min((s[1] + s[3]) / 2 for s in seeds)
-    hi = max((i for i, y in enumerate(ys) if y >= seed_lo), default=0)
-    spacing = _median(gaps[:hi]) if hi else _median(gaps)
-    threshold = spacing * _GAP_FACTOR
-    while hi < len(rows) - 1 and gaps[hi] <= threshold:
-        hi += 1
+    tops = [max(g[5] for g in row) for row in rows]
+    bottoms = [min(g[4] for g in row) for row in rows]
+    gaps = [bottoms[i] - tops[i + 1] for i in range(len(rows) - 1)]
+    _, seed_bottom, _, seed_top = _union(seeds)
+    touched = [
+        i for i in range(len(rows)) if bottoms[i] < seed_top and tops[i] > seed_bottom
+    ]
+    if not touched:
+        return rows
+    lo, hi = min(touched), max(touched)
+    region = gaps[lo:hi]
+    spacing = _median(region) if region else _median(gaps)
+    hi = _grow_run_down(gaps, hi, spacing * _GAP_FACTOR)
     return rows[: hi + 1]
 
 
@@ -212,7 +223,7 @@ def _reconstruct_table_from_text_layer(
     col_right = max(s[2] for s in seeds) + _RECON_X_PAD
     y_top = max(s[3] for s in seeds) + _RECON_X_PAD
     glyphs = [
-        (ch, b[0], b[2], (b[1] + b[3]) / 2)
+        (ch, b[0], b[2], (b[1] + b[3]) / 2, b[1], b[3])
         for ch, b in zip(layer.page_text, layer.char_boxes, strict=True)
         if b is not None
         and not ch.isspace()
