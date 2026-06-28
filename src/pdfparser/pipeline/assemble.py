@@ -53,7 +53,7 @@ from pdfparser.pipeline.furniture import (
 )
 from pdfparser.pipeline.latex import _latex_to_html
 from pdfparser.pipeline.layers import _DocumentLayers
-from pdfparser.pipeline.markdown import _md_to_html_blocks, _render_inline_html
+from pdfparser.pipeline.markdown import _caption_inner_html, _md_to_html_blocks
 from pdfparser.pipeline.merge import (
     _colocate_table_captions,
     _colocate_table_footnotes,
@@ -437,9 +437,8 @@ def _resolve_figure_clusters(
 
 
 def _figcaption_only(caption_html: str) -> str:
-    return (
-        f"<figure><figcaption>{_render_inline_html(caption_html)}</figcaption></figure>"
-    )
+    inner = _caption_inner_html(caption_html)
+    return f"<figure><figcaption>{inner}</figcaption></figure>"
 
 
 def _page_to_html_parts(

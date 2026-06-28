@@ -350,6 +350,103 @@ class TestRenderInlineHtml:
         assert "href" not in _render_inline_html("contact <a@b.edu>")
 
 
+class TestBreakCaptionTitle:
+    """A bolded figure-caption title runs straight into its legend; the title gets a
+    <br> before the legend, but only when it is genuinely bold and legend follows."""
+
+    def test_bold_title_broken_from_panel_legend(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        assert (
+            _break_caption_title(
+                "<strong>Figure 1. Gene clusters</strong> (A) Gene clusters"
+            )
+            == "<strong>Figure 1. Gene clusters</strong><br>(A) Gene clusters"
+        )
+
+    def test_nested_italic_title_closes_at_first_strong(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # the title's inner </em> closes before its </strong>, so the break lands after
+        # the whole bold title, not inside it
+        assert _break_caption_title(
+            "<strong>Figure 2. analyses of <em>BkTauF</em></strong> (A) SDS/PAGE"
+        ) == ("<strong>Figure 2. analyses of <em>BkTauF</em></strong><br>(A) SDS/PAGE")
+
+    def test_non_panel_legend_also_broken(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        assert (
+            _break_caption_title(
+                "<strong>Figure 7. Gene clusters</strong> Many of the close homologs"
+            )
+            == "<strong>Figure 7. Gene clusters</strong><br>Many of the close homologs"
+        )
+
+    def test_title_only_caption_unchanged(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # a caption that is wholly the bold title (no legend) gets no break
+        assert (
+            _break_caption_title("<strong>Figure 3. Overview of the assay.</strong>")
+            == "<strong>Figure 3. Overview of the assay.</strong>"
+        )
+
+    def test_unbolded_caption_unchanged(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # no leading bold title → nothing to break, even if a term inside is bold
+        cap = "Figure 4. Activity of the <strong>mutant</strong> enzyme over time"
+        assert _break_caption_title(cap) == cap
+
+    def test_punctuation_glued_to_bold_not_split(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # the </strong> is immediately followed by a period (the model un-bolded the
+        # trailing dot) — no whitespace, so it must NOT be mistaken for a legend start
+        cap = "<strong>Figure 5</strong>. continued title prose here"
+        assert _break_caption_title(cap) == cap
+
+    def test_bold_panel_label_not_a_title_unchanged(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # the leading bold is a panel label, not a figure/table title — no break, or the
+        # label is split from its own description (the regression this guard prevents)
+        cap = "<strong>(A)</strong> left panel shows the result"
+        assert _break_caption_title(cap) == cap
+
+    def test_bold_emphasis_word_not_a_title_unchanged(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # an emphasised first word in a legend ("**Asterisks** denote …") is not a title
+        for cap in (
+            "<strong>Asterisks</strong> denote p&lt;0.05 across all groups",
+            "<strong>Note</strong> values are means of three replicates",
+        ):
+            assert _break_caption_title(cap) == cap
+
+    def test_two_bold_run_title_breaks_after_last_run(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # the model emits the number and the title as two adjacent bold runs; the break
+        # must land after the *whole* title (the last </strong>), not split it mid-title
+        assert _break_caption_title(
+            "<strong>Figure 2.</strong> <strong>Comparison of A and B.</strong> "
+            "Panels show data"
+        ) == (
+            "<strong>Figure 2.</strong> <strong>Comparison of A and B.</strong>"
+            "<br>Panels show data"
+        )
+
+    def test_all_bold_two_run_title_no_legend_unchanged(self) -> None:
+        from pdfparser.pipeline.markdown import _break_caption_title
+
+        # two bold runs, no non-bold legend after — nothing to break off, so the title
+        # must not be split between its runs
+        cap = "<strong>Figure 1.</strong> <strong>The whole title here.</strong>"
+        assert _break_caption_title(cap) == cap
+
+
 class TestMdToHtmlBlocks:
     """A page's markdown becomes one HTML string per top-level block, with raw
     HTML (tables, <sup>) passed through and thematic breaks dropped."""

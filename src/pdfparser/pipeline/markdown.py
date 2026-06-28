@@ -14,7 +14,7 @@ from markdown_it import MarkdownIt
 
 from pdfparser.pipeline.dehyphenate import _dehyphenate_join
 from pdfparser.pipeline.latex import _latex_to_html
-from pdfparser.pipeline.text import _plain_p_text, _visible_text
+from pdfparser.pipeline.text import _CAPTION_RE, _plain_p_text, _visible_text
 
 _MD = MarkdownIt("commonmark", {"html": True}).enable("table")
 
@@ -62,6 +62,35 @@ def _render_inline_html(text: str) -> str:
     variant that applies that pass first."""
     rendered: str = _MD_INLINE.renderInline(text)
     return rendered.strip()
+
+
+# A bolded figure-caption title ("**Figure 1. …**") runs straight into the legend
+# that follows it ("(A) …"); markdown renders both as one inline run, so break the
+# title onto its own line.  The captured group spans *all* adjacent leading bold spans
+# (a number + title the model emits as two runs, "**Fig. 2.** **Title.**"), and the
+# legend is required to be non-bold (negative lookahead) so an all-bold two-run title
+# with no legend isn't split between its runs.  (Each <strong>…</strong> closes its own
+# nested </em> before its </strong>, so .*? stops at the right tag.)
+_CAPTION_BOLD_TITLE_RE = re.compile(
+    r"^(<strong>.*?</strong>(?:\s+<strong>.*?</strong>)*)\s+((?!<strong>)\S.*)$",
+    re.DOTALL,
+)
+
+
+def _break_caption_title(caption_html: str) -> str:
+    """Break a figure caption's leading bold *title* onto its own line with a ``<br>``,
+    so the legend the model bolded the title straight into starts fresh.  A no-op unless
+    the caption opens with a bold figure/table *title* (``_CAPTION_RE`` — not a bare
+    emphasised word or a panel label "(A)") and non-bold legend prose follows it."""
+    m = _CAPTION_BOLD_TITLE_RE.match(caption_html)
+    if m is None or not _CAPTION_RE.match(_visible_text(m.group(1)).lstrip()):
+        return caption_html
+    return f"{m.group(1)}<br>{m.group(2)}"
+
+
+def _caption_inner_html(caption_text: str) -> str:
+    """Inline-render a figure caption and break its bold title off from the legend."""
+    return _break_caption_title(_render_inline_html(caption_text))
 
 
 def _render_inline(text: str) -> str:
