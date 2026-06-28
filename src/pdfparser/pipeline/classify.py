@@ -890,6 +890,60 @@ def _split_abstract_citation(abstract: list[str]) -> tuple[list[str], list[str]]
     return abstract[:-1] + [prose], [f"<p>{m.group(3).strip()}</p>"]
 
 
+def _take_named_section(parts: list[str], i: int) -> tuple[list[str], int]:
+    """The contiguous glossary-metadata run a named heading at ``parts[i]`` owns: the
+    heading plus the following ";"-separated / labelled metadata blocks, stopping at
+    the first heading, figure, list, table or body paragraph.  Returns
+    ``(blocks, next_i)`` — or ``([], i)`` when ``parts[i]`` is not such a heading *or*
+    the heading owns no metadata content (probably a real section title, left in the
+    body so misfiled content isn't hidden)."""
+    if not _is_named_metadata_heading(parts[i]):
+        return [], i
+    j = i + 1
+    while j < len(parts) and (
+        _is_frontmatter_text(parts[j], strict=False) or _is_list_like(parts[j])
+    ):
+        j += 1
+    if j == i + 1:
+        return [], i
+    return parts[i:j], j
+
+
+def _take_publication_sidebar(parts: list[str], i: int) -> tuple[list[str], int]:
+    """The contiguous publication-sidebar run a label heading at ``parts[i]`` owns,
+    returned as ``(blocks, next_i)`` — or ``([], i)`` when ``parts[i]`` is not a
+    sidebar label heading.
+
+    A sidebar label heading owns the ``<p>`` value(s) directly under it, and the
+    sidebar is a contiguous run of such headings.  This pulls label headings and their
+    values — but a ``<p>`` that neither directly follows a *value* label heading nor is
+    itself recognised front matter ends the run, so trailing body prose is never swept
+    into the hidden panel.  A bare banner ("OPEN ACCESS") owns no value paragraph, so it
+    does not claim the ``<p>`` under it — only an independently-recognised front-matter
+    ``<p>`` follows it into the panel.  (Unlike a named section, the heading itself is
+    always taken, so this never returns an empty run for a matched heading.)"""
+    if not _is_publication_metadata_heading(parts[i]):
+        return [], i
+    j = i + 1
+    while j < len(parts):
+        nxt = parts[j]
+        if _is_publication_metadata_heading(nxt):
+            j += 1
+            continue
+        if (
+            _heading_inner(nxt) is None
+            and _plain_p_text(nxt) is not None
+            and (
+                _is_publication_value_heading(parts[j - 1])
+                or _is_frontmatter_text(nxt, strict=False)
+            )
+        ):
+            j += 1
+            continue
+        break
+    return parts[i:j], j
+
+
 def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[str]]:
     """Pull glossary-style metadata sections out of a single page's block stream,
     wherever they sit — returns ``(metadata, rest)``.
@@ -900,58 +954,23 @@ def _extract_named_metadata_sections(parts: list[str]) -> tuple[list[str], list[
     The caller scopes this to the article's first page, so a same-named section
     deeper in the document (e.g. a back-matter "Nomenclature") stays in place.
 
-    A matched heading owns only the contiguous run of positively-recognised
-    metadata blocks that follow it — a ";"-separated list or a labelled metadata
-    line — stopping at the first heading, figure, list, table or body paragraph,
-    so real content the OCR misfiled under the heading is not hidden.  A heading
-    with no such content is left in the body, as it is probably a real section
-    title rather than a glossary."""
+    Each block is offered to the two section-takers in turn (a named glossary section,
+    then a publication sidebar); the first that claims a run consumes it into the
+    metadata, otherwise the block stays in the body.  A named heading that owns no
+    metadata content falls through to the sidebar check (a heading can be both)."""
     metadata: list[str] = []
     rest: list[str] = []
     i = 0
     while i < len(parts):
-        part = parts[i]
-        if _is_named_metadata_heading(part):
-            j = i + 1
-            while j < len(parts) and (
-                _is_frontmatter_text(parts[j], strict=False) or _is_list_like(parts[j])
-            ):
-                j += 1
-            if j > i + 1:
-                metadata.extend(parts[i:j])
+        for take in (_take_named_section, _take_publication_sidebar):
+            blocks, j = take(parts, i)
+            if blocks:
+                metadata.extend(blocks)
                 i = j
-                continue
-        if _is_publication_metadata_heading(part):
-            # A sidebar label heading owns the <p> value(s) directly under it, and
-            # the sidebar is a contiguous run of such headings.  Pull label headings
-            # and their values — but a <p> that neither directly follows a *value*
-            # label heading nor is itself recognised front matter ends the run, so
-            # trailing body prose is never swept into the hidden panel.  A bare banner
-            # ("OPEN ACCESS") owns no value paragraph, so it does not claim the <p>
-            # under it — only an independently-recognised front-matter <p> follows it
-            # into the panel.
-            j = i + 1
-            while j < len(parts):
-                nxt = parts[j]
-                if _is_publication_metadata_heading(nxt):
-                    j += 1
-                    continue
-                if (
-                    _heading_inner(nxt) is None
-                    and _plain_p_text(nxt) is not None
-                    and (
-                        _is_publication_value_heading(parts[j - 1])
-                        or _is_frontmatter_text(nxt, strict=False)
-                    )
-                ):
-                    j += 1
-                    continue
                 break
-            metadata.extend(parts[i:j])
-            i = j
-            continue
-        rest.append(part)
-        i += 1
+        else:
+            rest.append(parts[i])
+            i += 1
     return metadata, rest
 
 
