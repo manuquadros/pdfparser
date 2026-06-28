@@ -42,6 +42,12 @@ _RECON_SPACE_FRAC = 0.3  # insert a space when a glyph gap exceeds this * glyph 
 _RECON_LABEL_GAP = 10.0  # min label|value separation (pt)
 _RECON_VALUE_OFFSET = 25.0  # a row starting this far right of the labels has no label
 _RECON_FOOTNOTE_LEN = 34  # a long value-less row past the body is a footnote: stop
+# A long value-less row only counts as a footnote-stop once this many data rows have
+# been seen; before that it is the table's title above the body, which is skipped.
+_RECON_MIN_DATA_ROWS_BEFORE_FOOTNOTE = 3
+# A value-only cell this short and non-alphanumeric is a stray rule glyph (a lone "_"
+# the header underline leaves behind), dropped rather than emitted as a row.
+_RECON_RULE_GLYPH_MAXLEN = 1
 # The space heuristic over-splits a digit run (a narrow "1" reads as a gap); rejoin a
 # space that sits between two digits/decimal points.
 _RECON_NUM_SPACE = re.compile(r"(?<=[\d.])\s+(?=[\d.])")
@@ -112,14 +118,11 @@ def _trim_rows_below_table(
     return rows[: hi + 1]
 
 
-def _rows_to_cells(rows: list[list[_Glyph]]) -> list[tuple[str, str]]:
-    """Turn text-layer rows into ``(label, value)`` cells.  A row that starts in the
-    value column has an empty label (the data-column header, or a centered divider); a
-    row with a clear gap splits there; a gapless row is a single cell.  Stops at the
-    first footnote (a long value-less row below the table body)."""
-    if not rows:
-        return []
-    label_left = min(
+def _label_left(rows: list[list[_Glyph]]) -> float:
+    """The x where the label column starts: the leftmost start-x among rows that
+    actually *split* (carry a clear label|value gap), so a value-only row doesn't drag
+    the column boundary left.  Falls back to the first row's start if none split."""
+    return min(
         (
             row[0][1]
             for row in rows
@@ -130,26 +133,41 @@ def _rows_to_cells(rows: list[list[_Glyph]]) -> list[tuple[str, str]]:
         ),
         default=rows[0][0][1],
     )
+
+
+def _classify_row(row: list[_Glyph], label_left: float) -> tuple[str, str]:
+    """Split one row into ``(label, value)``: a row starting well right of the label
+    column is value-only (empty label — the data-column header or a centered divider); a
+    row with a clear gap splits at the widest gap; a gapless row is a single label."""
+    gaps = [(row[i + 1][1] - row[i][2], i) for i in range(len(row) - 1)]
+    maxgap, gi = max(gaps, default=(0.0, -1))
+    if row[0][1] > label_left + _RECON_VALUE_OFFSET:
+        return "", _glyph_cell_text(row)
+    if maxgap >= _RECON_LABEL_GAP:
+        return _glyph_cell_text(row[: gi + 1]), _glyph_cell_text(row[gi + 1 :])
+    return _glyph_cell_text(row), ""
+
+
+def _rows_to_cells(rows: list[list[_Glyph]]) -> list[tuple[str, str]]:
+    """Turn text-layer rows into ``(label, value)`` cells.  A row that starts in the
+    value column has an empty label (the data-column header, or a centered divider); a
+    row with a clear gap splits there; a gapless row is a single cell.  Stops at the
+    first footnote (a long value-less row below the table body)."""
+    if not rows:
+        return []
+    label_left = _label_left(rows)
     cells: list[tuple[str, str]] = []
     seen_data = 0
     for row in rows:
-        gaps = [(row[i + 1][1] - row[i][2], i) for i in range(len(row) - 1)]
-        maxgap, gi = max(gaps, default=(0.0, -1))
-        if row[0][1] > label_left + _RECON_VALUE_OFFSET:
-            label, value = "", _glyph_cell_text(row)
-        elif maxgap >= _RECON_LABEL_GAP:
-            label = _glyph_cell_text(row[: gi + 1])
-            value = _glyph_cell_text(row[gi + 1 :])
-        else:
-            label, value = _glyph_cell_text(row), ""
+        label, value = _classify_row(row, label_left)
         # A long value-less row is the table's title (above the body) or a footnote
         # (below it): skip it above the body, stop at it once data rows have started.
         if not value and len(label) > _RECON_FOOTNOTE_LEN:
-            if seen_data >= 3:
+            if seen_data >= _RECON_MIN_DATA_ROWS_BEFORE_FOOTNOTE:
                 break
             continue
         # skip a stray rule glyph (a lone "_" the header underline leaves behind)
-        if not label and len(value) <= 1 and not value.isalnum():
+        if not label and len(value) <= _RECON_RULE_GLYPH_MAXLEN and not value.isalnum():
             continue
         if label or value:
             cells.append((label, value))
