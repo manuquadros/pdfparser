@@ -507,12 +507,19 @@ def _metadata_panel(metadata: list[str]) -> str:
 
 def _insert_footnotes_before_refs(body: list[str], footnotes: list[str]) -> list[str]:
     """Splice footnote paragraphs in just before the references section (or at the
-    end, if there is none) so they read after the prose but before the bibliography."""
+    end, if there is none) so they read after the prose but before the bibliography.
+
+    Anchors on the references *heading* first; the looser "<p>[1]" anchor
+    (``_REF_SECTION_RE``) is only the fallback for a heading-less numbered
+    bibliography, so a stray "[1]"-led body paragraph (an inline citation, a numbered
+    list) that precedes the real bibliography can't strand the footnotes mid-body."""
     if not footnotes:
         return body
-    ref_idx = next(
-        (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
-    )
+    ref_idx = next((i for i, p in enumerate(body) if _REF_HEADING_RE.match(p)), None)
+    if ref_idx is None:
+        ref_idx = next(
+            (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
+        )
     return body[:ref_idx] + footnotes + body[ref_idx:]
 
 

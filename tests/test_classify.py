@@ -661,6 +661,36 @@ class TestLightonAssembly:
         assert 0 < fn < ref
         assert 'class="footnote"' in html
 
+    def test_footnotes_anchor_on_references_heading_not_stray_bracket_one(self) -> None:
+        # A "[1]"-led body paragraph (an inline numbered note) precedes the real
+        # bibliography; footnotes must anchor on the References *heading*, not strand
+        # mid-body before the stray "[1]".
+        md = (
+            "# T\n\n## Abstract\n\nAbstract.\n\n## Body\n\n"
+            "[1] An inline numbered note in the body, not the bibliography.\n\n"
+            "<sup>*</sup>To whom correspondence should be addressed.\n\n"
+            "## References\n\n[1] A reference."
+        )
+        html = _run_lighton([md])
+        stray = html.find("An inline numbered note")
+        fn = html.find("To whom correspondence")
+        ref = html.find("[1] A reference")
+        assert 0 < stray < fn < ref
+
+    def test_footnotes_fall_back_to_bracket_one_when_headingless(self) -> None:
+        # A heading-less numbered bibliography (no "References" heading, just "[1] …")
+        # still anchors the footnotes before the bibliography via the looser fallback.
+        md = (
+            "# T\n\n## Abstract\n\nAbstract.\n\n## Body\n\nBody prose here.\n\n"
+            "<sup>*</sup>To whom correspondence should be addressed.\n\n"
+            "[1] A reference with no References heading."
+        )
+        html = _run_lighton([md])
+        fn = html.find("To whom correspondence")
+        ref = html.find("[1] A reference with no")
+        assert 0 < fn < ref
+        assert 'class="footnote"' in html
+
     def test_body_h1_demoted_to_h2(self) -> None:
         # Only the title is a legitimate <h1>; a body section heading the model
         # mis-levelled as <h1> is demoted so the document has one top-level head.
