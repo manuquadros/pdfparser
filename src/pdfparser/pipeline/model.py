@@ -15,7 +15,7 @@ import os
 import random
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import httpx
@@ -40,11 +40,14 @@ _CONTEXT_SAFETY_MARGIN = 64
 # the card is small and shared; override with ``PDFPARSER_OCR_CONCURRENCY``.
 _DEFAULT_OCR_CONCURRENCY = 4
 # A cold page can take tens of seconds on a small GPU; httpx's 5 s default would
-# abort mid-decode, so OCR requests use a generous per-request budget.
-_REQUEST_TIMEOUT_S = 600.0
+# abort mid-decode, so OCR requests use a generous per-request budget.  Override
+# per-deployment with ``PDFPARSER_OCR_TIMEOUT`` — a slow cold-start GPU may need
+# longer (see ``_resolve_request_timeout``).
+_DEFAULT_REQUEST_TIMEOUT_S = 600.0
 # The reachability probe must fail fast — it shares the client but not the long
 # generation budget, so a wedged server doesn't block startup for ten minutes.
-_HEALTH_TIMEOUT_S = 10.0
+# Override with ``PDFPARSER_OCR_HEALTH_TIMEOUT`` — a fast CI probe may want shorter.
+_DEFAULT_HEALTH_TIMEOUT_S = 10.0
 # A page POST runs concurrently against a small shared GPU, so a transient
 # connection blip or vLLM overload status on any one page would otherwise abort the
 # whole multi-page document via the propagated exception.  Absorb those with a
@@ -114,7 +117,7 @@ def _client_limits(workers: int) -> httpx.Limits:
 def load_ocr_model(
     base_url: str | None = None,
     model: str | None = None,
-    timeout: float = _REQUEST_TIMEOUT_S,
+    timeout: float | None = None,
 ) -> OcrModel:
     """Open a client to the vLLM server and verify it is reachable.
 
@@ -123,7 +126,8 @@ def load_ocr_model(
             ``PDFPARSER_VLLM_URL`` env var, then ``http://127.0.0.1:8000/v1``.
         model: Served model name.  Defaults to ``PDFPARSER_VLLM_MODEL``, then
             ``lightonocr``.
-        timeout: Per-request timeout in seconds.
+        timeout: Per-request timeout in seconds.  ``None`` (the default) resolves
+            ``PDFPARSER_OCR_TIMEOUT``, then ``_DEFAULT_REQUEST_TIMEOUT_S``.
 
     Raises:
         httpx.HTTPError: If the server is unreachable or unhealthy.  Callers that
@@ -132,9 +136,10 @@ def load_ocr_model(
     base_url = _resolve_base_url(base_url)
     model = model or os.environ.get("PDFPARSER_VLLM_MODEL", _DEFAULT_MODEL)
     concurrency = _resolve_ocr_concurrency()
-    client = httpx.Client(timeout=timeout, limits=_client_limits(concurrency))
+    request_timeout = timeout if timeout is not None else _resolve_request_timeout()
+    client = httpx.Client(timeout=request_timeout, limits=_client_limits(concurrency))
     try:
-        response = client.get(f"{base_url}/models", timeout=_HEALTH_TIMEOUT_S)
+        response = client.get(f"{base_url}/models", timeout=_resolve_health_timeout())
         response.raise_for_status()
     except httpx.HTTPError:
         client.close()  # don't leak the pool when the probe fails
@@ -170,6 +175,35 @@ def _env_int(name: str, default: int) -> int:
             stacklevel=3,  # past this helper to the real caller
         )
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive-float env var, defaulting (with a warning) on a bad value.
+
+    The float analogue of ``_env_int`` for the timeout knobs.  Unlike ``_env_int``
+    (which floors a too-small value at 1), a zero/negative timeout is a
+    misconfiguration with no sane clamp, so it warns and falls back rather than
+    coercing.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        # A misconfigured deployment should be visible, not silently defaulted.
+        warnings.warn(
+            f"{name}={raw!r} is not a number; falling back to {default}",
+            stacklevel=3,  # past this helper to the real caller
+        )
+        return default
+    if value <= 0:
+        warnings.warn(
+            f"{name}={raw!r} must be positive; falling back to {default}",
+            stacklevel=3,
+        )
+        return default
+    return value
 
 
 def _parse_server_context_len(payload: object) -> int | None:
@@ -354,6 +388,14 @@ def _resolve_ocr_concurrency() -> int:
     return _env_int("PDFPARSER_OCR_CONCURRENCY", _DEFAULT_OCR_CONCURRENCY)
 
 
+def _resolve_request_timeout() -> float:
+    return _env_float("PDFPARSER_OCR_TIMEOUT", _DEFAULT_REQUEST_TIMEOUT_S)
+
+
+def _resolve_health_timeout() -> float:
+    return _env_float("PDFPARSER_OCR_HEALTH_TIMEOUT", _DEFAULT_HEALTH_TIMEOUT_S)
+
+
 def _ocr_pages(
     images: list[Image.Image],
     ocr: OcrModel,
@@ -370,10 +412,12 @@ def _ocr_pages(
     independent, so results are gathered back in input order and the page↔image
     alignment the pipeline depends on is preserved.
 
-    On a per-page error, the first failing page's exception propagates and the pool
-    is torn down without waiting on still-running siblings (queued requests are
-    cancelled), so one quick failure can't be stalled for minutes behind a wedged
-    request near the long per-request timeout.
+    On a per-page error, the failing page's exception propagates and the pool is torn
+    down without waiting on still-running siblings (queued requests are cancelled), so
+    one quick failure can't be stalled for minutes behind a slow sibling near the long
+    per-request timeout.  This needs ``wait(..., FIRST_EXCEPTION)`` rather than
+    ``[f.result() for f in futures]`` — the latter blocks in *submission* order, so a
+    fast failure on a late page would wait out an earlier slow page first.
 
     Output is semantically equivalent to the serial path but not byte-identical
     across runs: continuous batching means batch composition now varies with
@@ -387,6 +431,16 @@ def _ocr_pages(
     pool = ThreadPoolExecutor(max_workers=min(limit, len(images)))
     try:
         futures = [pool.submit(_ocr_page, img, ocr, max_new_tokens) for img in images]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        for future in futures:
+            # Only completed futures are inspected (.exception()/.result() on a
+            # still-running one would block, re-defeating the fast-fail); the first
+            # failure in submission order is re-raised deterministically.
+            exc = future.exception() if future in done else None
+            if exc is not None:
+                raise exc
+        # No failure ⇒ FIRST_EXCEPTION returned only once *all* completed, so these
+        # .result() calls don't block.
         return [future.result() for future in futures]
     finally:
         pool.shutdown(wait=False, cancel_futures=True)

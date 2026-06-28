@@ -702,6 +702,161 @@ class TestOcrConcurrencyResolution:
         # post-load env value (9)
         assert captured == [3]
 
+    def test_ocr_pages_fast_fail_does_not_wait_on_slow_sibling(self) -> None:
+        import json
+        import threading
+
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_pages
+
+        # Page 0 blocks until released; page 1 fails fast.  The failure must surface
+        # without first waiting out the slow earlier-submitted page — the property a
+        # submission-order ``[f.result()]`` gather would defeat.
+        release = threading.Event()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            width = Image.open(
+                io.BytesIO(
+                    base64.b64decode(
+                        json.loads(request.content)["messages"][0]["content"][0][
+                            "image_url"
+                        ]["url"].split(",", 1)[1]
+                    )
+                )
+            ).size[0]
+            if width == 10:
+                release.wait(timeout=5)
+                return httpx.Response(
+                    200, json={"choices": [{"message": {"content": "slow"}}]}
+                )
+            return httpx.Response(500, json={"error": "boom"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
+        try:
+            with pytest.raises(httpx.HTTPStatusError):
+                _ocr_pages([_fake_image(10, 8), _fake_image(11, 8)], ocr, concurrency=2)
+        finally:
+            release.set()  # let the still-running slow page unwind
+
+
+class TestOcrTimeoutResolution:
+    """``PDFPARSER_OCR_TIMEOUT`` / ``PDFPARSER_OCR_HEALTH_TIMEOUT`` parsing —
+    defaulting, honoring a value, and the misconfiguration warnings — plus the
+    load-time wiring onto the client and the reachability probe."""
+
+    def test_request_timeout_default_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_REQUEST_TIMEOUT_S,
+            _resolve_request_timeout,
+        )
+
+        monkeypatch.delenv("PDFPARSER_OCR_TIMEOUT", raising=False)
+        assert _resolve_request_timeout() == _DEFAULT_REQUEST_TIMEOUT_S
+
+    def test_health_timeout_default_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_HEALTH_TIMEOUT_S,
+            _resolve_health_timeout,
+        )
+
+        monkeypatch.delenv("PDFPARSER_OCR_HEALTH_TIMEOUT", raising=False)
+        assert _resolve_health_timeout() == _DEFAULT_HEALTH_TIMEOUT_S
+
+    def test_valid_float_is_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pdfparser.pipeline.model import _resolve_request_timeout
+
+        monkeypatch.setenv("PDFPARSER_OCR_TIMEOUT", "42.5")
+        assert _resolve_request_timeout() == 42.5
+
+    def test_non_number_warns_and_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_HEALTH_TIMEOUT_S,
+            _resolve_health_timeout,
+        )
+
+        monkeypatch.setenv("PDFPARSER_OCR_HEALTH_TIMEOUT", "soon")
+        with pytest.warns(UserWarning, match="not a number"):
+            assert _resolve_health_timeout() == _DEFAULT_HEALTH_TIMEOUT_S
+
+    def test_non_positive_warns_and_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pdfparser.pipeline.model import (
+            _DEFAULT_REQUEST_TIMEOUT_S,
+            _resolve_request_timeout,
+        )
+
+        # A zero/negative timeout is a misconfiguration with no sane clamp (unlike the
+        # integer concurrency floor) — it warns and falls back rather than coercing.
+        monkeypatch.setenv("PDFPARSER_OCR_TIMEOUT", "0")
+        with pytest.warns(UserWarning, match="must be positive"):
+            assert _resolve_request_timeout() == _DEFAULT_REQUEST_TIMEOUT_S
+
+    def test_load_ocr_model_wires_env_timeouts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline import model
+        from pdfparser.pipeline.model import load_ocr_model
+
+        # The request timeout reaches the client default; the shorter health timeout is
+        # applied as a per-request override on the /models probe (httpx surfaces the
+        # resolved per-request value in request.extensions["timeout"]).
+        monkeypatch.setenv("PDFPARSER_OCR_TIMEOUT", "123")
+        monkeypatch.setenv("PDFPARSER_OCR_HEALTH_TIMEOUT", "7")
+        captured: dict[str, object] = {}
+        real_client = httpx.Client
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["probe_timeout"] = request.extensions["timeout"]["read"]
+            return httpx.Response(200, json={"data": []})
+
+        def fake_client(**kwargs: object) -> httpx.Client:
+            captured["client_timeout"] = kwargs["timeout"]
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(model.httpx, "Client", fake_client)
+        ocr = load_ocr_model(base_url="http://srv/v1", model="m")
+        assert captured["client_timeout"] == 123.0
+        assert captured["probe_timeout"] == 7.0
+        ocr.close()
+
+    def test_explicit_timeout_arg_overrides_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline import model
+        from pdfparser.pipeline.model import load_ocr_model
+
+        monkeypatch.setenv("PDFPARSER_OCR_TIMEOUT", "123")
+        captured: dict[str, object] = {}
+        real_client = httpx.Client
+
+        def fake_client(**kwargs: object) -> httpx.Client:
+            captured["client_timeout"] = kwargs["timeout"]
+            return real_client(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={"data": []})
+                ),
+                **kwargs,
+            )
+
+        monkeypatch.setattr(model.httpx, "Client", fake_client)
+        ocr = load_ocr_model(base_url="http://srv/v1", model="m", timeout=5.0)
+        # the explicit arg wins over the env value, mirroring base_url/model
+        assert captured["client_timeout"] == 5.0
+        ocr.close()
+
 
 class TestCli:
     """The ``python -m pdfparser`` entry point: output-path defaulting and option
