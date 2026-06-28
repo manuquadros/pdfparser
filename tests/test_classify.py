@@ -1762,3 +1762,42 @@ class TestSuperscriptMarkerCharClass:
         assert _AUTHOR_MARKER_RE.search("Jane Smith<sup>a</sup>")
         # …but a superscript "ⁿ" exponent in a math expression is not a marker
         assert _AUTHOR_MARKER_RE.search("the xⁿ term") is None
+
+
+class TestLeadingBoldLabelVocabulary:
+    """The leading-bold-label vocabulary sets keep their subset invariants by
+    *construction* (the superset is derived as ``subset | {rest}``), so a banner can
+    never drift out of the publication-metadata set nor a glossary label out of the
+    front-matter set.  These lock that against a revert to independent literals."""
+
+    def test_banner_is_subset_of_publication_metadata(self) -> None:
+        from pdfparser.pipeline.classify import (
+            _PUBLICATION_BANNER_LABELS,
+            _PUBLICATION_METADATA_LABELS,
+        )
+
+        assert _PUBLICATION_BANNER_LABELS <= _PUBLICATION_METADATA_LABELS
+        assert "open access" in _PUBLICATION_METADATA_LABELS
+
+    def test_glossary_is_subset_of_frontmatter(self) -> None:
+        from pdfparser.pipeline.classify import (
+            _FRONTMATTER_HEADING_LABELS,
+            _GLOSSARY_METADATA_LABELS,
+        )
+
+        assert _GLOSSARY_METADATA_LABELS < _FRONTMATTER_HEADING_LABELS  # strict subset
+        # the keyword labels are the front-matter-only delta over the glossary
+        delta = _FRONTMATTER_HEADING_LABELS - _GLOSSARY_METADATA_LABELS
+        assert delta == {"keywords", "key words"}
+
+    def test_single_either_colon_matcher_handles_both_shapes(self) -> None:
+        from pdfparser.pipeline.classify import _BOLD_LABEL_CAPTURE_RE
+
+        # the one either-colon matcher captures the label name for colon-inside…
+        m1 = _BOLD_LABEL_CAPTURE_RE.match("<strong>Keywords:</strong> a, b")
+        assert m1 is not None and (m1.group(1) or m1.group(2)) == "Keywords"
+        # …and colon-outside the bold
+        m2 = _BOLD_LABEL_CAPTURE_RE.match("<strong>Keywords</strong>: a, b")
+        assert m2 is not None and (m2.group(1) or m2.group(2)) == "Keywords"
+        # a bold run with no colon is not a label (left in the body)
+        assert _BOLD_LABEL_CAPTURE_RE.match("<strong>Important</strong> note") is None

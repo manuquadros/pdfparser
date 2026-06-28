@@ -80,8 +80,19 @@ _ARTICLE_HEADING_RE = re.compile(
 # neither one of these nor a document-type label is treated as front matter,
 # so the boundary doesn't depend on the body's opening section being literally
 # named "Introduction" (it may be "Background", numbered, non-English, etc.).
-_FRONTMATTER_HEADING_LABELS = frozenset(
-    {"abbreviations", "keywords", "key words", "nomenclature"}
+# A glossary the journal prints as a column-bottom footnote on the first page —
+# "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
+# mid-section, where it splits the surrounding paragraph in two; the pre-classify
+# stray sweep relocates it (before the paragraph merge) so the prose rejoins.
+# Keywords is excluded *here*: it doubles as the abstract terminator the classifier
+# reads, so removing it pre-classify leaks the following prose into the abstract;
+# a stranded keyword line is instead relocated post-classify in
+# ``_extract_front_matter`` (see ``_is_inline_frontmatter_label``).
+_GLOSSARY_METADATA_LABELS = frozenset({"abbreviations", "nomenclature"})
+# Front-matter section labels recognised as headings: the glossary labels plus the
+# keyword labels, derived so _GLOSSARY_METADATA_LABELS provably stays a subset.
+_FRONTMATTER_HEADING_LABELS = _GLOSSARY_METADATA_LABELS | frozenset(
+    {"keywords", "key words"}
 )
 _SECTION_NUMBER_RE = re.compile(r"^\d+(?:[.)]\d*)*[.)]?\s+")
 # A plain <p> is positively front matter when it carries a metadata label
@@ -188,6 +199,13 @@ _FOOTNOTE_MARKER_CHARS = "*†‡§¶"
 # length bound rejects a long prose run that happens to contain two.
 _STRAY_METADATA_MAX_LEN = 400
 _STRAY_METADATA_MIN_TOKENS = 2
+# Publication-metadata headings that are bare banners, not label:value pairs:
+# "OPEN ACCESS" carries no value paragraph (unlike "Citation"/"Editor"/…).  The
+# value-capture clause in _extract_named_metadata_sections grabs the paragraph
+# *directly* under any other label heading; for a banner it would swallow whatever
+# body prose happens to follow, so a banner relocates on its own and never claims a
+# trailing paragraph.  (Frontiers prints it atop its first-page sidebar.)
+_PUBLICATION_BANNER_LABELS = frozenset({"open access"})
 # A first-page metadata sidebar — the "Citation / Editor / Received / … / Competing
 # interests" block PLOS and many open-access journals print beside the abstract —
 # is OCR'd into the body away from the leading front-matter run, each entry a bold
@@ -196,7 +214,10 @@ _STRAY_METADATA_MIN_TOKENS = 2
 # these are recognised by a fixed vocabulary of publishing-process labels rather
 # than by the bold-label shape alone.  The label is decisive evidence, so a matched
 # line is relocated regardless of length (a Copyright/Funding statement runs long).
-_PUBLICATION_METADATA_LABELS = frozenset(
+# Derived as the banner(s) | the label:value labels, so _PUBLICATION_BANNER_LABELS
+# provably stays a subset; "specialty section" is Frontiers' sidebar routing line
+# (among Edited by / Reviewed by / Correspondence / Citation), furniture not body.
+_PUBLICATION_METADATA_LABELS = _PUBLICATION_BANNER_LABELS | frozenset(
     {
         "citation",
         "editor",
@@ -214,21 +235,9 @@ _PUBLICATION_METADATA_LABELS = frozenset(
         "conflict of interest",
         "conflicts of interest",
         "provenance and peer review",
-        # Frontiers prints an "OPEN ACCESS" banner heading atop its first-page
-        # sidebar, with a "Specialty section:" routing line among the Edited
-        # by / Reviewed by / Correspondence / Citation entries — sidebar
-        # furniture, not body text.
-        "open access",
         "specialty section",
     }
 )
-# Publication-metadata headings that are bare banners, not label:value pairs:
-# "OPEN ACCESS" carries no value paragraph (unlike "Citation"/"Editor"/…).  The
-# value-capture clause in _extract_named_metadata_sections grabs the paragraph
-# *directly* under any other label heading; for a banner it would swallow whatever
-# body prose happens to follow, so a banner relocates on its own and never claims a
-# trailing paragraph.
-_PUBLICATION_BANNER_LABELS = frozenset({"open access"})
 # A publication banner the OCR bolds at the very start of a paragraph
 # ("**OPEN ACCESS**" — sometimes its own block, sometimes glued onto the front of
 # the abstract beneath it).  It carries no content (unlike the Frontiers heading
@@ -240,22 +249,18 @@ _LEADING_BANNER_RE = re.compile(
     + r")\s*</strong>\s*",
     re.IGNORECASE,
 )
-# Captures a bold label's name with the colon inside *or* outside the bold
-# ("<strong>Keywords:</strong>" vs "<strong>Keywords</strong>:") — OCR emits both
-# shapes for the same label, and matching colon-inside only stranded the
-# colon-outside keyword line in the body instead of relocating it to the panel.
+# Matches — and captures the name of — a leading bold label with the colon inside
+# *or* outside the bold ("<strong>Keywords:</strong>" vs "<strong>Keywords</strong>:"):
+# OCR emits both shapes for the same label, and matching colon-inside only stranded
+# the colon-outside keyword line in the body instead of relocating it to the panel.
+# This is the *single* either-colon matcher — every leading-bold-label check
+# (the metadata/glossary/front-matter predicates via ``_bold_label_in``, and the
+# abstract terminator) goes through it, so the colon convention has one home.  Distinct
+# from ``text._BOLD_LABEL_RE`` (colon-inside only), which stays stricter for the
+# merge/furniture guards that must not treat a colon-outside run as a label.
 _BOLD_LABEL_CAPTURE_RE = re.compile(
     r"^<strong>([^<]+):</strong>|^<strong>([^<]+)</strong>\s*:"
 )
-# A glossary the journal prints as a column-bottom footnote on the first page —
-# "**Abbreviations:** ACT, …" / "**Nomenclature:** …".  OCR drops it inline,
-# mid-section, where it splits the surrounding paragraph in two; the pre-classify
-# stray sweep relocates it (before the paragraph merge) so the prose rejoins.
-# Keywords is excluded *here*: it doubles as the abstract terminator the classifier
-# reads, so removing it pre-classify leaks the following prose into the abstract;
-# a stranded keyword line is instead relocated post-classify in
-# ``_extract_front_matter`` (see ``_is_inline_frontmatter_label``).
-_GLOSSARY_METADATA_LABELS = frozenset({"abbreviations", "nomenclature"})
 # Front matter is hidden in a collapsed panel, so misclassifying body prose as
 # front matter makes it invisible.  A real prose paragraph under a metadata
 # section is recognised by length + a sentence ending, and breaks the run.
@@ -285,13 +290,6 @@ _INLINE_ABSTRACT_RE = re.compile(
 _ABSTRACT_CITATION_TAIL_RE = re.compile(
     r"^(<p[^>]*>)(.*)(\s*©\s*\d{4}\b.*?)(</p>)\s*$",
     re.IGNORECASE | re.DOTALL,
-)
-# A paragraph opening with a bold label, with the colon inside or outside the bold
-# ("<strong>Keywords:</strong>" / "<strong>KEYWORDS</strong>:").  Broader than
-# text._BOLD_LABEL_RE (colon-inside only); used to end the abstract so a
-# colon-outside label following an inline abstract is not absorbed as abstract prose.
-_BOLD_LABEL_EITHER_COLON_RE = re.compile(
-    r"^<strong>[^<]+:</strong>|^<strong>[^<]+</strong>\s*:"
 )
 # Affiliation / corresponding-author markers that accompany author names:
 # superscript digits (¹²³, ⁰⁴–⁹), a <sup>, or footnote symbols.  The digit class is
@@ -547,7 +545,7 @@ def _classify_paragraph(state: _ClassifyState, part: str) -> None:
         _open_inline_abstract(state, inner_p[m.end() :].lstrip())
         return
     if state.in_abstract:
-        if inner_p is not None and not _BOLD_LABEL_EITHER_COLON_RE.match(inner_p):
+        if inner_p is not None and not _BOLD_LABEL_CAPTURE_RE.match(inner_p):
             state.abstract.append(part)
             return
         state.in_abstract = False
