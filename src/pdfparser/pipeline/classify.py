@@ -1083,8 +1083,8 @@ def _restore_equal_contribution_marker(part: str, marker: str | None) -> str:
     if inner is None:
         return part
     plain = _visible_text(inner)
-    if not _EQUAL_CONTRIBUTION_RE.search(plain) or plain.lstrip()[:1] in (
-        _FOOTNOTE_MARKER_CHARS
+    if not _EQUAL_CONTRIBUTION_RE.search(plain) or (
+        (h := plain.lstrip()) and h[0] in _FOOTNOTE_MARKER_CHARS
     ):
         return part
     return f"<p>{marker}{inner}</p>"

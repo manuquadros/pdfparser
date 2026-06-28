@@ -360,8 +360,8 @@ def _region_fully_captured(
     proven completeness, never an opt-out on absence of evidence.  This is
     deliberately strict: the cross-fixture data shows the located bbox pulls in body
     prose, so a loose threshold cannot separate a genuine drop (often a single
-    token) from that prose noise; only the zero-missing case is safe to skip (see
-    optimize-pipeline-performance.md §2)."""
+    token) from that prose noise; only the zero-missing case is safe to skip (the
+    text-layer coverage gate."""
     distinctive = [
         t for t in _in_bbox_tokens(bbox, page_norm, centers) if _is_distinctive(t)
     ]

@@ -1020,7 +1020,7 @@ class TestTextLayerTableRepair:
     """A two-column stats table the OCR mangles (drops the empty header cell, shifting
     the first rows off by one and losing a value; truncates the tail) is rebuilt from
     the deterministic PDF text layer, keeping the OCR's cell formatting by match
-    (plans/render-review-fixes.md §2 — the 31298526 Table 2)."""
+    (the 31298526 Table 2; see the codebase-review Done log)."""
 
     @staticmethod
     def _glyphs(text: str, x0: float, y: float, cw: float = 5.0, gh: float = 8.0):

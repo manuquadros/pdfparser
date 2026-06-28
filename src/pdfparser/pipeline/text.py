@@ -98,7 +98,8 @@ def _ends_sentence(inner: str) -> bool:
     ("…humans.<sup>15–18</sup>", "…software.³²")."""
     html = _TRAILING_SUP_CITATION_RE.sub("", inner.rstrip())
     visible = _TRAILING_UNICODE_SUP_CITATION_RE.sub("", _visible_text(html).rstrip())
-    return bool(_SENTENCE_END_RE.search(visible.rstrip()))
+    # _SENTENCE_END_RE tolerates a trailing-whitespace tail (\s*$), so no re-strip.
+    return bool(_SENTENCE_END_RE.search(visible))
 
 
 def _plain_p_text(s: str) -> str | None:
@@ -108,7 +109,7 @@ def _plain_p_text(s: str) -> str | None:
     (reference lists), headings, tables, figures, and any other element.
     """
     if s.startswith("<p>") and s.endswith("</p>") and s.count("</p>") == 1:
-        return s[3:-4]
+        return s.removeprefix("<p>").removesuffix("</p>")
     return None
 
 

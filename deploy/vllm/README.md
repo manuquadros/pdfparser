@@ -3,8 +3,7 @@
 Runs `lightonai/LightOnOCR-2-1B-bbox` under vLLM as an OpenAI-compatible
 server, in a rootless podman container. All GPU/torch work lives in vLLM;
 `pdfparser` itself carries no torch or transformers — its model seam
-(`pipeline/model.py`) is a thin HTTP client that talks to this server (see
-`plans/optimize-pipeline-performance.md` §4 and `spike_results/vllm_determinism.md`).
+(`pipeline/model.py`) is a thin HTTP client that talks to this server.
 
 The server stays up and keeps the model resident, so each document pays the
 HTTP round-trip, not a ~35 s model reload.

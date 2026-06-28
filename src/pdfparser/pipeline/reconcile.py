@@ -28,6 +28,7 @@ import pypdfium2 as pdfium
 
 from pdfparser.pipeline.layers import _DocumentLayers
 from pdfparser.pipeline.text import (
+    _STRIP_TAGS_RE,
     _TABLE_TAG_RE,
     _looks_like_figure_caption,
     _split_md_blocks,
@@ -47,7 +48,6 @@ _MIN_ALPHA_RATIO = 0.55
 # A line recurring on at least this many pages is running furniture.
 _FURNITURE_MIN_PAGES = 3
 
-_TAG_RE = re.compile(r"<[^>]+>")
 _IMG_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)[\d,]*")
 _MD_RE = re.compile(r"[*_`#>|]+")
 _DASH_RE = re.compile(r"[‐-―−]")
@@ -85,7 +85,7 @@ def _norm(s: str) -> str:
     """Normalize OCR markdown (or a furniture line) for anchor matching."""
     s = unicodedata.normalize("NFKC", s)
     s = _IMG_RE.sub(" ", s)
-    s = _TAG_RE.sub(" ", s)
+    s = _STRIP_TAGS_RE.sub(" ", s)
     s = _MD_RE.sub(" ", s)
     s = _DASH_RE.sub("-", s)
     return _WS_RE.sub(" ", s).strip()
