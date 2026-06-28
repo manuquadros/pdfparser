@@ -1732,7 +1732,9 @@ class TestDegenerateInputs:
 
         # the bbox grammar is unsigned, so a negative coordinate is simply "not a
         # figure placeholder" rather than a crash or a bogus negative box
-        assert _parse_figure_placeholder("![image](i.png)-5,0,100,100") is None
+        assert not _parse_figure_placeholder(
+            "![image](i.png)-5,0,100,100"
+        ).is_placeholder
 
     def test_out_of_bounds_placeholder_assembles_without_crash(self) -> None:
         md = "# T\n\n![image](i.png)0,0,1500,1500\n\n## Abstract\n\nThe abstract."

@@ -23,6 +23,7 @@ import io
 import logging
 import re
 from collections.abc import Callable  # noqa: TC003 — beartype reads annotations
+from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtime
 
 import numpy as np
@@ -133,19 +134,33 @@ _FIGURE_NOTE_RE = re.compile(r"doi\.org|https?://", re.IGNORECASE)
 _FIGURE_MERGE_GAP_FRAC = 0.03  # of page height
 
 
-def _parse_figure_placeholder(line: str) -> tuple[int, int, int, int] | None | bool:
+@dataclass(frozen=True)
+class _FigurePlaceholder:
+    """The classification of a markdown line as a figure placeholder.
+
+    ``is_placeholder`` is ``False`` only when the line is not a placeholder at all.
+    ``bbox_norm`` is the ``[0, 1000]``-normalized ``(x0, y0, x1, y1)`` crop box, or
+    ``None`` for a bbox-less placeholder (the base-variant fallback).
+    """
+
+    is_placeholder: bool
+    bbox_norm: tuple[int, int, int, int] | None
+
+
+def _parse_figure_placeholder(line: str) -> _FigurePlaceholder:
     """Classify a single markdown line as a figure placeholder.
 
-    Returns the ``(x0, y0, x1, y1)`` crop box (normalized to ``[0, 1000]``) when
-    present, ``True`` for a bbox-less placeholder (base-variant fallback), or
-    ``None`` when the line is not a figure placeholder at all.
+    Returns the crop box when the placeholder carries one, a bbox-less result for
+    the base-variant fallback, or a non-placeholder result when the line is not a
+    figure placeholder at all.
     """
     m = _FIGURE_PLACEHOLDER_RE.match(line.strip())
     if m is None:
-        return None
+        return _FigurePlaceholder(False, None)
     if m.group(1) is None:
-        return True
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        return _FigurePlaceholder(True, None)
+    bbox = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+    return _FigurePlaceholder(True, bbox)
 
 
 def _is_bare_figure_label(block: str) -> bool:

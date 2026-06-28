@@ -141,7 +141,9 @@ _Block = _MdBlock | _FigBlock
 def _starts_figure(block: str) -> bool:
     """True when ``block``'s first line is a figure placeholder."""
     block = block.strip()
-    return bool(block) and _parse_figure_placeholder(block.splitlines()[0]) is not None
+    return (
+        bool(block) and _parse_figure_placeholder(block.splitlines()[0]).is_placeholder
+    )
 
 
 # A caption's final clause: the run after its last sentence terminator, with no
@@ -199,7 +201,7 @@ def _is_caption_continuation(block: str) -> bool:
         if (
             s.startswith(("#", "|"))
             or _TABLE_TAG_RE.match(s)
-            or _parse_figure_placeholder(s)
+            or _parse_figure_placeholder(s).is_placeholder
         ):
             return False
     return not _opens_with_caption_label(block)
@@ -263,7 +265,7 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         block = raw_blocks[k].strip()
         lines = block.splitlines()
         fig = _parse_figure_placeholder(lines[0]) if lines else None
-        if fig is None:
+        if fig is None or not fig.is_placeholder:
             next_is_fig = k + 1 < len(raw_blocks) and _starts_figure(raw_blocks[k + 1])
             prev_is_fig = bool(blocks) and isinstance(blocks[-1], _FigBlock)
             if _is_panel_label(block) and (next_is_fig or prev_is_fig):
@@ -325,7 +327,7 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         # repeated inside the figcaption (the real heading still follows as its block).
         if caption is not None and k + 1 < len(raw_blocks):
             caption = _strip_trailing_heading_echo(caption, raw_blocks[k + 1])
-        blocks.append(_FigBlock(fig if isinstance(fig, tuple) else None, caption))
+        blocks.append(_FigBlock(fig.bbox_norm, caption))
         k += 1
     return blocks
 

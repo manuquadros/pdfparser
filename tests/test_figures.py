@@ -1108,35 +1108,33 @@ class TestParseFigurePlaceholder:
     def test_box_extracted(self) -> None:
         from pdfparser.pipeline.figures import _parse_figure_placeholder
 
-        assert _parse_figure_placeholder("![image](image_1.png)122,89,877,614") == (
-            122,
-            89,
-            877,
-            614,
-        )
+        result = _parse_figure_placeholder("![image](image_1.png)122,89,877,614")
+        assert result.is_placeholder
+        assert result.bbox_norm == (122, 89, 877, 614)
 
     def test_box_with_surrounding_whitespace(self) -> None:
         from pdfparser.pipeline.figures import _parse_figure_placeholder
 
-        assert _parse_figure_placeholder("  ![image](img.png) 10, 20, 30, 40 ") == (
-            10,
-            20,
-            30,
-            40,
-        )
+        result = _parse_figure_placeholder("  ![image](img.png) 10, 20, 30, 40 ")
+        assert result.is_placeholder
+        assert result.bbox_norm == (10, 20, 30, 40)
 
-    def test_bboxless_placeholder_returns_true(self) -> None:
+    def test_bboxless_placeholder_is_placeholder_without_bbox(self) -> None:
         from pdfparser.pipeline.figures import _parse_figure_placeholder
 
-        assert _parse_figure_placeholder("![image](image_1.png)") is True
+        result = _parse_figure_placeholder("![image](image_1.png)")
+        assert result.is_placeholder
+        assert result.bbox_norm is None
 
     def test_caption_line_is_not_a_placeholder(self) -> None:
         from pdfparser.pipeline.figures import _parse_figure_placeholder
 
-        assert _parse_figure_placeholder("FIG. 2 Protein alignments of TRI.") is None
+        result = _parse_figure_placeholder("FIG. 2 Protein alignments of TRI.")
+        assert not result.is_placeholder
+        assert result.bbox_norm is None
 
     def test_inline_image_in_prose_is_not_a_placeholder(self) -> None:
         from pdfparser.pipeline.figures import _parse_figure_placeholder
 
         line = "Some prose with ![inline](x.png) embedded mid-sentence."
-        assert _parse_figure_placeholder(line) is None
+        assert not _parse_figure_placeholder(line).is_placeholder
