@@ -43,6 +43,7 @@ from pdfparser.pipeline.tables.rebuild import (
     _repair_page_tables,
     _repair_tables_from_text_layer,
     _rows_to_cells,
+    _trim_rows_below_table,
 )
 from pdfparser.pipeline.tables.recover import (
     _crop_trailing,
@@ -77,5 +78,6 @@ __all__ = [
     "_rows_to_cells",
     "_scaled_crop",
     "_table_regions",
+    "_trim_rows_below_table",
     "_union",
 ]

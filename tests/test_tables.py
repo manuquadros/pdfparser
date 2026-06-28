@@ -1063,6 +1063,56 @@ class TestTextLayerTableRepair:
         # the long value-less footnote (below the data) stops the table
         assert not any("footnote" in lab for lab, _ in cells)
 
+    def test_trim_rows_below_table_drops_body_prose(self) -> None:
+        # The column glyph filter has only a top bound, so on a 2-column page it sweeps
+        # body prose below the table into the rows; the gap-to-prose trim must cut at
+        # the wider margin so the prose can't inflate the rebuild past the OCR table
+        # and win the substitution gate with a wrong table.
+        from pdfparser.pipeline.tables import (
+            _group_glyph_rows,
+            _trim_rows_below_table,
+        )
+
+        glyphs = (
+            self._glyphs("PDB code", 10, 200)
+            + self._glyphs("6JX2", 80, 200)
+            + self._glyphs("wavelength", 10, 188)
+            + self._glyphs("0.97934", 80, 188)
+            + self._glyphs("space group", 10, 176)
+            + self._glyphs("P212121", 80, 176)
+            + self._glyphs("redundancy", 10, 164)
+            + self._glyphs("4.2", 80, 164)
+            # body prose far below the table (gap 44 ≫ 1.5 × the 12-pt row spacing)
+            + self._glyphs("The following paragraph discusses the structure", 10, 120)
+            + self._glyphs("and continues with more body prose here", 10, 108)
+        )
+        rows = _group_glyph_rows(glyphs)
+        seeds = [(10.0, 164.0, 200.0, 200.0)]  # spans the four data rows
+        trimmed = _trim_rows_below_table(rows, seeds)
+        assert len(trimmed) == 4
+        flat = " ".join(g[0] for row in trimmed for g in row)
+        assert "paragraph" not in flat and "prose" not in flat
+
+    def test_trim_rows_below_table_keeps_contiguous_rows(self) -> None:
+        # No wide gap → nothing is body prose → every row is kept (a trailing data row
+        # the anchors did not cover must still survive the trim).
+        from pdfparser.pipeline.tables import (
+            _group_glyph_rows,
+            _trim_rows_below_table,
+        )
+
+        glyphs = (
+            self._glyphs("PDB code", 10, 200)
+            + self._glyphs("6JX2", 80, 200)
+            + self._glyphs("wavelength", 10, 188)
+            + self._glyphs("0.97934", 80, 188)
+            + self._glyphs("bond lengths", 10, 176)  # trailing row, no seed
+            + self._glyphs("0.011", 80, 176)
+        )
+        rows = _group_glyph_rows(glyphs)
+        seeds = [(10.0, 188.0, 200.0, 200.0)]  # only the top two rows are seeded
+        assert len(_trim_rows_below_table(rows, seeds)) == 3
+
     def test_format_cell_recovers_ocr_subscripts(self) -> None:
         from pdfparser.pipeline.tables import _cell_format_map, _format_cell
 

@@ -15,8 +15,13 @@ from __future__ import annotations
 import html
 import re
 
-from pdfparser.pipeline.layers import _DocumentLayers, _normalize, _PageLayer
-from pdfparser.pipeline.tables.localize import _anchor_texts, _collect_seeds
+from pdfparser.pipeline.layers import _Box, _DocumentLayers, _normalize, _PageLayer
+from pdfparser.pipeline.tables.localize import (
+    _GAP_FACTOR,
+    _anchor_texts,
+    _collect_seeds,
+    _median,
+)
 from pdfparser.pipeline.tables.markup import (
     _CELL_RE,
     _COLSPAN_RE,
@@ -69,6 +74,31 @@ def _group_glyph_rows(glyphs: list[_Glyph]) -> list[list[_Glyph]]:
             rows.append([g])
             anchors.append(g[3])
     return [sorted(row, key=lambda g: g[1]) for row in rows]
+
+
+def _trim_rows_below_table(
+    rows: list[list[_Glyph]], seeds: list[_Box]
+) -> list[list[_Glyph]]:
+    """Drop the body-prose rows the unbounded column sweep collected below the table.
+
+    The glyph filter has only a top bound (the seeds' top), so it runs to page bottom;
+    a 2-column page's body prose below the table would then be swept in as extra rows,
+    inflating the rebuild past the OCR table and winning the row-count substitution
+    gate with a wrong table.  Grow down from the lowest seed row while the inter-row
+    gap stays within ``_GAP_FACTOR`` of the table's own line spacing — the same
+    gap-to-prose rule ``_locate_bbox`` uses — and cut at the wider margin to the
+    following prose."""
+    if len(rows) < 2 or not seeds:
+        return rows
+    ys = [sum(g[3] for g in row) / len(row) for row in rows]
+    gaps = [ys[i] - ys[i + 1] for i in range(len(rows) - 1)]
+    seed_lo = min((s[1] + s[3]) / 2 for s in seeds)
+    hi = max((i for i, y in enumerate(ys) if y >= seed_lo), default=0)
+    spacing = _median(gaps[:hi]) if hi else _median(gaps)
+    threshold = spacing * _GAP_FACTOR
+    while hi < len(rows) - 1 and gaps[hi] <= threshold:
+        hi += 1
+    return rows[: hi + 1]
 
 
 def _rows_to_cells(rows: list[list[_Glyph]]) -> list[tuple[str, str]]:
@@ -189,13 +219,14 @@ def _reconstruct_table_from_text_layer(
         and col_left <= (b[0] + b[2]) / 2 <= col_right
         and (b[1] + b[3]) / 2 <= y_top
     ]
+    rows = _trim_rows_below_table(_group_glyph_rows(glyphs), seeds)
     caption_rows, caption_text = _leading_caption_rows(table_html)
     # Drop the wrapped title fragments the wide centered caption leaves in the column,
     # but only *above* the table body — a value-less row mid-table is a real divider
     # whose label can legitimately be a substring of the caption (e.g. "Refinement").
     cells: list[tuple[str, str]] = []
     seen_data = False
-    for label, value in _rows_to_cells(_group_glyph_rows(glyphs)):
+    for label, value in _rows_to_cells(rows):
         seen_data = seen_data or bool(value)
         if (
             not seen_data
