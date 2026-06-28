@@ -660,15 +660,19 @@ def _assemble_html(
         stray_metadata, per_page_parts[0] = _extract_stray_metadata(per_page_parts[0])
 
     parts = [part for page in per_page_parts for part in page]
-    parts = _join_split_table_caption_labels(parts)
-    # Re-fuse a composite table the model split into per-panel <table>s before caption
-    # colocation, so the single "Table N …" caption attaches to the merged table.
-    parts = _merge_split_panel_tables(parts)
-    parts = _colocate_table_captions(parts)
-    # Before classify so a table's footnotes stay with it rather than being swept
-    # into the article footnote section, and before merge so the table is a
-    # single float the cross-table paragraph merge can step over.
-    parts = _colocate_table_footnotes(parts)
+    # Uniform table-cleanup passes (each list[str] -> list[str]), in a load-bearing
+    # order: panel-fusion must precede caption colocation so the single "Table N …"
+    # caption attaches to the *merged* table; footnote colocation must precede both
+    # classify (so a table's footnotes stay with it rather than being swept into the
+    # article footnote run) and the paragraph merge (so the table is one float the
+    # cross-table merge steps over).
+    for cleanup in (
+        _join_split_table_caption_labels,
+        _merge_split_panel_tables,
+        _colocate_table_captions,
+        _colocate_table_footnotes,
+    ):
+        parts = cleanup(parts)
 
     meta = _classify_parts(parts)
 
