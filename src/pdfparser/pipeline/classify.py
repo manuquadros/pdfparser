@@ -17,6 +17,7 @@ from pdfparser.pipeline.furniture import _is_degenerate_repetition
 from pdfparser.pipeline.text import (
     _BOLD_LABEL_RE,
     _SENTENCE_END_RE,
+    _SUP_DIGITS,
     _ends_sentence,
     _heading_inner,
     _plain_p_text,
@@ -38,7 +39,9 @@ _SUP_MARKER_RE = re.compile(r"^<sup>[^<]{1,3}</sup>")
 # whitespace or non-uppercase content.  It shares its leading class with affiliation
 # lines ("¹ Department of …"), so it is only consulted in the body — see
 # ``seen_body_heading`` in ``_classify_parts`` — never on the first-page affiliations.
-_UNICODE_SUP_MARKER_RE = re.compile(r"^[¹²³⁰⁴-⁹]{1,3}(?![¹²³⁰⁴-⁹])(?:\s+|(?![A-Z]))\S")
+_UNICODE_SUP_MARKER_RE = re.compile(
+    rf"^[{_SUP_DIGITS}]{{1,3}}(?![{_SUP_DIGITS}])(?:\s+|(?![A-Z]))\S"
+)
 _DOCUMENT_TYPE_LABELS = frozenset(
     {
         "abstract",
@@ -98,10 +101,8 @@ _SECTION_NUMBER_RE = re.compile(r"^\d+(?:[.)]\d*)*[.)]?\s+")
 # A plain <p> is positively front matter when it carries a metadata label
 # ("Keywords:", reuses _BOLD_LABEL_RE), opens with an affiliation/footnote
 # superscript marker, or is a submission/correspondence/copyright line.
-# Superscript-digit class is the canonical [¹²³⁰⁴-⁹] (¹²³ are Latin-1, ⁰⁴-⁹ are
-# U+2070/2074-2079) + footnote symbols — NOT [⁰-ⁿ], which spills past the digits
-# into ⁱⁿ⁺⁻⁼⁽⁾ and unassigned codepoints (see the digit-class gotcha in CLAUDE.md).
-_LEADING_SUP_RE = re.compile(r"^[¹²³⁰⁴-⁹*†‡§]")
+# `_SUP_DIGITS` (the canonical class, see text.py) + footnote symbols.
+_LEADING_SUP_RE = re.compile(rf"^[{_SUP_DIGITS}*†‡§]")
 _FRONTMATTER_TEXT_RE = re.compile(
     r"^(?:received|accepted|published|revised|doi|https?://|©|copyright|e-?mail|"
     r"(?:address\s+for\s+)?correspond(?:ence|ing\s+author))\b",
@@ -292,9 +293,8 @@ _ABSTRACT_CITATION_TAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 # Affiliation / corresponding-author markers that accompany author names:
-# superscript digits (¹²³, ⁰⁴–⁹), a <sup>, or footnote symbols.  The digit class is
-# the canonical [¹²³⁰⁴-⁹], not [⁰-ⁿ] (which over-matches ⁱⁿ⁺⁻⁼⁽⁾ — see CLAUDE.md).
-_AUTHOR_MARKER_RE = re.compile(r"<sup>|[¹²³⁰⁴-⁹*†‡§]")
+# superscript digits (`_SUP_DIGITS`, see text.py), a <sup>, or footnote symbols.
+_AUTHOR_MARKER_RE = re.compile(rf"<sup>|[{_SUP_DIGITS}*†‡§]")
 # A comma / "and" / ";"-separated author segment: a short, capitalized,
 # digit-free name.
 _NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")

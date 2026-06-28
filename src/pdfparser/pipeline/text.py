@@ -11,6 +11,13 @@ import re
 
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
+# The canonical superscript-digit class *content* (to interpolate inside ``[…]`` and
+# ``(?!…)``): ``¹²³`` are Latin-1 (U+00B9/B2/B3), ``⁰⁴-⁹`` are U+2070/2074-2079.
+# Deliberately NOT ``⁰-⁹`` (U+2070-2079), which also spans ``ⁱ`` (U+2071) and
+# unassigned codepoints — the documented footgun (see CLAUDE.md).  Shared so the four
+# call sites (here, latex unit runs, classify marker/author patterns) can't drift
+# back into ``⁰-⁹``.
+_SUP_DIGITS = "¹²³⁰⁴-⁹"
 # A trailing citation superscript ("…harmless to humans.<sup>15–18</sup>",
 # "…PyMOL software.³²") hides the sentence-terminal period from the visible-text
 # end test, so a finished paragraph looks like an unterminated fragment that the
@@ -20,7 +27,7 @@ _SENTENCE_END_RE = re.compile(r"[.!?;:]\s*$")
 # ("Mg²⁺", "³⁵S") ends in a non-digit superscript, so the digit-anchored patterns
 # leave it untouched.
 _TRAILING_SUP_CITATION_RE = re.compile(r"(?:\s*<sup>[\d\s,–—-]+</sup>)+\s*$")
-_TRAILING_UNICODE_SUP_CITATION_RE = re.compile(r"[¹²³⁰⁴-⁹]+\s*$")
+_TRAILING_UNICODE_SUP_CITATION_RE = re.compile(rf"[{_SUP_DIGITS}]+\s*$")
 # Paragraphs that open with a bold label ("Keywords:", "Abbreviations:", "Note:")
 # are structured metadata, never mid-sentence continuations.
 _BOLD_LABEL_RE = re.compile(r"^<strong>[^<]+:</strong>")

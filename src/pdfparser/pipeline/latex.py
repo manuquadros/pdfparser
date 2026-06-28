@@ -16,6 +16,8 @@ import re
 
 from pylatexenc.latex2text import LatexNodes2Text  # type: ignore[import-untyped]
 
+from pdfparser.pipeline.text import _SUP_DIGITS
+
 # Unicode superscript forms.  A LaTeX ``$^{…}$`` run is rendered with these
 # glyphs when every character has one (so "NAD$^+$" → "NAD⁺"); otherwise it falls
 # back to an HTML <sup> wrapper so nothing is lost.
@@ -246,7 +248,7 @@ _MATH_VARIABLE_RE = re.compile(r"(?<![A-Za-z])[A-Za-z](?![A-Za-z])")
 # common.
 _UNIT_PREFIX = "°µμ"
 _UNIT_RUN_RE = re.compile(
-    rf"(?<=[0-9¹²³⁰⁴-⁹])\s?[{_UNIT_PREFIX}]?[A-Za-z]+(?:[·/*][A-Za-z]+|[¹²³⁰⁴-⁹])*"
+    rf"(?<=[0-9{_SUP_DIGITS}])\s?[{_UNIT_PREFIX}]?[A-Za-z]+(?:[·/*][A-Za-z]+|[{_SUP_DIGITS}])*"
 )
 
 
