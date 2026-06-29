@@ -526,11 +526,20 @@ def _insert_footnotes_before_refs(body: list[str], footnotes: list[str]) -> list
     list) that precedes the real bibliography can't strand the footnotes mid-body."""
     if not footnotes:
         return body
-    ref_idx = next((i for i, p in enumerate(body) if _REF_HEADING_RE.match(p)), None)
-    if ref_idx is None:
-        ref_idx = next(
-            (i for i, p in enumerate(body) if _REF_SECTION_RE.match(p)), len(body)
-        )
+    heading_idx: int | None = None
+    section_idx: int | None = None
+    for i, p in enumerate(body):
+        if _REF_HEADING_RE.match(p):
+            heading_idx = i
+            break
+        if section_idx is None and _REF_SECTION_RE.match(p):
+            section_idx = i
+    if heading_idx is not None:
+        ref_idx = heading_idx
+    elif section_idx is not None:
+        ref_idx = section_idx
+    else:
+        ref_idx = len(body)
     return body[:ref_idx] + footnotes + body[ref_idx:]
 
 
