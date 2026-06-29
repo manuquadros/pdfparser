@@ -40,7 +40,7 @@ dev = [
 [tool.pdm.scripts]
 to-html = "python -m pdfparser"
 test = "pytest"
-test-cov = "pytest --cov=src/pdfparser --cov-report=term-missing"
+test-cov = "pytest --cov=pdfparser --cov-report=term-missing"
 lint = "ruff check ."
 fmt = "ruff format ."
 fmt-check = "ruff format --check ."
