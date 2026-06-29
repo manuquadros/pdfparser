@@ -1173,3 +1173,96 @@ class TestParseFigurePlaceholder:
 
         line = "Some prose with ![inline](x.png) embedded mid-sentence."
         assert not _parse_figure_placeholder(line).is_placeholder
+
+
+class TestFigureRecoveryOrchestration:
+    """``_recover_dropped_figures`` enumerates the text-layer figure numbers the OCR
+    never emitted, localizes and re-OCRs each on its page, and splices the recovered
+    placeholder back.  Driven against a real fixture's text layer with a fake
+    ``ocr_region`` so no GPU/server is needed — only the injected re-OCR is faked; the
+    caption localization and crop render are pure CPU."""
+
+    _FIXTURE = Path(__file__).parent / "fixtures" / "30592559.pdf"  # figs 1–4, no ad
+
+    def test_textlayer_caption_pages_maps_numbers_to_pages(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.recover_figures import _textlayer_caption_pages
+
+        with _DocumentLayers.open(self._FIXTURE) as layers:
+            truth = _textlayer_caption_pages(layers.pdf)
+        assert set(truth) == {1, 2, 3, 4}
+        assert all(ps and ps == sorted(set(ps)) for ps in truth.values())
+
+    def test_missing_figures_are_localized_and_spliced(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.recover_figures import _recover_dropped_figures
+
+        calls: list[int] = []
+
+        def fake_ocr_region(image: Image.Image) -> str:
+            calls.append(1)
+            return (
+                "![image](image_1.png)120,120,880,880"
+                "\n\nFigure 1. Recovered legend title."
+            )
+
+        with _DocumentLayers.open(self._FIXTURE) as layers:
+            # Nothing emitted -> every text-layer figure (1–4) is "missing".
+            pages = [""] * len(layers.pdf)
+            out = _recover_dropped_figures(layers, pages, fake_ocr_region)
+
+        joined = "\n".join(out)
+        assert len(calls) == 4  # one re-OCR per missing figure (not batched)
+        assert joined.count("![image]") == 4  # all four recovered and spliced back
+        assert "Recovered legend title" in joined  # figure 1's caption matched + kept
+
+    def test_no_ocr_when_every_figure_already_emitted(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.recover_figures import _recover_dropped_figures
+
+        calls: list[int] = []
+
+        def fake_ocr_region(image: Image.Image) -> str:
+            calls.append(1)
+            return ""
+
+        emitted = ["Figure 1. A\n\nFigure 2. B\n\nFigure 3. C\n\nFigure 4. D"]
+        with _DocumentLayers.open(self._FIXTURE) as layers:
+            out = _recover_dropped_figures(layers, emitted, fake_ocr_region)
+        assert out == emitted  # no gap between text-layer and emitted -> untouched
+        assert calls == []  # ...and not a single re-OCR
+
+    def test_attempt_declines_before_ocr_when_caption_not_on_page(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.recover_figures import _attempt_page_figure
+
+        calls: list[int] = []
+
+        def fake_ocr_region(image: Image.Image) -> str:
+            calls.append(1)
+            return "![image](image_1.png)0,0,1000,1000"
+
+        with _DocumentLayers.open(self._FIXTURE) as layers:
+            # Figure 999 has no caption label anywhere -> no crop box -> declined.
+            result = _attempt_page_figure(layers, 0, 999, fake_ocr_region, "")
+        assert result is None
+        assert calls == []  # localization fails first, so the re-OCR is never reached
+
+    def test_candidate_reocring_to_no_placeholder_injects_no_figure(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.recover_figures import _recover_dropped_figures
+
+        calls: list[int] = []
+
+        def fake_ocr_region(image: Image.Image) -> str:
+            calls.append(1)
+            return "Prose the crop caught, but no image placeholder came back."
+
+        with _DocumentLayers.open(self._FIXTURE) as layers:
+            pages = [""] * len(layers.pdf)
+            out = _recover_dropped_figures(layers, pages, fake_ocr_region)
+
+        # Candidates were localized and re-OCR'd, but none returned a placeholder — so
+        # the module's safety contract holds: a spurious candidate injects no figure.
+        assert calls  # the crops were attempted
+        assert "![image]" not in "\n".join(out)

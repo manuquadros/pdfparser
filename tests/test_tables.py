@@ -1530,3 +1530,221 @@ class TestTableCellBold:
             assert f"<strong>{row}</strong>" in out
         assert "<strong>0.9795" not in out  # a plain data value is not bolded
         assert "<strong>Resolution" not in out  # normal-weight, appears twice
+
+
+class TestTableReocrApply:
+    """``_apply_page_results`` splices a region's batched re-OCR back into the page,
+    but only when the crop came back at least as rich — the substitution gate that
+    stops a worse (or empty) re-OCR from degrading a table the full-page pass got
+    right.  Pure markdown work: a ``_RegionPlan`` is built directly with a blank crop,
+    so no PDF or localization is needed."""
+
+    _ORIG = (
+        "<table><tr><td>Sample</td><td>Value</td></tr>"
+        "<tr><td>A</td><td>1</td></tr></table>"  # 4 non-empty cells
+    )
+    _RICHER = (
+        "<table><tr><th>Sample</th><th>Low</th><th>High</th></tr>"
+        "<tr><td>A</td><td>1</td><td>2</td></tr>"
+        "<tr><td>B</td><td>3</td><td>4</td></tr></table>"  # 9 cells
+    )
+    _SPARSER = "<table><tr><td>A</td></tr></table>"  # 1 cell
+
+    def _plan(self, md: str):
+        from PIL import Image
+
+        from pdfparser.pipeline.tables.recover import _RegionPlan
+
+        start = md.index(self._ORIG)
+        return _RegionPlan(
+            start, start + len(self._ORIG), [self._ORIG], Image.new("RGB", (10, 10))
+        )
+
+    def test_richer_reocr_replaces_original(self) -> None:
+        from pdfparser.pipeline.tables.recover import _apply_page_results
+
+        md = f"Intro paragraph.\n\n{self._ORIG}\n\nTrailing body paragraph."
+        out = _apply_page_results(md, [(self._plan(md), self._RICHER)])
+        assert "<th>High</th>" in out  # the richer crop's structure replaced the orig
+        assert self._ORIG not in out
+        assert "Intro paragraph." in out and "Trailing body paragraph." in out
+
+    def test_sparser_reocr_keeps_original(self) -> None:
+        from pdfparser.pipeline.tables.recover import _apply_page_results
+
+        md = f"Intro paragraph.\n\n{self._ORIG}\n\nTrailing body paragraph."
+        # Fewer non-empty cells than the original -> the full-page table is kept.
+        assert _apply_page_results(md, [(self._plan(md), self._SPARSER)]) == md
+
+    def test_reocr_without_a_table_keeps_original(self) -> None:
+        from pdfparser.pipeline.tables.recover import _apply_page_results
+
+        md = f"Intro paragraph.\n\n{self._ORIG}\n\nTrailing body paragraph."
+        assert _apply_page_results(md, [(self._plan(md), "prose, no table")]) == md
+
+    def test_recovered_legend_folded_as_table_footnote(self) -> None:
+        from pdfparser.pipeline.tables.recover import _apply_page_results
+
+        md = f"Intro paragraph.\n\n{self._ORIG}\n\nTrailing body paragraph."
+        crop = self._RICHER + "\n\naValues are means of triplicate assays."
+        out = _apply_page_results(md, [(self._plan(md), crop)])
+        assert '<p class="footnote">' in out
+        assert "means of triplicate assays" in out
+
+    def test_legend_already_in_page_not_duplicated(self) -> None:
+        from pdfparser.pipeline.tables.recover import _apply_page_results
+
+        legend = "aValues are means of triplicate assays."
+        md = f"Intro paragraph.\n\n{self._ORIG}\n\n{legend}"
+        crop = self._RICHER + "\n\n" + legend
+        out = _apply_page_results(md, [(self._plan(md), crop)])
+        # The crop re-OCR caught the legend the page already has -> not folded again.
+        assert '<p class="footnote">' not in out
+
+    def test_multiple_regions_spliced_back_to_front(self) -> None:
+        from PIL import Image
+
+        from pdfparser.pipeline.tables.recover import _apply_page_results, _RegionPlan
+
+        t2 = "<table><tr><td>X</td><td>Y</td></tr><tr><td>9</td><td>8</td></tr></table>"
+        r2 = (
+            "<table><tr><th>X</th><th>Y</th><th>Z</th></tr>"
+            "<tr><td>9</td><td>8</td><td>7</td></tr></table>"
+        )
+        md = f"Lead.\n\n{self._ORIG}\n\nMiddle.\n\n{t2}\n\nTail."
+        blank = Image.new("RGB", (10, 10))
+        p1 = _RegionPlan(
+            md.index(self._ORIG),
+            md.index(self._ORIG) + len(self._ORIG),
+            [self._ORIG],
+            blank,
+        )
+        p2 = _RegionPlan(md.index(t2), md.index(t2) + len(t2), [t2], blank)
+        out = _apply_page_results(md, [(p1, self._RICHER), (p2, r2)])
+        # Both regions replaced and the interleaved prose intact: the back-to-front
+        # splice order kept the earlier offsets valid after the later splice.
+        assert "<th>High</th>" in out and "<th>Z</th>" in out
+        assert "Lead." in out and "Middle." in out and "Tail." in out
+
+
+class TestTableReocrEndToEnd:
+    """``_recover_dropped_tables`` plans each page's crops from the text layer, OCRs
+    them in **one batched call**, and splices the results.  Driven against a real
+    fixture's text layer with a fake ``ocr_regions`` so no GPU/server is needed (only
+    the injected re-OCR is faked); the localization and crop render are pure CPU."""
+
+    @staticmethod
+    def _dump_pages(stem: str):
+        import pathlib
+        import re as _re
+
+        import pytest
+
+        pdf = pathlib.Path(__file__).parent / "fixtures" / f"{stem}.pdf"
+        dump = (
+            pathlib.Path(__file__).parent / "data" / "dumps" / f"{stem}_raw_markdown.md"
+        )
+        if not pdf.exists() or not dump.exists():
+            pytest.skip(f"fixture not found: {pdf} / {dump}")
+        pages = [
+            p.strip("\n")
+            for p in _re.split(
+                r"^===== PAGE \d+ =====$", dump.read_text("utf-8"), flags=_re.M
+            )[1:]
+        ]
+        return pdf, pages
+
+    def test_crops_are_batched_in_one_call_and_richer_reocr_spliced(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.tables.recover import _recover_dropped_tables
+
+        pdf, pages = self._dump_pages("30592559")
+        # 240 distinct cells out-cells the fixture's biggest planned region (101), so a
+        # planned region always clears the cell-count gate and splices.  Rows must be
+        # *distinct* — byte-identical rows would be folded by the decode-loop collapse
+        # before the gate, masking the richer cell count.
+        rich = (
+            "<table>"
+            + "".join(
+                "<tr>"
+                + "".join(f"<td>RECOVEREDCELL{r}_{c}</td>" for c in range(8))
+                + "</tr>"
+                for r in range(30)
+            )
+            + "</table>"
+        )
+        calls: list[int] = []
+
+        def fake_ocr_regions(crops):
+            calls.append(len(crops))
+            return [rich] * len(crops)
+
+        with _DocumentLayers.open(str(pdf)) as layers:
+            out = _recover_dropped_tables(layers, pages, fake_ocr_regions)
+
+        assert len(calls) == 1  # every crop OCR'd in a single batched request
+        assert calls[0] >= 1  # at least one table region localized + planned
+        assert "RECOVEREDCELL0_0" in "\n".join(out)  # the richer re-OCR was spliced in
+        assert len(out) == len(pages)
+
+    def test_pages_without_a_table_incur_no_ocr(self) -> None:
+        from unittest.mock import MagicMock
+
+        import pypdfium2 as pdfium
+
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.tables.recover import _recover_dropped_tables
+
+        called: list[int] = []
+
+        def fake_ocr_regions(crops):
+            called.append(len(crops))
+            return [""] * len(crops)
+
+        # No "<table" on any page -> never touches the (mocked) document or the OCR.
+        layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+        pages = ["# Intro\n\nProse, no tables here.", "More prose, still no table."]
+        out = _recover_dropped_tables(layers, pages, fake_ocr_regions)
+        assert out == pages
+        assert called == []
+
+    def test_sideways_table_localizes_to_a_planned_crop(self) -> None:
+        # 32117944 Table 2 is printed rotated 270°: localization records the glyph
+        # rotation and the planner rotates the crop upright before re-OCR.  Declining
+        # every crop here (empty re-OCR) keeps the originals, but the rotation-aware
+        # localize→batch path still runs.
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.tables.recover import _recover_dropped_tables
+
+        pdf, pages = self._dump_pages("32117944")
+        seen: list[int] = []
+
+        def fake_ocr_regions(crops):
+            seen.append(len(crops))
+            return [""] * len(crops)
+
+        with _DocumentLayers.open(str(pdf)) as layers:
+            out = _recover_dropped_tables(layers, pages, fake_ocr_regions)
+
+        assert seen and seen[0] >= 1  # the rotated table localized to a planned crop
+        assert len(out) == len(pages)
+
+    def test_unlocalizable_table_is_left_untouched(self) -> None:
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.tables.recover import _recover_dropped_tables
+
+        pdf, _ = self._dump_pages("30592559")
+        called: list[int] = []
+
+        def fake_ocr_regions(crops):
+            called.append(len(crops))
+            return ["<table><tr><td>x</td></tr></table>"] * len(crops)
+
+        # Cells that appear nowhere in the page's text layer can't be localized, so
+        # the region is skipped — no crop, no OCR, the original table left as-is.
+        nonsense = "<table><tr><td>NOMATCHAA</td><td>NOMATCHBB</td></tr></table>"
+        with _DocumentLayers.open(str(pdf)) as layers:
+            out = _recover_dropped_tables(layers, [nonsense], fake_ocr_regions)
+
+        assert out == [nonsense]  # unchanged
+        assert called == []  # localization failed first -> no crop was ever OCR'd
