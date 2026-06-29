@@ -25,17 +25,32 @@ def _downscale_to_long_side(img: Image.Image) -> Image.Image:
     )
 
 
+def _page_render_scale(width_pt: float, height_pt: float) -> float:
+    """Scale that rasterizes a page directly at the OCR long-side budget.
+
+    Capped at ``_RENDER_SCALE`` so a page already within budget at 200 DPI is not
+    upscaled — that preserves the prior behaviour for such pages while avoiding the
+    ~2× pixel-area waste of supersampling every standard page to 200 DPI only to
+    LANCZOS-shrink it back to the budget."""
+    return min(_RENDER_SCALE, _OCR_MAX_LONG_SIDE / max(width_pt, height_pt))
+
+
 def _render_page_images(pdf_path: Path) -> list[Image.Image]:
     """Render every page to an RGB image, long side ≤ ``_OCR_MAX_LONG_SIDE``.
 
-    ``convert("RGB")`` detaches each image from the pdfium bitmap, so the
-    document can be closed before the images are consumed.
+    Each page is rasterized once directly at the budget (``_page_render_scale``)
+    rather than at a fixed 200 DPI then LANCZOS-downscaled; ``_downscale_to_long_side``
+    then only clamps a sub-pixel rounding overshoot.  ``convert("RGB")`` detaches each
+    image from the pdfium bitmap, so the document can be closed before the images are
+    consumed.
     """
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
         return [
             _downscale_to_long_side(
-                page.render(scale=_RENDER_SCALE).to_pil().convert("RGB")
+                page.render(scale=_page_render_scale(*page.get_size()))
+                .to_pil()
+                .convert("RGB")
             )
             for page in pdf
         ]
