@@ -729,7 +729,9 @@ class TestPlosTableFormatting:
         # both panels live inside that single table block
         assert "A. Effect of EDTA" in table
         assert "B. ICP-MS analysis" in table
-        assert "Zn²⁺" in table  # panel B's data is under the same caption
+        # the model renders Zn²⁺ as either Unicode superscripts or <sup>2+</sup>
+        # depending on batch composition — both are panel B's data under one caption
+        assert "Zn²⁺" in table or "Zn<sup>2+</sup>" in table
         # exactly one caption for the composite table
         assert table.count("<caption>") == 1
 
