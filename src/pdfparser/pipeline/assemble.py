@@ -251,6 +251,27 @@ def _is_legend_continuation(block: str) -> bool:
     )
 
 
+def _opens_panel_continuation(block: str) -> bool:
+    """A multi-panel sub-description ("(A) … (B) …") the model split into its own
+    paragraph: caption text the OCR detached from the header, foldable onto the
+    caption.  Excludes a panel block that merged with a following heading/table
+    (``_is_caption_continuation``), which must not be folded whole."""
+    return _opens_with_panel_label(block) and _is_caption_continuation(block)
+
+
+def _fold_next(
+    raw_blocks: list[str],
+    k: int,
+    caption: str,
+    next_ok: Callable[[str], bool],
+) -> tuple[int, str]:
+    """Fold the block after ``k`` onto ``caption`` when ``next_ok`` accepts it,
+    advancing the cursor past the consumed block; otherwise return both unchanged."""
+    if k + 1 < len(raw_blocks) and next_ok(raw_blocks[k + 1]):
+        return k + 1, f"{caption} {raw_blocks[k + 1].strip()}"
+    return k, caption
+
+
 def _parse_page_blocks(md: str) -> list[_Block]:
     """Split a page's markdown into an ordered stream of prose and figure blocks.
 
@@ -284,29 +305,19 @@ def _parse_page_blocks(md: str) -> list[_Block]:
         ):
             k += 1
             caption = raw_blocks[k].strip()
-        if (
-            caption is not None
-            and _is_bare_figure_label(caption)
-            and k + 1 < len(raw_blocks)
-            and _is_caption_continuation(raw_blocks[k + 1])
-        ):
-            k += 1
-            caption = f"{caption} {raw_blocks[k].strip()}"
-        # Multi-panel sub-descriptions the model split into their own paragraph(s)
-        # ("(A) … (B) … (C) …") are caption text the OCR detached from the caption
-        # header, not body prose — fold each onto the caption.  Only when a caption
-        # header was actually found (caption is not None): otherwise a headerless
-        # figure would absorb a genuine body enumeration, or the next figure's
-        # caption.  _is_caption_continuation keeps a panel block that merged with a
-        # following heading/table from being folded whole.
-        while (
-            caption is not None
-            and k + 1 < len(raw_blocks)
-            and _opens_with_panel_label(raw_blocks[k + 1])
-            and _is_caption_continuation(raw_blocks[k + 1])
-        ):
-            k += 1
-            caption = f"{caption} {raw_blocks[k].strip()}"
+        if caption is not None and _is_bare_figure_label(caption):
+            k, caption = _fold_next(raw_blocks, k, caption, _is_caption_continuation)
+        # Fold each multi-panel sub-description ("(A) … (B) … (C) …") onto the
+        # caption.  Gated on a caption header having been found (caption is not
+        # None): otherwise a headerless figure would absorb a genuine body
+        # enumeration, or the next figure's caption.
+        while caption is not None:
+            new_k, caption = _fold_next(
+                raw_blocks, k, caption, _opens_panel_continuation
+            )
+            if new_k == k:
+                break
+            k = new_k
         # A legend the OCR split after the "Figure N. Title" header — a plain
         # descriptive sentence, not a "(A) …" panel run — is folded onto a
         # title-only caption.  Stranded between its figure and the paragraph the
@@ -318,11 +329,8 @@ def _parse_page_blocks(md: str) -> list[_Block]:
             caption is not None
             and _looks_like_figure_caption(caption)
             and _is_title_only_figure_caption(caption)
-            and k + 1 < len(raw_blocks)
-            and _is_legend_continuation(raw_blocks[k + 1])
         ):
-            k += 1
-            caption = f"{caption} {raw_blocks[k].strip()}"
+            k, caption = _fold_next(raw_blocks, k, caption, _is_legend_continuation)
         # A folded panel/legend block can carry a duplicate of the *next* section
         # heading the OCR glued onto its tail; drop that echo so the heading isn't
         # repeated inside the figcaption (the real heading still follows as its block).
