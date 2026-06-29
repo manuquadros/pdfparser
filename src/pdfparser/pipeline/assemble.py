@@ -766,6 +766,47 @@ class ParsedDocument:
     doi: str | None
 
 
+def _recover_from_text_layer(
+    pdf_path: Path | str,
+    pages_md: list[str],
+    ocr_region: Callable[[Image.Image], str],
+    ocr_regions: Callable[[list[Image.Image]], list[str]],
+) -> tuple[list[str], str | None]:
+    """Run the post-OCR PDF-text-layer passes over the page markdown, returning the
+    recovered markdown and the best-effort DOI.
+
+    Every pass here — plus the DOI scan — reads the PDF text layer, so the document is
+    opened **once** as a shared ``_DocumentLayers`` (a lazy per-page ``_PageLayer``
+    cache) whose lifetime this helper scopes; the orchestrator then stays render → OCR
+    → recover → assemble.  The pass order is load-bearing (each step's own docstring
+    explains why), so move steps only with that in mind."""
+    with _DocumentLayers.open(pdf_path) as layers:
+        pages_md = _recover_dropped_tables(layers, pages_md, ocr_regions)
+        # Rebuild a two-column table the OCR mangled (off-by-one header, dropped
+        # cells) from the deterministic PDF text layer, keeping the OCR's cell
+        # formatting.
+        pages_md = _repair_tables_from_text_layer(layers, pages_md)
+        # Re-apply <strong> to table cells the OCR transcribed plain but that are
+        # boldfaced in the PDF (section/total rows).  After the table passes so it
+        # bolds whatever table HTML survives (re-OCR'd or rebuilt).
+        pages_md = _recover_table_cell_bold(layers, pages_md)
+        pages_md = _recover_dropped_figures(layers, pages_md, ocr_region)
+        # Recover short tails the OCR truncated, from the PDF text layer.  Runs
+        # *after* table/figure recovery so an appended tail can neither feed the
+        # table coverage gate's adjacent-token check nor make a figure number look
+        # already-emitted.  No-op on a PDF without a usable text layer.
+        pages_md = _reconcile_text_layer(layers, pages_md)
+        # DOI from the article's first-page text layer (deterministic), else that
+        # page's OCR text — both keyed on the same leading-ad skip the assembly uses,
+        # so an ad-prefixed PDF's empty page 0 is stepped over.
+        start = _leading_pages_to_skip_md(pages_md)
+        doi = _extract_doi(
+            layers.page_raw_text(start),
+            pages_md[start] if start < len(pages_md) else "",
+        )
+    return pages_md, doi
+
+
 def lightonocr_pdf_to_document(
     pdf_path: Path | str,
     *,
@@ -812,33 +853,9 @@ def lightonocr_pdf_to_document(
         # re-OCR for the document's table crops.
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
-        # The post-OCR passes all read the PDF text layer; hold one open document
-        # with a shared per-page _PageLayer cache across them so a page is extracted
-        # once, not once per pass.
-        with _DocumentLayers.open(pdf_path) as layers:
-            pages_md = _recover_dropped_tables(layers, pages_md, ocr_regions)
-            # Rebuild a two-column table the OCR mangled (off-by-one header, dropped
-            # cells) from the deterministic PDF text layer, keeping the OCR's cell
-            # formatting.
-            pages_md = _repair_tables_from_text_layer(layers, pages_md)
-            # Re-apply <strong> to table cells the OCR transcribed plain but that are
-            # boldfaced in the PDF (section/total rows).  After the table passes so it
-            # bolds whatever table HTML survives (re-OCR'd or rebuilt).
-            pages_md = _recover_table_cell_bold(layers, pages_md)
-            pages_md = _recover_dropped_figures(layers, pages_md, ocr_region)
-            # Recover short tails the OCR truncated, from the PDF text layer.  Runs
-            # *after* table/figure recovery so an appended tail can neither feed the
-            # table coverage gate's adjacent-token check nor make a figure number look
-            # already-emitted.  No-op on a PDF without a usable text layer.
-            pages_md = _reconcile_text_layer(layers, pages_md)
-            # DOI from the article's first-page text layer (deterministic), else that
-            # page's OCR text — both keyed on the same leading-ad skip the assembly
-            # uses, so an ad-prefixed PDF's empty page 0 is stepped over.
-            start = _leading_pages_to_skip_md(pages_md)
-            doi = _extract_doi(
-                layers.page_raw_text(start),
-                pages_md[start] if start < len(pages_md) else "",
-            )
+        pages_md, doi = _recover_from_text_layer(
+            pdf_path, pages_md, ocr_region, ocr_regions
+        )
         if encode_image is None:
             encode_image = (
                 _file_image_writer(image_dir) if image_dir is not None else _base64_src
