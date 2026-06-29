@@ -78,6 +78,8 @@ _REF_HEADING_RE = re.compile(
 _ARTICLE_HEADING_RE = re.compile(
     r"^\s*(?:\d+[.)]?\s+)?(?:abstract|introduction)\b", re.IGNORECASE
 )
+# A markdown ATX heading line ("## Title"), capturing the heading text.
+_MD_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+(.*)")
 # Headings that may legitimately sit *inside* the front matter (between the
 # abstract and the article body).  Everything up to the first heading that is
 # neither one of these nor a document-type label is treated as front matter,
@@ -298,6 +300,8 @@ _AUTHOR_MARKER_RE = re.compile(rf"<sup>|[{_SUP_DIGITS}*†‡§]")
 # A comma / "and" / ";"-separated author segment: a short, capitalized,
 # digit-free name.
 _NAME_SEGMENT_RE = re.compile(r"^[A-Z][^\d]*$")
+# The delimiters a byline lists authors with — split a name list on any of them.
+_NAME_LIST_SPLIT_RE = re.compile(r",|\s+and\s+|;")
 # A lone-author byline ("Daniel D. Clark") has no comma to split on and no
 # affiliation marker, so it is recognised as a "given-name … surname" frame: an
 # alphabetic capitalised word at each end (``_NAME_ALPHA_WORD_RE``) with a *mid-name*
@@ -353,9 +357,10 @@ def _leading_title_follows(parts: list[str], idx: int) -> bool:
 
 
 def _looks_like_name_list(plain: str) -> bool:
-    segments = [s.strip() for s in re.split(r",|\s+and\s+|;", plain) if s.strip()]
+    segments = [s.strip() for s in _NAME_LIST_SPLIT_RE.split(plain) if s.strip()]
     return len(segments) >= 2 and all(
-        _NAME_SEGMENT_RE.match(s) and len(s.split()) <= 5 for s in segments
+        _NAME_SEGMENT_RE.match(s) and len(s.split()) <= _PERSONAL_NAME_MAX_WORDS
+        for s in segments
     )
 
 
@@ -374,6 +379,11 @@ def _looks_like_personal_name(plain: str) -> bool:
 
 _BYLINE_EMPHASIS_RE = re.compile(r"</?(?:strong|em)>")
 _BYLINE_MARKER_RE = re.compile(r"\*+")
+_BR_TAG_RE = re.compile(r"<br\s*/?>")
+# A trailing run of '*' is the unclosed-bold mis-pair leftover, collapsed to one marker.
+_TRAILING_MARKER_RUN_RE = re.compile(r"\*+$")
+# Past this many characters a "byline" is really a body paragraph, not an author line.
+_BYLINE_MAX_CHARS = 400
 
 
 def _byline_html(inner: str) -> str:
@@ -389,14 +399,14 @@ def _byline_html(inner: str) -> str:
     mis-pairing) and re-cast each surviving literal ``*`` as a superscript marker.  A
     byline whose markers already arrived as ``<sup>`` (the ``$^{1,*}$`` LaTeX shape)
     carries no bare ``*`` and is left untouched."""
-    inner = re.sub(r"<br\s*/?>", "; ", inner).strip()
+    inner = _BR_TAG_RE.sub("; ", inner).strip()
     inner = _BYLINE_EMPHASIS_RE.sub("", inner)
     if "<sup>" not in inner:
         # A *trailing* '*' run is the unclosed-bold mis-pair leftover (the real marker
         # was consumed into the emphasis pairing), so it stands for a single marker;
         # collapse it first.  An *inline* run is a genuine marker whose count can
         # distinguish authors ('*' vs '**'), so the wrap then keeps the run verbatim.
-        inner = re.sub(r"\*+$", "*", inner)
+        inner = _TRAILING_MARKER_RUN_RE.sub("*", inner)
         inner = _BYLINE_MARKER_RE.sub(lambda m: f"<sup>{m.group()}</sup>", inner)
     return inner
 
@@ -411,7 +421,7 @@ def _is_byline(inner: str) -> bool:
     names.  Anything else (a date, DOI, journal line) falls through to the body
     rather than being silently moved into the header."""
     plain = _byline_text(inner)
-    if not plain or len(plain) >= 400 or _SENTENCE_END_RE.search(plain):
+    if not plain or len(plain) >= _BYLINE_MAX_CHARS or _SENTENCE_END_RE.search(plain):
         return False
     if _BOLD_LABEL_RE.match(inner):
         return False
@@ -426,7 +436,7 @@ def _is_article_page_md(md: str) -> bool:
     """A page is the article start if it carries an Abstract/Introduction
     heading (a cover ad / masthead has neither)."""
     for line in md.splitlines():
-        m = re.match(r"^#{1,6}\s+(.*)", line.strip())
+        m = _MD_HEADING_LINE_RE.match(line.strip())
         if m and _ARTICLE_HEADING_RE.match(_visible_text(m.group(1)).strip()):
             return True
     return False

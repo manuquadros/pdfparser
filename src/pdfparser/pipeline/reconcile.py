@@ -40,10 +40,14 @@ _ANCHOR_TOKENS = 6
 # A next block shorter than this (a one-word "FUNDING" heading) is a weak bound:
 # its lone token can match a word inside the span being recovered.
 _MIN_HEAD_TOKENS = 3
+# Below this many normalized chars the recovered slice is too little signal to trust
+# as a genuine truncated tail (vs an incidental fragment); the floor to _MAX_GAP_CHARS.
 _MIN_GAP_CHARS = 12
 # A truncation tail is a clause; a larger gap is almost always a block the OCR
 # reordered relative to the layer, so decline it rather than splice foreign text.
 _MAX_GAP_CHARS = 60
+# A genuine prose tail is mostly letters; below majority-alpha the slice is a digit /
+# punctuation run (a table-number column, a furniture stamp), not prose — decline it.
 _MIN_ALPHA_RATIO = 0.55
 # A line recurring on at least this many pages is running furniture.
 _FURNITURE_MIN_PAGES = 3

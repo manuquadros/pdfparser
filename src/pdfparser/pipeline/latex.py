@@ -119,6 +119,9 @@ def _latex_command_to_unicode(command: str) -> str:
     try:
         text = str(_L2T.latex_to_text(command)).strip()
     except Exception:
+        # pylatexenc raises assorted errors on a malformed/unknown macro; any failure
+        # means "untranslatable" — keep the command literal (per the docstring) so a
+        # later MathJax pass can still render it, rather than crash the page.
         return command
     if not text or "%" in text:
         return _LATEX_SYMBOL_FALLBACK.get(command, command)

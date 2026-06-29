@@ -35,7 +35,9 @@ from pdfparser.pipeline.tables.markup import (
 )
 from pdfparser.pipeline.text import _visible_text
 
-_RECON_X_PAD = 6.0
+# Breathing room (pt) added around the seed column — both its x-bounds and its top
+# y-bound — so a glyph just outside the anchors' tight box is still captured.
+_RECON_PAD = 6.0
 _RECON_ROW_TOL = 6.0  # merge super/subscript-shifted glyphs into their row
 _RECON_MIN_SEEDS = 4  # unique anchors needed to localize the column confidently
 _RECON_SPACE_FRAC = 0.3  # insert a space when a glyph gap exceeds this * glyph width
@@ -62,8 +64,7 @@ def _glyph_cell_text(seg: list[_Glyph]) -> str:
     digit run the heuristic over-split."""
     if not seg:
         return ""
-    widths = sorted(g[2] - g[1] for g in seg)
-    cw = widths[len(widths) // 2] or 1.0
+    cw = _median([g[2] - g[1] for g in seg]) or 1.0
     out = seg[0][0]
     for prev, cur in zip(seg, seg[1:], strict=False):
         if cur[1] - prev[2] > _RECON_SPACE_FRAC * cw:
@@ -237,9 +238,9 @@ def _reconstruct_table_from_text_layer(
     )
     if len(seeds) < _RECON_MIN_SEEDS:
         return None
-    col_left = min(s[0] for s in seeds) - _RECON_X_PAD
-    col_right = max(s[2] for s in seeds) + _RECON_X_PAD
-    y_top = max(s[3] for s in seeds) + _RECON_X_PAD
+    col_left = min(s[0] for s in seeds) - _RECON_PAD
+    col_right = max(s[2] for s in seeds) + _RECON_PAD
+    y_top = max(s[3] for s in seeds) + _RECON_PAD
     glyphs = [
         (ch, b[0], b[2], (b[1] + b[3]) / 2, b[1], b[3])
         for ch, b in zip(layer.page_text, layer.char_boxes, strict=True)

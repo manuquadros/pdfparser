@@ -98,6 +98,9 @@ def _page_text_and_boxes(
                 (left, bottom, right, top) if right > left and top > bottom else None
             )
         except Exception:
+            # Broad on purpose: this runs per glyph over thousands of chars, and a
+            # single malformed box (any pdfium quirk) must drop that glyph's box, not
+            # abort the page's extraction — the char keeps its index with box=None.
             box = None
         angle = pdfium_c.FPDFText_GetCharAngle(raw, i)
         rot = _snap_rotation(math.degrees(angle)) if angle >= 0 else None

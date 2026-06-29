@@ -121,8 +121,10 @@ _FIGURE_CAPTION_SCAN_FRAC = 0.5
 # fraction of the figure, the "caption" bands were really figure content that
 # echoes the caption words (a GC-MS trace labelled with the retention times its
 # caption lists, a sequence alignment naming its own rows) — reject the trim and
-# keep the full crop rather than annihilate a real figure.
-_FIGURE_CAPTION_MIN_KEEP_FRAC = _FIGURE_CAPTION_SCAN_FRAC
+# keep the full crop rather than annihilate a real figure.  Its own literal (not an
+# alias of the scan-window fraction): a keep-ratio is an unrelated knob that happens
+# to share the 0.5 value, so tuning one must not move the other.
+_FIGURE_CAPTION_MIN_KEEP_FRAC = 0.5
 _FIGURE_CAPTION_NOTE_BANDS = 2  # trailing note lines (a DOI) tolerated below a caption
 _FIGURE_BLOCK_GAP_FRAC = 0.008  # blank run separating caption / figure / note blocks
 _FIGURE_OCR_MIN_BAND_PX = 48  # pad thinner bands so the vision model can patch them
