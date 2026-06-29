@@ -23,21 +23,28 @@ _JAFC_PDF = Path(__file__).parent / "fixtures" / "31298526.pdf"
 _OUTPUT_DIR = Path(__file__).parent / "fixtures"
 
 
-def _run_pipeline_to_file(pdf: Path, ocr: object) -> str:
+def _run_document_to_file(pdf: Path, ocr: object) -> object:
     """Run the full pipeline on ``pdf`` and save the HTML for visual inspection.
 
-    The output lands at ``tests/fixtures/<pdf-stem>.html`` so every integration
-    run leaves an on-disk copy of each fixture's rendering to open in a browser.
+    Returns the :class:`ParsedDocument` (HTML + structured title/byline/DOI).  The
+    HTML lands at ``tests/fixtures/<pdf-stem>.html`` so every integration run leaves
+    an on-disk copy of each fixture's rendering to open in a browser.
     """
-    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_html
+    from pdfparser.pipeline import OcrModel, lightonocr_pdf_to_document
 
     assert isinstance(ocr, OcrModel)
     _OUTPUT_DIR.mkdir(exist_ok=True)
-    html = lightonocr_pdf_to_html(
+    doc = lightonocr_pdf_to_document(
         pdf, ocr=ocr, image_dir=_OUTPUT_DIR / f"{pdf.stem}_files"
     )
-    (_OUTPUT_DIR / f"{pdf.stem}.html").write_text(html, encoding="utf-8")
-    return html
+    (_OUTPUT_DIR / f"{pdf.stem}.html").write_text(doc.html, encoding="utf-8")
+    return doc
+
+
+def _run_pipeline_to_file(pdf: Path, ocr: object) -> str:
+    """The HTML of :func:`_run_document_to_file` — for the fixtures asserting on the
+    rendered string only."""
+    return _run_document_to_file(pdf, ocr).html
 
 
 @pytest.fixture(scope="session")
@@ -52,15 +59,24 @@ def ocr_model() -> object:
 
 
 @pytest.fixture(scope="session")
-def article_html(ocr_model: object) -> str:
-    """Run the full pipeline on the no-ad fixture; skip if the model is absent.
+def parsed_document(ocr_model: object) -> object:
+    """Parse the no-ad fixture once into a ParsedDocument; skip if the model is absent.
 
-    Writes the result to tests/fixtures/30592559.html so the file stays current
-    after each integration run.
+    Writes the HTML to tests/fixtures/30592559.html so the file stays current after
+    each integration run; ``article_html`` is its ``.html`` (so the string-asserting
+    tests and the structured-return tests share one pipeline run).
     """
     if not _FIXTURE_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_FIXTURE_PDF}")
-    return _run_pipeline_to_file(_FIXTURE_PDF, ocr_model)
+    return _run_document_to_file(_FIXTURE_PDF, ocr_model)
+
+
+@pytest.fixture(scope="session")
+def article_html(parsed_document: object) -> str:
+    from pdfparser.pipeline import ParsedDocument
+
+    assert isinstance(parsed_document, ParsedDocument)
+    return parsed_document.html
 
 
 @pytest.mark.integration
@@ -1274,3 +1290,23 @@ class TestJafcTruncatedPageRecovery:
             max_run = max_run + 1 if cur == prev else 1
             longest_run = max(longest_run, max_run)
         assert longest_run <= 3, f"decode-loop explosion: {longest_run} identical rows"
+
+
+@pytest.mark.integration
+class TestStructuredDocument:
+    """``lightonocr_pdf_to_document`` wires the full pipeline to the structured
+    return — HTML plus the title/byline/DOI the annotation-hub Reference row needs
+    without re-parsing the HTML (Tasks B).  The DOI is deterministic (text-layer), the
+    title/byline track the live OCR's header."""
+
+    def test_doi_from_text_layer(self, parsed_document: object) -> None:
+        assert parsed_document.doi == "10.1002/bmb.21202"
+
+    def test_title_and_byline_populated(self, parsed_document: object) -> None:
+        assert "Hydroxypropyl-Coenzyme M Dehydrogenases" in parsed_document.title
+        assert "Daniel D. Clark" in parsed_document.byline
+
+    def test_html_is_a_full_document(self, parsed_document: object) -> None:
+        html = parsed_document.html
+        assert html.startswith("<!DOCTYPE html>")
+        assert "<h1>" in html and html.rstrip().endswith("</html>")

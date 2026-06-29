@@ -185,3 +185,19 @@ class _DocumentLayers:
             layer = _page_layer(self.pdf[index])
             self._layers[index] = layer
         return layer
+
+    def page_raw_text(self, index: int) -> str:
+        """The page's text-view layer — raw text only, no per-glyph geometry.
+
+        The cheap native read (``get_text_range``), not the char-by-char
+        :class:`_PageLayer` walk: used where a pass needs only a page's text (the DOI
+        scan) and not its glyph boxes.  Out-of-range pages return ``""``.  Not cached
+        (callers want it for a page or two), and the native text-page handle is closed
+        explicitly — pypdfium2's ``PdfTextPage`` has no context-manager protocol."""
+        if not 0 <= index < len(self.pdf):
+            return ""
+        textpage = self.pdf[index].get_textpage()
+        try:
+            return str(textpage.get_text_range())
+        finally:
+            textpage.close()

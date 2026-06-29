@@ -16,6 +16,7 @@ integration suite — the dumps carry no PDF text layer and no real page images.
 """
 
 import functools
+import html as _htmllib
 import re
 from pathlib import Path
 
@@ -26,9 +27,13 @@ from helpers import (
     _byline,
     _fake_image,
     _header,
+    _header_h1,
     _metadata,
     _run_lighton,
 )
+
+from pdfparser.pipeline.assemble import _assemble_document
+from pdfparser.pipeline.text import _visible_text
 
 _DUMP_DIR = Path(__file__).parent / "data" / "dumps"
 _PAGE_MARKER = re.compile(r"^===== PAGE \d+ =====$", re.MULTILINE)
@@ -56,6 +61,20 @@ def _replay(stem: str) -> str:
     return _run_lighton(_load_dump(stem), _fake_image(1540, 1995))
 
 
+@functools.cache
+def _replay_document(stem: str) -> tuple[str, str, str]:
+    """Assemble ``stem``'s dump via ``_assemble_document``: (html, title, byline)."""
+    pages = _load_dump(stem)
+    img = _fake_image(1540, 1995)
+    return _assemble_document(pages, [img for _ in pages])
+
+
+def _flatten(fragment: str) -> str:
+    """The reader-visible text of an HTML fragment: tags stripped, entities unescaped
+    — the same form ``_assemble_document`` returns for the title/byline."""
+    return _htmllib.unescape(_visible_text(fragment)).strip()
+
+
 @pytest.mark.parametrize("stem", _STEMS)
 class TestUniversalInvariants:
     """Hold for every fixture regardless of journal/layout."""
@@ -81,6 +100,27 @@ class TestUniversalInvariants:
         assert opens == closes, (
             f"{stem}: tables unbalanced ({opens} open, {closes} close)"
         )
+
+
+@pytest.mark.parametrize("stem", _STEMS)
+class TestStructuredReturn:
+    """``_assemble_document`` surfaces the header title/byline structurally, so a
+    consumer (the annotation-hub Reference row) needn't re-parse the HTML."""
+
+    def test_html_matches_string_view(self, stem: str) -> None:
+        # The .html of the structured return is identical to _assemble_html's str.
+        assert _replay_document(stem)[0] == _replay(stem)
+
+    def test_title_matches_header_h1(self, stem: str) -> None:
+        html, title, _ = _replay_document(stem)
+        # Every fixture carries a real article title (none fall to the "Untitled"
+        # shell fallback), so the plain title equals the flattened <h1>.
+        assert title
+        assert title == _flatten(_header_h1(html))
+
+    def test_byline_matches_header(self, stem: str) -> None:
+        html, _, byline = _replay_document(stem)
+        assert byline == _flatten(_byline(html))
 
 
 class TestHpcdhDump:
@@ -111,6 +151,11 @@ class TestHpcdhDump:
     def test_table_footnote_rides_with_table(self) -> None:
         body = _body(_replay(self.STEM))
         assert '</table><p class="footnote">Molecule structures' in body
+
+    def test_structured_title_and_byline(self) -> None:
+        _, title, byline = _replay_document(self.STEM)
+        assert title.startswith("Characterization of the Recombinant")
+        assert byline == "Daniel D. Clark"
 
 
 class TestTropinoneDump:
@@ -165,6 +210,11 @@ class TestPlosDump:
 
     def test_title_not_masthead(self) -> None:
         assert "<h1>PLOS ONE</h1>" not in _replay(self.STEM)
+
+    def test_structured_title_is_article_not_masthead(self) -> None:
+        _, title, _ = _replay_document(self.STEM)
+        assert title.startswith("Purification and characterization")
+        assert "PLOS ONE" not in title
 
     def test_byline_has_no_stray_emphasis(self) -> None:
         header = _header(_replay(self.STEM))

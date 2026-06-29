@@ -10,19 +10,25 @@ except ImportError:
     pass
 
 from pdfparser.pipeline import (
+    ImageSink,
     OcrResponseError,
     OcrUnavailableError,
+    ParsedDocument,
     PdfInputError,
     PdfParserError,
+    lightonocr_pdf_to_document,
     lightonocr_pdf_to_html,
     load_ocr_model,
 )
 
 __all__ = [
+    "ImageSink",
     "OcrResponseError",
     "OcrUnavailableError",
+    "ParsedDocument",
     "PdfInputError",
     "PdfParserError",
+    "lightonocr_pdf_to_document",
     "lightonocr_pdf_to_html",
     "load_ocr_model",
 ]

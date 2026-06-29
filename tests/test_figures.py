@@ -1,5 +1,7 @@
 """Tests for figure geometry, crop recovery, and <figure> assembly."""
 
+import base64
+import io
 import logging
 import re
 from pathlib import Path
@@ -647,6 +649,39 @@ class TestFigureFileOutput:
         assert "data:image/png;base64," not in html
         assert 'src="doc_files/fig_001.png"' in html
         assert Image.open(image_dir / "fig_001.png").size == (1190, 1540)
+
+
+class TestImageSink:
+    """The injectable ``encode_image`` seam (Tasks B): a sink receives each crop's
+    PNG bytes + MIME and its returned value becomes the figure's ``<img src>``, so a
+    caller can store the bytes elsewhere (e.g. served assets) instead of inlining."""
+
+    _MD = "# T\n\n## Abstract\n\nA.\n\n## Body\n\n![image](i.png)0,0,1000,1000"
+
+    def test_sink_receives_png_bytes_and_src_used(self) -> None:
+        from pdfparser.pipeline.assemble import _assemble_html
+
+        received: list[tuple[bytes, str]] = []
+
+        def sink(image_bytes: bytes, mime: str) -> str:
+            received.append((image_bytes, mime))
+            return f"https://assets.example/fig{len(received)}.png"
+
+        html = _assemble_html([self._MD], [_fake_image(1190, 1540)], None, sink)
+        assert len(received) == 1
+        png, mime = received[0]
+        assert mime == "image/png"
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")  # PNG signature
+        assert Image.open(io.BytesIO(png)).size == (1190, 1540)
+        assert 'src="https://assets.example/fig1.png"' in html
+        assert "data:image/png;base64," not in html
+
+    def test_base64_default_inlines_data_uri(self) -> None:
+        from pdfparser.pipeline.figures import _base64_src
+
+        out = _base64_src(b"\x89PNG\r\n\x1a\nfake", "image/png")
+        assert out.startswith("data:image/png;base64,")
+        assert base64.b64decode(out.split(",", 1)[1]) == b"\x89PNG\r\n\x1a\nfake"
 
 
 class TestDenormalizeBbox:

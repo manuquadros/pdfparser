@@ -32,9 +32,11 @@ from pdfparser.pipeline.classify import (
     _recover_headingless_abstract,
     _split_abstract_citation,
 )
+from pdfparser.pipeline.doi import _extract_doi
 from pdfparser.pipeline.figures import (
     _FIGURE_MERGE_GAP_FRAC,
     _FIGURE_NOTE_RE,
+    ImageSink,
     _base64_src,
     _cluster_figure_boxes,
     _denormalize_bbox,
@@ -456,7 +458,7 @@ def _page_to_html_parts(
     md: str,
     image: Image.Image,
     ocr_region: Callable[[Image.Image], str] | None = None,
-    encode_image: Callable[[Image.Image], str] = _base64_src,
+    encode_image: ImageSink = _base64_src,
 ) -> list[str]:
     """Convert one page's markdown to block HTML, replacing each ``![image]``
     placeholder with a cropped ``<figure>`` and stitching consecutive prose into
@@ -640,12 +642,16 @@ def _document_shell(
 </html>"""
 
 
-def _assemble_html(
+def _assemble_document(
     pages_md: list[str],
     images: list[Image.Image],
     ocr_region: Callable[[Image.Image], str] | None = None,
-    encode_image: Callable[[Image.Image], str] = _base64_src,
-) -> str:
+    encode_image: ImageSink = _base64_src,
+) -> tuple[str, str, str]:
+    """The pure assembly core: returns the document HTML plus its plain-text title
+    and byline, flattened from the same header HTML the shell renders so a consumer
+    gets them without re-parsing the output.  :func:`_assemble_html` is the
+    ``.html``-only view kept for the existing string callers."""
     start = _leading_pages_to_skip_md(pages_md)
     pages_md = pages_md[start:]
     images = images[start:]
@@ -722,35 +728,78 @@ def _assemble_html(
     if license_footer is not None:
         metadata = metadata + [license_footer]
 
-    return _document_shell(
+    html = _document_shell(
         title_html=meta.title_html or "Untitled",
         byline_html=meta.byline_html,
         abstract=_abstract_section(abstract),
         metadata=_metadata_panel(metadata),
         body="\n".join(body),
     )
+    # markdown-it entity-escapes the header HTML (`&` → `&amp;`), so unescape the
+    # tag-stripped text back to the reader-visible title/byline a consumer stores.
+    title = _html.unescape(_visible_text(meta.title_html)).strip()
+    byline = _html.unescape(_visible_text(meta.byline_html)).strip()
+    return html, title, byline
 
 
-def lightonocr_pdf_to_html(
+def _assemble_html(
+    pages_md: list[str],
+    images: list[Image.Image],
+    ocr_region: Callable[[Image.Image], str] | None = None,
+    encode_image: ImageSink = _base64_src,
+) -> str:
+    """The ``str`` view of :func:`_assemble_document` — the document HTML only."""
+    return _assemble_document(pages_md, images, ocr_region, encode_image)[0]
+
+
+@dataclass
+class ParsedDocument:
+    """A parsed PDF's HTML plus the metadata a consumer needs without re-parsing it.
+
+    ``title``/``byline`` are the reader-visible (tag-stripped, entity-unescaped) forms
+    of the header the HTML renders — empty strings when the document carried none.
+    ``doi`` is the best-effort article DOI, ``None`` when none was found."""
+
+    html: str
+    title: str
+    byline: str
+    doi: str | None
+
+
+def lightonocr_pdf_to_document(
     pdf_path: Path | str,
     *,
     ocr: OcrModel | None = None,
     base_url: str | None = None,
     model: str | None = None,
     image_dir: Path | None = None,
-) -> str:
-    """Convert a PDF to HTML with LightOnOCR-2-1B-bbox.
+    encode_image: ImageSink | None = None,
+) -> ParsedDocument:
+    """Parse a PDF with LightOnOCR-2-1B-bbox into HTML plus structured metadata.
 
     Args:
         pdf_path: Path to the input PDF.
         ocr: Open connection bundle.  ``None`` calls ``load_ocr_model()``.
         base_url: vLLM endpoint root, used only when ``ocr`` is ``None``.
         model: Served model name, used only when ``ocr`` is ``None``.
-        image_dir: When given, figure crops are written here as sidecar PNGs and
-            referenced by a path relative to its parent (so the HTML, written into
-            that parent, links them) instead of inlined as base64 — quicker to
-            regenerate and live-editable in a browser.  ``None`` (default) inlines
-            the images, keeping the HTML self-contained.
+        image_dir: When given (and ``encode_image`` is not), figure crops are written
+            here as sidecar PNGs and referenced by a path relative to its parent (so
+            the HTML, written into that parent, links them) instead of inlined as
+            base64 — quicker to regenerate and live-editable in a browser.
+        encode_image: The image-delivery sink ``(png_bytes, mime) -> src``; pdfparser
+            writes the returned value into each figure's ``<img src>``.  ``None``
+            (default) inlines the crops as base64 data URIs, or writes sidecar PNGs
+            when ``image_dir`` is set.  Pass a sink to store the bytes elsewhere (e.g.
+            an asset store) and return a served URL.  Takes precedence over
+            ``image_dir``.
+
+    Returns:
+        A :class:`ParsedDocument` carrying the HTML, plain-text title/byline, and the
+        best-effort DOI.
+
+    Raises:
+        OcrUnavailableError / OcrResponseError / PdfInputError: per the typed boundary
+        in :mod:`pdfparser.pipeline.errors`.
     """
     owns_ocr = ocr is None
     if ocr is None:
@@ -762,7 +811,7 @@ def lightonocr_pdf_to_html(
         # re-OCR for the document's table crops.
         ocr_region = lambda region: _ocr_page(region, ocr)  # noqa: E731
         ocr_regions = lambda regions: _ocr_pages(regions, ocr)  # noqa: E731
-        # The four post-OCR passes all read the PDF text layer; hold one open document
+        # The post-OCR passes all read the PDF text layer; hold one open document
         # with a shared per-page _PageLayer cache across them so a page is extracted
         # once, not once per pass.
         with _DocumentLayers.open(pdf_path) as layers:
@@ -781,10 +830,44 @@ def lightonocr_pdf_to_html(
             # table coverage gate's adjacent-token check nor make a figure number look
             # already-emitted.  No-op on a PDF without a usable text layer.
             pages_md = _reconcile_text_layer(layers, pages_md)
-        encode_image = (
-            _file_image_writer(image_dir) if image_dir is not None else _base64_src
+            # DOI from the article's first-page text layer (deterministic), else that
+            # page's OCR text — both keyed on the same leading-ad skip the assembly
+            # uses, so an ad-prefixed PDF's empty page 0 is stepped over.
+            start = _leading_pages_to_skip_md(pages_md)
+            doi = _extract_doi(
+                layers.page_raw_text(start),
+                pages_md[start] if start < len(pages_md) else "",
+            )
+        if encode_image is None:
+            encode_image = (
+                _file_image_writer(image_dir) if image_dir is not None else _base64_src
+            )
+        html, title, byline = _assemble_document(
+            pages_md, images, ocr_region, encode_image
         )
-        return _assemble_html(pages_md, images, ocr_region, encode_image)
+        return ParsedDocument(html=html, title=title, byline=byline, doi=doi)
     finally:
         if owns_ocr:
             ocr.close()
+
+
+def lightonocr_pdf_to_html(
+    pdf_path: Path | str,
+    *,
+    ocr: OcrModel | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    image_dir: Path | None = None,
+    encode_image: ImageSink | None = None,
+) -> str:
+    """Parse a PDF to HTML with LightOnOCR-2-1B-bbox — the ``.html`` of
+    :func:`lightonocr_pdf_to_document` (which see for the arguments).  Kept as the
+    thin string entry point for the CLI and existing callers."""
+    return lightonocr_pdf_to_document(
+        pdf_path,
+        ocr=ocr,
+        base_url=base_url,
+        model=model,
+        image_dir=image_dir,
+        encode_image=encode_image,
+    ).html

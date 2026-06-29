@@ -179,16 +179,24 @@ def _opens_with_panel_label(block: str) -> bool:
     return bool(_PANEL_DESC_RE.match(block.strip()))
 
 
-def _base64_src(crop: Image.Image) -> str:
-    """Encode a crop as an inline ``data:`` PNG URI (the self-contained default)."""
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+# The image-delivery seam: a figure crop, already encoded to image bytes, plus its
+# MIME type → the value pdfparser writes into ``<img src>``.  Inline base64
+# (:func:`_base64_src`) is the self-contained default; a sidecar-file writer
+# (:func:`_file_image_writer`) or a caller-supplied sink (e.g. one that stores the
+# bytes in an asset store and returns its served URL) plug in the same way.  The
+# crop→PNG encode happens once at the call site (:func:`_figure_html`), so a sink
+# never touches Pillow.
+ImageSink = Callable[[bytes, str], str]
 
 
-def _file_image_writer(image_dir: Path) -> Callable[[Image.Image], str]:
-    """Return an image encoder that writes each crop as a PNG into ``image_dir`` and
-    references it by a path relative to ``image_dir``'s parent.
+def _base64_src(image_bytes: bytes, mime: str) -> str:
+    """Encode image bytes as an inline ``data:`` URI (the self-contained default)."""
+    return f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
+
+
+def _file_image_writer(image_dir: Path) -> ImageSink:
+    """Return an :data:`ImageSink` that writes each crop as a PNG into ``image_dir``
+    and references it by a path relative to ``image_dir``'s parent.
 
     So when the HTML is written into that parent directory it links the sidecar
     PNGs (quick to regenerate, live-editable in a browser) instead of inlining a
@@ -196,11 +204,11 @@ def _file_image_writer(image_dir: Path) -> Callable[[Image.Image], str]:
     image_dir.mkdir(parents=True, exist_ok=True)
     count = 0
 
-    def encode(crop: Image.Image) -> str:
+    def encode(image_bytes: bytes, mime: str) -> str:
         nonlocal count
         count += 1
         name = f"fig_{count:03d}.png"
-        crop.save(image_dir / name, format="PNG")
+        (image_dir / name).write_bytes(image_bytes)
         return f"{image_dir.name}/{name}"
 
     return encode
@@ -209,12 +217,14 @@ def _file_image_writer(image_dir: Path) -> Callable[[Image.Image], str]:
 def _figure_html(
     crop: Image.Image,
     caption_text: str | None,
-    encode_src: Callable[[Image.Image], str] = _base64_src,
+    encode_src: ImageSink = _base64_src,
 ) -> str:
-    """Return a ``<figure>`` element; ``encode_src`` turns the crop into the
-    ``<img src>`` (an inline data URI by default, a sidecar PNG path with
+    """Return a ``<figure>`` element; ``encode_src`` turns the crop's PNG bytes into
+    the ``<img src>`` (an inline data URI by default, a sidecar PNG path with
     :func:`_file_image_writer`)."""
-    src = encode_src(crop)
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    src = encode_src(buf.getvalue(), "image/png")
     caption_html = (
         f"<figcaption>{_caption_inner_html(caption_text)}</figcaption>"
         if caption_text

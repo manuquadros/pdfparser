@@ -25,21 +25,29 @@ Typical use::
 
 from __future__ import annotations
 
-from pdfparser.pipeline.assemble import lightonocr_pdf_to_html
+from pdfparser.pipeline.assemble import (
+    ParsedDocument,
+    lightonocr_pdf_to_document,
+    lightonocr_pdf_to_html,
+)
 from pdfparser.pipeline.errors import (
     OcrResponseError,
     OcrUnavailableError,
     PdfInputError,
     PdfParserError,
 )
+from pdfparser.pipeline.figures import ImageSink
 from pdfparser.pipeline.model import OcrModel, load_ocr_model
 
 __all__ = [
+    "ImageSink",
     "OcrModel",
     "OcrResponseError",
     "OcrUnavailableError",
+    "ParsedDocument",
     "PdfInputError",
     "PdfParserError",
+    "lightonocr_pdf_to_document",
     "lightonocr_pdf_to_html",
     "load_ocr_model",
 ]
