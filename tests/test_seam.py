@@ -47,6 +47,40 @@ class TestOcrSeam:
         assert part["type"] == "image_url"
         assert part["image_url"]["url"].startswith("data:image/png;base64,")
 
+    def test_ocr_upload_is_lossless(self) -> None:
+        """The PNG upload must decode pixel-identical to the rendered page, so the
+        encode's compression level is a pure speed knob with no effect on the OCR."""
+        import json
+
+        import httpx
+
+        from pdfparser.pipeline.model import OcrModel, _ocr_page
+
+        page = Image.frombytes(
+            "RGB",
+            (12, 9),
+            bytes((i * 37 + c * 53) % 256 for i in range(12 * 9) for c in range(3)),
+        )
+
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}]}
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
+        _ocr_page(page, ocr)
+
+        body = captured["body"]
+        assert isinstance(body, dict)
+        uri = body["messages"][0]["content"][0]["image_url"]["url"]
+        png = base64.b64decode(uri.split(",", 1)[1])
+        decoded = Image.open(io.BytesIO(png)).convert("RGB")
+        assert decoded.tobytes() == page.tobytes()
+
     def test_ocr_page_raises_on_server_error(self) -> None:
         import httpx
 

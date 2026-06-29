@@ -369,7 +369,11 @@ def _ocr_page(
     truncated text is kept rather than dropped.
     """
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    # compress_level=1 over the default 6: the upload destination is loopback
+    # (127.0.0.1 -> vLLM), so zlib effort buys no transfer time but ~2x the encode
+    # cost, which is GIL-bound across the concurrent _ocr_pages workers.  PNG is
+    # lossless, so the server decodes pixel-identical input and the OCR is unchanged.
+    image.save(buffer, format="PNG", compress_level=1)
     encoded = base64.b64encode(buffer.getvalue()).decode()
     content, finish_reason, prompt_tokens = _post_ocr_page(encoded, ocr, max_new_tokens)
     if finish_reason != "length" or prompt_tokens is None:
