@@ -187,6 +187,14 @@ def _opens_with_panel_label(block: str) -> bool:
 # crop→PNG encode happens once at the call site (:func:`_figure_html`), so a sink
 # never touches Pillow.
 ImageSink = Callable[[bytes, str], str]
+"""Image-delivery seam: ``(png_bytes, mime) -> src``.
+
+Given a figure crop's encoded PNG bytes and its MIME type, returns the string written
+into the figure's ``<img src>`` — an inline ``data:`` URI (:func:`_base64_src`), a
+sidecar-PNG path (:func:`_file_image_writer`), or a served URL from a caller-supplied
+store.  The crop is encoded to PNG once, in :func:`_figure_html`, so a sink never
+touches Pillow.
+"""
 
 
 def _base64_src(image_bytes: bytes, mime: str) -> str:

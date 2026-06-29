@@ -447,6 +447,64 @@ class TestOcrSeam:
         # the probe failed, so the pool must be torn down rather than leaked
         assert built and built[0].is_closed  # type: ignore[attr-defined]
 
+    def test_reconnect_rebuilds_pool_and_reprobes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        # The restarted server reports a different context window on the second probe.
+        probes = {"n": 0}
+        reported = [4096, 16384]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            i = probes["n"]
+            probes["n"] += 1
+            return httpx.Response(200, json={"data": [{"max_model_len": reported[i]}]})
+
+        self._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1", model="m", timeout=123.0)
+        assert ocr.context_len == 4096
+        first_client = ocr.client
+
+        returned = ocr.reconnect()
+        assert returned is ocr  # in-place, chainable
+        assert probes["n"] == 2  # re-probed the restarted server
+        assert ocr.context_len == 16384  # context window re-read
+        assert ocr.base_url == "http://srv/v1" and ocr.model == "m"
+        assert ocr.request_timeout == 123.0  # explicit timeout preserved
+        assert first_client.is_closed  # stale pool torn down
+        assert not ocr.client.is_closed and ocr.client is not first_client
+        ocr.close()
+
+    def test_reconnect_keeps_old_bundle_when_reprobe_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        from pdfparser.pipeline.model import load_ocr_model
+
+        probes = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            probes["n"] += 1
+            if probes["n"] == 1:
+                return httpx.Response(200, json={"data": [{"max_model_len": 8192}]})
+            return httpx.Response(503, json={"error": "restarting"})
+
+        built = self._patch_client(monkeypatch, handler)
+        ocr = load_ocr_model(base_url="http://srv/v1", model="m")
+        first_client = ocr.client
+
+        with pytest.raises(OcrUnavailableError):
+            ocr.reconnect()
+        # the freshly built (failed) pool is closed; the original bundle is untouched
+        assert built[1].is_closed  # type: ignore[attr-defined]
+        assert ocr.client is first_client and not ocr.client.is_closed
+        assert ocr.context_len == 8192
+        ocr.close()
+
 
 class TestOcrTransientRetry:
     """A transient connection blip or vLLM overload status on one page must not

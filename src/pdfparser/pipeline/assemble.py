@@ -798,8 +798,9 @@ def lightonocr_pdf_to_document(
         best-effort DOI.
 
     Raises:
-        OcrUnavailableError / OcrResponseError / PdfInputError: per the typed boundary
-        in :mod:`pdfparser.pipeline.errors`.
+        OcrUnavailableError: The OCR server was unreachable, unhealthy, or timed out.
+        OcrResponseError: The OCR server replied, but the payload was unconsumable.
+        PdfInputError: The input PDF could not be opened or rendered.
     """
     owns_ocr = ocr is None
     if ocr is None:

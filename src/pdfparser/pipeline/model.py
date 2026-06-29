@@ -80,6 +80,10 @@ class OcrModel:
     at load time — it sizes *both* the httpx pool (``_client_limits``) and the
     ``_ocr_pages`` worker count, so reading it once here keeps the two in lock-step
     (a re-read at call time could desync the workers from the pool cap).
+
+    ``request_timeout`` is the resolved per-request budget, retained so
+    :meth:`reconnect` can rebuild the pool with the *same* timeout the caller chose
+    (an explicit ``load_ocr_model(timeout=…)`` would otherwise be lost on reconnect).
     """
 
     client: httpx.Client
@@ -87,6 +91,7 @@ class OcrModel:
     model: str
     context_len: int = _DEFAULT_MODEL_CONTEXT_LEN
     concurrency: int = _DEFAULT_OCR_CONCURRENCY
+    request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_S
 
     def close(self) -> None:
         self.client.close()
@@ -96,6 +101,34 @@ class OcrModel:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+    def reconnect(self) -> OcrModel:
+        """Rebuild the connection pool and re-probe the server **in place**.
+
+        For a long-lived worker (the annotation-hub batch ingester holds one
+        ``OcrModel`` across many documents): if the vLLM server restarts, the pooled
+        connections go stale and its config (the context window) may change.  Calling
+        this on a persistent :class:`OcrUnavailableError` swaps in a fresh pool and
+        re-reads ``context_len``/``concurrency`` from the new server *without* dropping
+        the bundle the worker threads around — every existing reference stays valid.
+
+        The new pool is built and probed first; only on success is the stale pool
+        closed and its fields swapped in, so a failed reconnect leaves the existing
+        bundle intact and usable.  ``base_url``/``model``/``request_timeout`` are
+        preserved.  Returns ``self`` so the call can be chained.
+
+        Raises:
+            OcrUnavailableError: if the server is still unreachable (the freshly built
+                pool is closed on that path by ``load_ocr_model``; ``self`` is left
+                untouched).
+        """
+        fresh = load_ocr_model(self.base_url, self.model, self.request_timeout)
+        self.close()  # tear down the stale pool only once the new one is up
+        self.client = fresh.client
+        self.context_len = fresh.context_len
+        self.concurrency = fresh.concurrency
+        self.request_timeout = fresh.request_timeout
+        return self
 
 
 def _resolve_base_url(base_url: str | None) -> str:
@@ -163,6 +196,7 @@ def load_ocr_model(
         model=model,
         context_len=context_len,
         concurrency=concurrency,
+        request_timeout=request_timeout,
     )
 
 
