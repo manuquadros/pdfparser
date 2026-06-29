@@ -7,6 +7,8 @@ from pathlib import Path  # noqa: TC003 — beartype reads annotations at runtim
 import pypdfium2 as pdfium
 from PIL import Image
 
+from pdfparser.pipeline.errors import PdfInputError
+
 _RENDER_SCALE = 200 / 72  # 200 DPI per the model card
 _OCR_MAX_LONG_SIDE = 1540  # model-card target; VRAM ≈ 2.7/6.1 GiB at this size
 
@@ -44,7 +46,10 @@ def _render_page_images(pdf_path: Path) -> list[Image.Image]:
     image from the pdfium bitmap, so the document can be closed before the images are
     consumed.
     """
-    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+    except (pdfium.PdfiumError, FileNotFoundError) as exc:
+        raise PdfInputError(f"could not open PDF: {pdf_path}") from exc
     try:
         return [
             _downscale_to_long_side(
@@ -54,5 +59,7 @@ def _render_page_images(pdf_path: Path) -> list[Image.Image]:
             )
             for page in pdf
         ]
+    except pdfium.PdfiumError as exc:
+        raise PdfInputError(f"could not render PDF: {pdf_path}") from exc
     finally:
         pdf.close()

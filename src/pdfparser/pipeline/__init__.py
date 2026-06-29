@@ -26,6 +26,20 @@ Typical use::
 from __future__ import annotations
 
 from pdfparser.pipeline.assemble import lightonocr_pdf_to_html
+from pdfparser.pipeline.errors import (
+    OcrResponseError,
+    OcrUnavailableError,
+    PdfInputError,
+    PdfParserError,
+)
 from pdfparser.pipeline.model import OcrModel, load_ocr_model
 
-__all__ = ["OcrModel", "lightonocr_pdf_to_html", "load_ocr_model"]
+__all__ = [
+    "OcrModel",
+    "OcrResponseError",
+    "OcrUnavailableError",
+    "PdfInputError",
+    "PdfParserError",
+    "lightonocr_pdf_to_html",
+    "load_ocr_model",
+]

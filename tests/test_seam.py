@@ -10,6 +10,8 @@ from helpers import (
 )
 from PIL import Image
 
+from pdfparser.pipeline.errors import OcrResponseError, OcrUnavailableError
+
 
 class TestOcrSeam:
     """The model seam is now an HTTP client to the vLLM server, so it is
@@ -91,7 +93,7 @@ class TestOcrSeam:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(OcrUnavailableError):
             _ocr_page(_fake_image(8, 8), ocr)
 
     def test_ocr_page_null_content_returns_empty_string(self) -> None:
@@ -118,10 +120,10 @@ class TestOcrSeam:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
-        with pytest.raises(RuntimeError, match="unexpected OCR response"):
+        with pytest.raises(OcrResponseError, match="unexpected OCR response"):
             _ocr_page(_fake_image(8, 8), ocr)
 
-    def test_ocr_page_null_choices_raises_runtime_error(self) -> None:
+    def test_ocr_page_null_choices_raises_ocr_response_error(self) -> None:
         import httpx
 
         from pdfparser.pipeline.model import OcrModel, _ocr_page
@@ -133,7 +135,7 @@ class TestOcrSeam:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
-        with pytest.raises(RuntimeError, match="unexpected OCR response"):
+        with pytest.raises(OcrResponseError, match="unexpected OCR response"):
             _ocr_page(_fake_image(8, 8), ocr)
 
     def test_ocr_page_non_string_content_raises(self) -> None:
@@ -150,7 +152,7 @@ class TestOcrSeam:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
-        with pytest.raises(RuntimeError, match="unexpected OCR content type"):
+        with pytest.raises(OcrResponseError, match="unexpected OCR content type"):
             _ocr_page(_fake_image(8, 8), ocr)
 
     def test_truncated_page_is_reocrd_with_full_context(self) -> None:
@@ -323,7 +325,7 @@ class TestOcrSeam:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="lightonocr")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(OcrUnavailableError):
             _ocr_pages([_fake_image(8, 8), _fake_image(9, 8)], ocr, concurrency=2)
 
     def test_ocr_model_context_manager_closes_client(self) -> None:
@@ -439,8 +441,9 @@ class TestOcrSeam:
         built = self._patch_client(
             monkeypatch, lambda request: httpx.Response(503, json={"error": "down"})
         )
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(OcrUnavailableError) as excinfo:
             load_ocr_model(base_url="http://srv/v1")
+        assert isinstance(excinfo.value.__cause__, httpx.HTTPError)
         # the probe failed, so the pool must be torn down rather than leaked
         assert built and built[0].is_closed  # type: ignore[attr-defined]
 
@@ -583,7 +586,7 @@ class TestOcrTransientRetry:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(OcrUnavailableError):
             _ocr_page(_fake_image(8, 8), ocr)
         # the initial attempt plus exactly _MAX_OCR_RETRIES retries, then it gives up
         assert len(calls) == _MAX_OCR_RETRIES + 1
@@ -606,7 +609,7 @@ class TestOcrTransientRetry:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(OcrUnavailableError):
             _ocr_page(_fake_image(8, 8), ocr)
         assert len(calls) == 1
 
@@ -628,8 +631,9 @@ class TestOcrTransientRetry:
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
-        with pytest.raises(httpx.ReadTimeout):
+        with pytest.raises(OcrUnavailableError) as excinfo:
             _ocr_page(_fake_image(8, 8), ocr)
+        assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
         assert len(calls) == 1
 
     def test_retry_after_header_is_honored_and_capped(
@@ -769,7 +773,7 @@ class TestOcrConcurrencyResolution:
         client = httpx.Client(transport=httpx.MockTransport(handler))
         ocr = OcrModel(client=client, base_url="http://srv/v1", model="m")
         try:
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(OcrUnavailableError):
                 _ocr_pages([_fake_image(10, 8), _fake_image(11, 8)], ocr, concurrency=2)
         finally:
             release.set()  # let the still-running slow page unwind
@@ -990,7 +994,9 @@ class TestCli:
         pdf = self._make_pdf(tmp_path)
 
         def boom(*a: object, **k: object) -> str:
-            raise httpx.ConnectError("connection refused")
+            raise OcrUnavailableError("server unreachable") from httpx.ConnectError(
+                "connection refused"
+            )
 
         monkeypatch.setattr(cli, "lightonocr_pdf_to_html", boom)
         # An unreachable server must yield a concise stderr message naming the resolved

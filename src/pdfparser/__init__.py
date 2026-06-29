@@ -9,6 +9,20 @@ try:
 except ImportError:
     pass
 
-from pdfparser.pipeline import lightonocr_pdf_to_html, load_ocr_model
+from pdfparser.pipeline import (
+    OcrResponseError,
+    OcrUnavailableError,
+    PdfInputError,
+    PdfParserError,
+    lightonocr_pdf_to_html,
+    load_ocr_model,
+)
 
-__all__ = ["lightonocr_pdf_to_html", "load_ocr_model"]
+__all__ = [
+    "OcrResponseError",
+    "OcrUnavailableError",
+    "PdfInputError",
+    "PdfParserError",
+    "lightonocr_pdf_to_html",
+    "load_ocr_model",
+]

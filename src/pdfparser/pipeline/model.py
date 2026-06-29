@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import httpx
 from PIL import Image  # noqa: TC002 — beartype reads annotations at runtime
 
+from pdfparser.pipeline.errors import OcrResponseError, OcrUnavailableError
+
 _DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 _DEFAULT_MODEL = "lightonocr"
 _OCR_MAX_NEW_TOKENS = 2048
@@ -130,8 +132,9 @@ def load_ocr_model(
             ``PDFPARSER_OCR_TIMEOUT``, then ``_DEFAULT_REQUEST_TIMEOUT_S``.
 
     Raises:
-        httpx.HTTPError: If the server is unreachable or unhealthy.  Callers that
-            want to degrade gracefully (e.g. the integration fixture) catch this.
+        OcrUnavailableError: If the server is unreachable or unhealthy (the probe's
+            ``httpx.HTTPError`` is preserved as ``__cause__``).  Callers that want to
+            degrade gracefully (e.g. the integration fixture) catch this.
     """
     base_url = _resolve_base_url(base_url)
     model = model or os.environ.get("PDFPARSER_VLLM_MODEL", _DEFAULT_MODEL)
@@ -141,9 +144,11 @@ def load_ocr_model(
     try:
         response = client.get(f"{base_url}/models", timeout=_resolve_health_timeout())
         response.raise_for_status()
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
         client.close()  # don't leak the pool when the probe fails
-        raise
+        raise OcrUnavailableError(
+            f"vLLM server at {base_url} is unreachable or unhealthy"
+        ) from exc
     # The probe doubles as the context-window query (vLLM reports max_model_len in
     # /models), so the truncation-retry budget matches the live server with no extra
     # round trip.  A non-JSON body (a bare-200 mock / non-vLLM endpoint) falls back.
@@ -312,7 +317,9 @@ def _request_ocr(encoded: str, ocr: OcrModel, max_new_tokens: int) -> httpx.Resp
             return response
         except httpx.HTTPError as exc:
             if not _is_retryable_ocr_error(exc) or attempt >= _MAX_OCR_RETRIES:
-                raise
+                raise OcrUnavailableError(
+                    f"OCR request to {ocr.base_url} failed"
+                ) from exc
             time.sleep(_retry_delay(exc, attempt))
     raise AssertionError("unreachable: OCR retry loop exited without return/raise")
 
@@ -335,7 +342,7 @@ def _post_ocr_page(
     except (KeyError, IndexError, TypeError) as exc:
         # TypeError covers a null-valued key ("choices": null -> None[0]), not just
         # a missing one, so a malformed shape always surfaces as this clear error.
-        raise RuntimeError(f"unexpected OCR response shape: {payload}") from exc
+        raise OcrResponseError(f"unexpected OCR response shape: {payload}") from exc
     finish_reason = choice.get("finish_reason")
     usage = payload.get("usage")
     prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
@@ -347,7 +354,7 @@ def _post_ocr_page(
     if content is None:
         return "", finish_reason, prompt_tokens
     if not isinstance(content, str):
-        raise RuntimeError(f"unexpected OCR content type: {payload}")
+        raise OcrResponseError(f"unexpected OCR content type: {payload}")
     return content, finish_reason, prompt_tokens
 
 

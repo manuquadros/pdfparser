@@ -10,9 +10,11 @@ import argparse
 import sys
 from pathlib import Path
 
-import httpx
-
-from pdfparser.pipeline import lightonocr_pdf_to_html
+from pdfparser.pipeline import (
+    OcrUnavailableError,
+    PdfParserError,
+    lightonocr_pdf_to_html,
+)
 from pdfparser.pipeline.model import _resolve_base_url
 
 
@@ -61,15 +63,21 @@ def main(argv: list[str] | None = None) -> int:
             model=args.vllm_model,
             image_dir=args.image_dir,
         )
-    except httpx.HTTPError as exc:
-        # load_ocr_model raises this when the server is down — the likeliest failure
-        # a human hits.  Surface it as a one-line message, not a raw traceback.
+    except OcrUnavailableError as exc:
+        # Raised when the server is down/unhealthy — the likeliest failure a human
+        # hits.  Surface the underlying network error as a one-line message, not a raw
+        # traceback (the typed wrapper's __cause__ carries the concrete detail).
         url = _resolve_base_url(args.vllm_url)
+        detail = exc.__cause__ if exc.__cause__ is not None else exc
         print(
-            f"error: could not reach the vLLM server at {url} ({exc}). "
+            f"error: could not reach the vLLM server at {url} ({detail}). "
             "Is it running? See deploy/vllm/run-server.sh.",
             file=sys.stderr,
         )
+        return 1
+    except PdfParserError as exc:
+        # A bad input PDF or a malformed OCR response — concise message, no traceback.
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     output.write_text(html, encoding="utf-8")
