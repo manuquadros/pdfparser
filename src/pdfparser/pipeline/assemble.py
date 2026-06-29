@@ -69,6 +69,7 @@ from pdfparser.pipeline.tables import (
     _close_unclosed_tables,
     _collapse_repeated_rows_md,
     _recover_dropped_tables,
+    _recover_table_cell_bold,
     _repair_tables_from_text_layer,
 )
 from pdfparser.pipeline.text import (
@@ -753,6 +754,10 @@ def lightonocr_pdf_to_html(
             # cells) from the deterministic PDF text layer, keeping the OCR's cell
             # formatting.
             pages_md = _repair_tables_from_text_layer(layers, pages_md)
+            # Re-apply <strong> to table cells the OCR transcribed plain but that are
+            # boldfaced in the PDF (section/total rows).  After the table passes so it
+            # bolds whatever table HTML survives (re-OCR'd or rebuilt).
+            pages_md = _recover_table_cell_bold(layers, pages_md)
             pages_md = _recover_dropped_figures(layers, pages_md, ocr_region)
             # Recover short tails the OCR truncated, from the PDF text layer.  Runs
             # *after* table/figure recovery so an appended tail can neither feed the

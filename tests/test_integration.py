@@ -1083,6 +1083,35 @@ class TestBioscienceReportsRunningHeader:
         assert "Figure 4. Crystal structures" not in body_no_figures
 
 
+@pytest.mark.integration
+class TestBioscienceReportsTableBold:
+    """Table 1's boldfaced section rows (Data collection, Refinement, …) are
+    transcribed as plain cells by the OCR; the table-cell bold recovery re-applies
+    <strong> from the PDF text-layer font weight."""
+
+    _BOLD_ROWS = (
+        "Data collection",
+        "Cell dimension",
+        "Refinement",
+        "Number of atoms",
+        "Ramachandran plot",
+    )
+
+    def test_bold_section_rows_recovered(self, bsr_html: str) -> None:
+        bolded = {
+            row
+            for row in self._BOLD_ROWS
+            if re.search(rf"<td[^>]*><strong>{re.escape(row)}", bsr_html)
+        }
+        # most section rows come back bold (tolerate an OCR cell-text garble that would
+        # make one row miss the text-layer match)
+        assert len(bolded) >= 3, f"only {bolded} bolded"
+
+    def test_plain_data_cell_not_bolded(self, bsr_html: str) -> None:
+        # a numeric data value (the X-ray wavelength) is not spuriously bolded
+        assert "<strong>0.9795" not in bsr_html
+
+
 @pytest.fixture(scope="session")
 def jafc_html(ocr_model: object) -> str:
     """Full pipeline HTML for the J. Agric. Food Chem. 31298526.pdf fixture; skip if

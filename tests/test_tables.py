@@ -1312,7 +1312,7 @@ class TestRepairLazyExtraction:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
                 "pdfparser.pipeline.layers._page_layer",
-                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
+                lambda page: calls.append(1) or _PageLayer("", [], [], [], "", []),
             )
             # a 3-column table: the repair only understands label|value (2-col) tables
             md = "<table><tr><td>a</td><td>b</td><td>c</td></tr></table>"
@@ -1333,7 +1333,7 @@ class TestRepairLazyExtraction:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
                 "pdfparser.pipeline.layers._page_layer",
-                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
+                lambda page: calls.append(1) or _PageLayer("", [], [], [], "", []),
             )
             # _repair_page_tables resolves _reconstruct_table_from_text_layer in the
             # rebuild submodule, so patch it there (not the tables package re-export).
@@ -1365,7 +1365,7 @@ class TestDocumentLayersCache:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
                 "pdfparser.pipeline.layers._page_layer",
-                lambda page: calls.append(1) or _PageLayer("", [], [], "", []),
+                lambda page: calls.append(1) or _PageLayer("", [], [], [], "", []),
             )
             layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
             # the table pass and the figure pass both localize against page 0
@@ -1375,3 +1375,158 @@ class TestDocumentLayersCache:
         assert first is second  # memoized, same instance handed back
         assert other is not first
         assert calls == [1, 1]  # once for page 0, once for page 1 — never re-extracted
+
+
+class TestTableCellBold:
+    """Re-applying <strong> to bold table cells from the PDF text layer: the bold
+    threshold, the contextual (document-order) cell matcher, the majority vote, and the
+    th/already-bold/miss guards — plus an end-to-end run on the real fixture layer."""
+
+    def test_is_bold_glyph_threshold(self) -> None:
+        from pdfparser.pipeline.tables import _is_bold_glyph
+
+        assert not _is_bold_glyph(None)
+        assert not _is_bold_glyph(315)
+        assert not _is_bold_glyph(599)
+        assert _is_bold_glyph(600)
+        assert _is_bold_glyph(708)
+
+    def test_majority_vote_bolds_cell(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # "Total" is bold (708×5), "x" is normal (315) — only the bold cell is wrapped.
+        table = "<table><tr><td>Total</td><td>x</td></tr></table>"
+        out = _rewrap_bold_cells(table, "total x", [708] * 5 + [None, 315])
+        assert "<td><strong>Total</strong></td>" in out
+        assert "<td>x</td>" in out
+
+    def test_one_thin_glyph_still_bold_majority(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # 4/5 glyphs bold (0.8 >= 0.6) — one antialiased-thin glyph doesn't un-bold it.
+        table = "<table><tr><td>Total</td></tr></table>"
+        out = _rewrap_bold_cells(table, "total", [708, 708, 315, 708, 708])
+        assert "<td><strong>Total</strong></td>" in out
+
+    def test_lone_bold_glyph_does_not_bold_cell(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # 1/5 glyphs bold (0.2 < 0.6) — a stray bold glyph leaves the cell plain.
+        table = "<table><tr><td>Total</td></tr></table>"
+        out = _rewrap_bold_cells(table, "total", [708, 315, 315, 315, 315])
+        assert "<td>Total</td>" in out
+
+    def test_repeated_cell_binds_in_document_order(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # "Resolution" twice: the first occurrence is bold, the second normal — the
+        # monotonic cursor binds each cell to its own occurrence, not always the first.
+        table = (
+            "<table><tr><td>Resolution</td></tr><tr><td>Resolution</td></tr></table>"
+        )
+        weights = [708] * 10 + [None] + [315] * 10
+        out = _rewrap_bold_cells(table, "resolution resolution", weights)
+        assert out.count("<strong>") == 1
+        assert out.index("<strong>") < out.index("</tr><tr>")
+
+    def test_miss_leaves_cell_unchanged(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # The OCR text isn't in the layer here → no guess, cell unchanged.
+        table = "<table><tr><td>xyz</td></tr></table>"
+        out = _rewrap_bold_cells(table, "abc", [708, 708, 708])
+        assert out == table
+
+    def test_header_th_not_bolded(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # A <th> matches and advances the cursor (so later cells stay aligned) but is
+        # never wrapped — the render's CSS already differentiates headers.
+        table = "<table><tr><th>Header</th></tr></table>"
+        out = _rewrap_bold_cells(table, "header", [708] * 6)
+        assert out == table
+
+    def test_already_bold_cell_not_double_wrapped(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        table = "<table><tr><td><strong>foo</strong></td></tr></table>"
+        out = _rewrap_bold_cells(table, "foo", [708, 708, 708])
+        assert out.count("<strong>") == 1
+
+    def test_empty_cell_unchanged_and_keeps_cursor(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # An empty cell is skipped without consuming the cursor, so the following bold
+        # cell still binds to its glyph run.
+        table = "<table><tr><td></td><td>Total</td></tr></table>"
+        out = _rewrap_bold_cells(table, "total", [708] * 5)
+        assert "<td></td>" in out
+        assert "<td><strong>Total</strong></td>" in out
+
+    def test_inline_markup_cell_rewrapped_whole(self) -> None:
+        from pdfparser.pipeline.tables import _rewrap_bold_cells
+
+        # A bold cell carrying inline markup is wrapped around its whole inner HTML,
+        # preserving the sub-tag (a blind string replace would corrupt it).
+        table = "<table><tr><td>R<sub>merge</sub></td></tr></table>"
+        out = _rewrap_bold_cells(table, "rmerge", [708] * 6)
+        assert "<td><strong>R<sub>merge</sub></strong></td>" in out
+
+    def test_apply_table_bold_no_text_layer_is_noop(self) -> None:
+        from unittest.mock import MagicMock
+
+        import pypdfium2 as pdfium
+        import pytest
+
+        from pdfparser.pipeline.layers import _DocumentLayers, _PageLayer
+        from pdfparser.pipeline.tables import _apply_table_bold
+
+        # An image-only / scanned page: the text layer carries no font-weight metadata
+        # (every weight None) → every table is returned unchanged.
+        md = "<table><tr><td>Total</td></tr></table>"
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "pdfparser.pipeline.layers._page_layer",
+                lambda page: _PageLayer("", [], [], [], "", []),
+            )
+            layers = _DocumentLayers(MagicMock(spec=pdfium.PdfDocument))
+            assert _apply_table_bold(md, layers, 0) == md
+
+    def test_recover_table_cell_bold_31123167_deterministically(self) -> None:
+        # End-to-end on the real PDF text layer (no GPU): Table 1's boldfaced section
+        # rows come back wrapped in <strong>, a plain data value does not, and the
+        # twice-occurring normal-weight "Resolution" stays plain.  Skips if absent.
+        import pathlib
+        import re as _re
+
+        import pytest
+
+        from pdfparser.pipeline.layers import _DocumentLayers
+        from pdfparser.pipeline.tables import _apply_table_bold
+
+        pdf = pathlib.Path(__file__).parent / "fixtures" / "31123167.pdf"
+        dump = (
+            pathlib.Path(__file__).parent
+            / "data"
+            / "dumps"
+            / "31123167_raw_markdown.md"
+        )
+        if not pdf.exists() or not dump.exists():
+            pytest.skip(f"fixture not found: {pdf} / {dump}")
+        pages = [
+            p.strip("\n")
+            for p in _re.split(
+                r"^===== PAGE \d+ =====$", dump.read_text("utf-8"), flags=_re.M
+            )[1:]
+        ]
+        with _DocumentLayers.open(str(pdf)) as layers:
+            out = _apply_table_bold(pages[4], layers, 4)
+        for row in (
+            "Data collection",
+            "Refinement",
+            "Number of atoms",
+            "Ramachandran plot (%)",
+        ):
+            assert f"<strong>{row}</strong>" in out
+        assert "<strong>0.9795" not in out  # a plain data value is not bolded
+        assert "<strong>Resolution" not in out  # normal-weight, appears twice

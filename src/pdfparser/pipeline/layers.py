@@ -65,11 +65,12 @@ def _snap_rotation(angle_deg: float) -> int:
 
 def _page_text_and_boxes(
     textpage: pdfium.PdfTextPage,
-) -> tuple[str, list[_Box | None], list[int | None]]:
-    """Page text paired with one glyph box and rotation per character, index-aligned.
+) -> tuple[str, list[_Box | None], list[int | None], list[int | None]]:
+    """Page text paired with one glyph box, rotation and font weight per character,
+    index-aligned.
 
     Built char by char in the same index domain so that position *p* in the
-    returned text always indexes ``boxes[p]`` and ``rotations[p]``.
+    returned text always indexes ``boxes[p]``, ``rotations[p]`` and ``weights[p]``.
     ``get_text_range()`` (the text view) and ``count_chars()`` (the char-array)
     disagree on real PDFs — pdfium drops or inserts characters between the two — so
     deriving the text from one and the boxes from the other would silently misalign
@@ -79,10 +80,15 @@ def _page_text_and_boxes(
     The rotation (snapped to a quarter turn) is what lets a sideways table — laid
     out at 90°/270° on the page — be localized along its true reading axis and the
     crop turned upright before re-OCR; ``FPDFText_GetCharAngle`` returns the glyph's
-    counter-clockwise rotation in radians (a negative value signals an error)."""
+    counter-clockwise rotation in radians (a negative value signals an error).
+
+    The font weight (CSS-style: 400 normal, 700 bold; ``FPDFText_GetFontWeight``
+    returns ``-1`` on error → ``None``) backs the table-cell bold recovery, which
+    re-applies ``<strong>`` to cells the OCR transcribed as plain text."""
     parts: list[str] = []
     boxes: list[_Box | None] = []
     rotations: list[int | None] = []
+    weights: list[int | None] = []
     raw = textpage.raw
     for i in range(textpage.count_chars()):
         ch = textpage.get_text_range(i, 1)
@@ -95,10 +101,13 @@ def _page_text_and_boxes(
             box = None
         angle = pdfium_c.FPDFText_GetCharAngle(raw, i)
         rot = _snap_rotation(math.degrees(angle)) if angle >= 0 else None
+        weight = pdfium_c.FPDFText_GetFontWeight(raw, i)
         parts.append(ch)
-        boxes.extend([box] * len(ch))  # a glyph may decode to several text chars
+        # a glyph may decode to several text chars — replicate its metadata per char
+        boxes.extend([box] * len(ch))
         rotations.extend([rot] * len(ch))
-    return "".join(parts), boxes, rotations
+        weights.extend([weight if weight >= 0 else None] * len(ch))
+    return "".join(parts), boxes, rotations, weights
 
 
 @dataclass(frozen=True)
@@ -107,13 +116,15 @@ class _PageLayer:
     normalized text and its index map back to the raw stream.
 
     Building it walks the page char by char through pdfium's native API (a
-    ``get_text_range`` + ``get_charbox`` + ``FPDFText_GetCharAngle`` round-trip each —
-    thousands of ctypes calls), so the localization passes share one instance per page
-    rather than re-extracting it per table."""
+    ``get_text_range`` + ``get_charbox`` + ``FPDFText_GetCharAngle`` +
+    ``FPDFText_GetFontWeight`` round-trip each — thousands of ctypes calls), so the
+    localization passes share one instance per page rather than re-extracting it per
+    table."""
 
     page_text: str
     char_boxes: list[_Box | None]
     char_rotations: list[int | None]
+    char_weights: list[int | None]
     norm: str
     idx_map: list[int]
 
@@ -123,11 +134,15 @@ def _page_layer(page: pdfium.PdfPage) -> _PageLayer:
     text page handle rather than leaking it to GC."""
     textpage = page.get_textpage()
     try:
-        page_text, char_boxes, char_rotations = _page_text_and_boxes(textpage)
+        page_text, char_boxes, char_rotations, char_weights = _page_text_and_boxes(
+            textpage
+        )
     finally:
         textpage.close()
     norm, idx_map = _normalize_with_map(page_text)
-    return _PageLayer(page_text, char_boxes, char_rotations, norm, idx_map)
+    return _PageLayer(
+        page_text, char_boxes, char_rotations, char_weights, norm, idx_map
+    )
 
 
 class _DocumentLayers:

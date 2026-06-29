@@ -14,6 +14,14 @@ submodule (e.g. ``pdfparser.pipeline.tables.recover._region_fully_captured``), n
 this package, since the caller resolves it in that submodule's namespace.
 """
 
+from pdfparser.pipeline.tables.enrich import (
+    _apply_table_bold,
+    _bbox_glyph_run,
+    _bold_one_table,
+    _is_bold_glyph,
+    _recover_table_cell_bold,
+    _rewrap_bold_cells,
+)
 from pdfparser.pipeline.tables.localize import (
     _adjacent_para_tokens,
     _glyph_centers,
@@ -53,6 +61,9 @@ from pdfparser.pipeline.tables.recover import (
 
 __all__ = [
     "_adjacent_para_tokens",
+    "_apply_table_bold",
+    "_bbox_glyph_run",
+    "_bold_one_table",
     "_cell_format_map",
     "_cell_texts",
     "_close_unclosed_tables",
@@ -66,13 +77,16 @@ __all__ = [
     "_group_glyph_rows",
     "_group_lines",
     "_in_bbox_tokens",
+    "_is_bold_glyph",
     "_leading_caption_rows",
     "_legend_footnote_html",
     "_locate_bbox",
     "_nonempty_cell_count",
     "_reconstruct_table_from_text_layer",
     "_recover_dropped_tables",
+    "_recover_table_cell_bold",
     "_region_fully_captured",
+    "_rewrap_bold_cells",
     "_repair_page_tables",
     "_repair_tables_from_text_layer",
     "_rows_to_cells",
