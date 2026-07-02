@@ -311,6 +311,30 @@ retries surfaces as a typed
 :class:`~pdfparser.pipeline.errors.OcrResponseError` a batch worker can classify for
 re-queue, not a raw ``httpx`` traceback.
 
+Leading image-only pages are skipped *before* OCR.  An ad-prefixed article opens with a
+full-page-image cover the model would transcribe to garbage the assembly discards
+anyway — one or two wasted ~10–24 s round trips, more wall-clock than any other saving
+on this side of the seam.  :func:`~pdfparser.pipeline.layers._leading_image_only_pages`
+reads the PDF text layer first and, for the *leading run* of pages whose layer is
+essentially empty (below a small alphanumeric floor,
+:func:`~pdfparser.pipeline.layers._is_trivial_text_layer`), sends nothing to the model;
+each skipped page is padded with empty markdown so the page↔image alignment the recovery
+passes and the assembly depend on survives, and the assembly's own article-start scan
+then drops the pads exactly as it dropped an OCR'd-but-heading-less cover before.  This
+is the one place the pipeline accepts a *possible* content loss for a performance gain,
+the opposite lean from the content-preserving biases above, and that is worth being
+explicit about: the empty-text-layer signal cannot tell an ad cover from a *scanned*
+first page carrying a real title and abstract, so a mixed-source PDF — an image page 0
+ahead of a born-digital body — would lose that page un-OCR'd.  It is accepted because it
+is vanishingly rare (a modern article's first page has a text layer) and the only way to
+be sure is to OCR the page, the exact cost the skip exists to avoid.  Two guards keep the
+blast radius small: the skip is the leading run only, never an interior page, and a
+document whose text layer is empty *everywhere* (a wholly-scanned paper) is left entirely
+to the model.  Deciding ad-versus-article for a page that *does* carry text stays the
+model's job (:func:`~pdfparser.pipeline.classify._is_article_page_md`); should a real
+fixture ever lose content here, the fix is a cap on how many leading pages may be
+skipped, not removing the skip.
+
 Tables are re-OCR'd from a tight crop (:mod:`pdfparser.pipeline.tables`).  The
 full-page pass silently drops small in-table content — a column-spanning
 subheader, the ``colspan``/``rowspan`` structure of a header — and does so at

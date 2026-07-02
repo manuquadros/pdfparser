@@ -214,20 +214,54 @@ class TestPipeline:
 
 
 @pytest.fixture(scope="session")
-def ad_prefix_html(ocr_model: object) -> str:
-    """Full pipeline output for the ad-prefixed 31051047.pdf fixture.
+def ad_prefix_run(ocr_model: object) -> tuple[str, list[int]]:
+    """Run the ad-prefixed 31051047.pdf fixture once, spying on the full-page OCR batch.
 
+    Returns the pipeline HTML plus the image counts each ``_ocr_pages`` call received.
+    The first call is the full-page pass (``_ocr_document_pages``); the later calls are
+    the table/figure crop re-OCR batches — so ``sizes[0]`` proves how many pages were
+    actually sent to the model, i.e. that the image-only ad page was skipped before OCR.
     Writes the result to tests/fixtures/31051047.html for visual inspection.
     """
     if not _AD_PREFIX_PDF.exists():
         pytest.skip(f"Fixture PDF not found: {_AD_PREFIX_PDF}")
-    return _run_pipeline_to_file(_AD_PREFIX_PDF, ocr_model)
+    from pdfparser.pipeline import assemble
+
+    sizes: list[int] = []
+    real_ocr_pages = assemble._ocr_pages
+
+    def _spy(
+        images: list[object], ocr: object, *args: object, **kwargs: object
+    ) -> list[str]:
+        sizes.append(len(images))
+        return real_ocr_pages(images, ocr, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(assemble, "_ocr_pages", _spy)
+        html = _run_pipeline_to_file(_AD_PREFIX_PDF, ocr_model)
+    return html, sizes
+
+
+@pytest.fixture(scope="session")
+def ad_prefix_html(ad_prefix_run: tuple[str, list[int]]) -> str:
+    return ad_prefix_run[0]
 
 
 @pytest.mark.integration
 class TestAdPageExclusion:
     """The 31051047.pdf fixture has an advertisement as its first page; the
     pipeline must drop it and start the document at the real article title."""
+
+    def test_ad_page_skipped_before_ocr(
+        self, ad_prefix_run: tuple[str, list[int]]
+    ) -> None:
+        # The pre-OCR text-layer skip drops the image-only ad (page 0) before OCR, so
+        # the full-page pass — the first _ocr_pages call — sees only the 10 article
+        # pages, never the ad.  That is 1–2 fewer ~10-24 s round trips per ad-prefixed
+        # document, the perf win, and it costs the model no OCR of a page whose output
+        # the leading-page skip discards anyway.
+        _, sizes = ad_prefix_run
+        assert sizes[0] == 10  # 11 pages total, ad page 0 excluded
 
     def test_title_starts_with_article_title(self, ad_prefix_html: str) -> None:
         # The title carries the PDF's intra-title line breaks; normalize runs of

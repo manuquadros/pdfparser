@@ -25,6 +25,15 @@ import pypdfium2.raw as pdfium_c
 
 _Box = tuple[float, float, float, float]  # PDF points: left, bottom, right, top
 
+# A leading page whose text layer holds fewer than this many alphanumeric characters
+# is treated as image-only furniture (an ad/cover) rather than article content: a real
+# article page carries ~1500+ alnum chars in its text layer, while a full-page-image
+# cover carries ~0 (see ``_leading_image_only_pages``).  Deliberately well below any
+# real page — the skip must never drop content, so a page with even a sentence of text
+# (a graphical-abstract caption, a masthead) stays above the bar and is left to the OCR
+# and the model's own article-start detection.
+_MIN_TEXT_LAYER_ALNUM = 32
+
 
 def _normalize_with_map(text: str) -> tuple[str, list[int]]:
     """Fold text to matchable form and map each output char to its source index.
@@ -204,3 +213,55 @@ class _DocumentLayers:
             return str(textpage.get_text_range())
         finally:
             textpage.close()
+
+
+def _is_trivial_text_layer(page_text: str) -> bool:
+    """Whether a page's text layer is essentially empty — an image-only page.
+
+    Keyed on the alphanumeric-character count (not raw length) so whitespace, form
+    feeds and stray punctuation a scanner may leave don't read as content.  A page
+    below ``_MIN_TEXT_LAYER_ALNUM`` alnum chars carries no extractable text worth
+    OCRing (its OCR would be a garbled transcription of a picture)."""
+    return sum(ch.isalnum() for ch in page_text) < _MIN_TEXT_LAYER_ALNUM
+
+
+def _leading_image_only_count(trivial: list[bool]) -> int:
+    """Length of the leading run of image-only (empty-text-layer) pages.
+
+    ``trivial[i]`` is whether page *i*'s text layer is essentially empty.  The index of
+    the first text-bearing page is the count of leading empty pages to skip (never an
+    interior page — mirrors ``_leading_pages_to_skip_md``'s leading-run semantics, and
+    is the same ``next((i for …), 0)`` idiom).  The default-0 covers the all-empty case:
+    a fully-scanned paper has no usable text layer anywhere, so there is nothing to
+    distinguish a cover from the article and the model must OCR it all (skip 0)."""
+    return next((i for i, t in enumerate(trivial) if not t), 0)
+
+
+def _leading_image_only_pages(layers: _DocumentLayers) -> int:
+    """Count the leading image-only pages that can be skipped before OCR.
+
+    A full-page-image ad/cover before the article (e.g. ``31051047.pdf``) has an empty
+    text layer and OCRs to garbage the leading-page skip discards anyway — one or two
+    wasted ~10-24 s round trips.  Reading the (shared) text layer here decides, *before*
+    any OCR, which leading pages needn't be sent at all.  Stops at the first
+    text-bearing page (the leading run can't extend past it), so a normal document costs
+    a single cheap text-view read; a *fully* image-only document (a scanned paper) has
+    no such page, so it reads every page and — via ``_leading_image_only_count``'s
+    all-empty guard — skips nothing.
+
+    **Tradeoff (deliberate).** The empty-text-layer signal cannot tell an ad/cover from
+    a *scanned* leading page that is genuine article content: a mixed document whose
+    leading page is an image carrying the real title/abstract, followed by text-bearing
+    pages, would have that page skipped and dropped (its image is never OCR'd).
+    Accepted because it is vanishingly rare — a modern article's first page carries a
+    text layer — and the only alternative is to OCR every page to find out, which is
+    exactly the cost this skip exists to avoid; the all-empty guard still protects a
+    wholly-scanned paper.  Do **not** widen the skip to a text-*bearing* page — deciding
+    ad-vs-article there stays the model's call via ``_is_article_page_md``."""
+    trivial: list[bool] = []
+    for i in range(len(layers)):
+        is_trivial = _is_trivial_text_layer(layers.page_raw_text(i))
+        trivial.append(is_trivial)
+        if not is_trivial:
+            break  # first text-bearing page ends the leading run — read no further
+    return _leading_image_only_count(trivial)
