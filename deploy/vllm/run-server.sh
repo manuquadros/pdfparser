@@ -21,6 +21,15 @@ HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 
+# bfloat16 needs Ampere+ (SM 8.0). On a pre-Ampere card (e.g. Pascal P100, SM 6.0)
+# set DTYPE=float16. ENFORCE_EAGER=--enforce-eager avoids CUDA-graph VRAM on the
+# small card; clear it (ENFORCE_EAGER="") on a bigger card for CUDA graphs.
+DTYPE="${DTYPE:-bfloat16}"
+# Unset -> --enforce-eager; ENFORCE_EAGER="" explicitly re-enables CUDA graphs.
+ENFORCE_EAGER="${ENFORCE_EAGER---enforce-eager}"
+# FlashAttention needs SM 8.0; on older cards set VLLM_ATTENTION_BACKEND=XFORMERS.
+VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-}"
+
 # Mount the host HF cache at a fixed path and point HF_HOME at it explicitly,
 # rather than guessing the image's home dir — the cache is reused (no re-pull of
 # the 2.7 GiB model) whether the container runs as root or a non-root user.
@@ -34,12 +43,13 @@ exec podman run --rm \
   -v "${HF_CACHE}:/hf-cache:rw" \
   -e HF_HOME=/hf-cache \
   -e VLLM_USE_FLASHINFER_SAMPLER=0 \
+  -e VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}" \
   "$IMAGE" \
     "$MODEL" \
     --served-model-name lightonocr \
-    --dtype bfloat16 \
+    --dtype "$DTYPE" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --limit-mm-per-prompt '{"image": 1}' \
-    --enforce-eager
+    $ENFORCE_EAGER
