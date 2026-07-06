@@ -1,0 +1,22 @@
+# P100 shim runtime — a SEPARATE environment from the pdfparser venv (which
+# carries no torch by design). See README.md.
+#
+# torch must ship Pascal (sm_60) kernels, which the pinned vLLM image does not.
+# The cu121 wheels through torch 2.6 include sm_60; the very latest (2.7+/cu128)
+# began dropping Maxwell/Pascal. 2.4.1+cu121 is a known-good sm_60-bearing pin.
+# Install with the PyTorch CUDA index:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# Then GATE on: python -c "import torch; print(torch.cuda.get_arch_list())"
+#   -> must contain 'sm_60'. If not, lower the torch pin.
+torch==2.4.1
+
+# LightOnOcrForConditionalGeneration / LightOnOcrProcessor ship inside a recent
+# transformers (no trust_remote_code). If the import fails, upgrade transformers;
+# if the upgrade forces a torch that dropped sm_60, pin transformers to the
+# minimum version that carries the LightOnOcr classes instead.
+transformers>=4.57
+accelerate>=0.30
+pillow>=10.0
+
+fastapi>=0.110
+uvicorn>=0.29
