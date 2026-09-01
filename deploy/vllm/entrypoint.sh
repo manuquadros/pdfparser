@@ -8,25 +8,26 @@ set -euo pipefail
 . /usr/local/bin/gpu-defaults.sh
 apply_gpu_defaults
 
-# An empty VLLM_ATTENTION_BACKEND is not the same as an unset one; on Ampere+ the
-# backend is vLLM's to choose.
-if [ -n "${VLLM_ATTENTION_BACKEND:-}" ]; then
-  export VLLM_ATTENTION_BACKEND
-else
-  unset VLLM_ATTENTION_BACKEND
-fi
-
 # vLLM rejects a command whose model is not the *first* positional ("`model`
-# should be provided as the first positional argument"), so the derived --dtype
-# can only be appended, never prepended.  Appended, it would also win over an
-# explicit --dtype in the command (vLLM takes the last occurrence) — so add ours
-# only when the caller supplied none.
+# should be provided as the first positional argument"), so derived flags can
+# only be appended, never prepended.  Appended, they would also win over an
+# explicit setting in the command — vLLM takes the last --dtype, and rejects
+# --attention-backend outright when --attention-config already carries one — so
+# add each only when the caller supplied nothing equivalent.
+derived=()
+caller_dtype=""
+caller_backend=""
 for arg in "$@"; do
   case "$arg" in
-    --dtype | --dtype=*)
-      exec vllm serve "$@"
-      ;;
+    --dtype | --dtype=*) caller_dtype=1 ;;
+    --attention-backend | --attention-backend=* | \
+      --attention-config | --attention-config=* | -ac) caller_backend=1 ;;
   esac
 done
 
-exec vllm serve "$@" --dtype "$DTYPE"
+[ -n "$caller_dtype" ] || derived+=(--dtype "$DTYPE")
+if [ -z "$caller_backend" ] && [ -n "${ATTENTION_BACKEND:-}" ]; then
+  derived+=(--attention-backend "$ATTENTION_BACKEND")
+fi
+
+exec vllm serve "$@" "${derived[@]}"

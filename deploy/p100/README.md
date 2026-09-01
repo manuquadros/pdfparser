@@ -17,8 +17,15 @@ is enough. The trade-off: serialized, eager attention, no continuous batching â€
 determinism/fidelity gate. If a T4/A10/A40/A6000/A100 (sm_75+) is available,
 prefer `deploy/vllm/` instead; this shim becomes unnecessary. A **T4** needs no
 hand-tuning there: `deploy/vllm/gpu-defaults.sh` reads the compute capability and
-picks `--dtype float16` with `VLLM_ATTENTION_BACKEND=TRITON_ATTN`, without which
-vLLM auto-selects FlashInfer and the engine dies on the first request.
+picks `--dtype float32` with `--attention-backend TRITON_ATTN`, without which
+vLLM auto-selects FlashInfer and the engine dies on the first request. Note the
+backend is a flag: `VLLM_ATTENTION_BACKEND` no longer exists in vLLM 0.22.1.
+
+**fp32 rather than fp16 there is not caution, it is measured:** under vLLM this
+model emits nothing but `!` at float16 while bfloat16 is correct, on both
+attention backends. That finding lands on this shim too â€” it runs
+`torch.float16` (see the fp16 note below), so smoke-test its output rather than
+assuming HF's eager attention escapes the overflow.
 
 ## Setup (host venv)
 

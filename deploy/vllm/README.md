@@ -45,17 +45,26 @@ Two of the server's settings depend on the card. Both `run-server.sh` and the
 unified image derive them at start time from the GPU's compute capability
 (`gpu-defaults.sh`), so neither has to be edited per machine:
 
-| Card | Example | `--dtype` | `VLLM_ATTENTION_BACKEND` |
+| Card | Example | `--dtype` | `--attention-backend` |
 |---|---|---|---|
-| Ampere or newer (sm_80+) | RTX Ada, A10, A100 | `bfloat16` | unset — vLLM chooses (FlashInfer) |
-| Turing (sm_75) | Tesla T4 | `float16` | `TRITON_ATTN` |
-| Undetectable (no `nvidia-smi`) | — | `float16` | `TRITON_ATTN`, with a warning |
+| Ampere or newer (sm_80+) | RTX Ada, A10, A100 | `bfloat16` | omitted — vLLM chooses (FlashInfer) |
+| Turing (sm_75) | Tesla T4 | `float32` | `TRITON_ATTN` |
+| Undetectable (no `nvidia-smi`) | — | `float32` | `TRITON_ATTN`, with a warning |
 
 An explicit value always wins, so either can be forced:
 
 ```
-DTYPE=float16 VLLM_ATTENTION_BACKEND=FLEX_ATTENTION ./run-server.sh
+DTYPE=float16 ATTENTION_BACKEND=FLEX_ATTENTION ./run-server.sh
 ```
+
+**The backend is a command-line flag, not an environment variable.**
+`VLLM_ATTENTION_BACKEND` — which most advice online, and this repo's own earlier
+comments, still name — **does not exist in vLLM 0.22.1**: the string appears
+nowhere in the package, so exporting it is silently inert and the server goes on
+selecting FlashInfer. The live knob is `--attention-backend <NAME>` (or
+`--attention-config '{"backend": "<NAME>"}'`; the two are mutually exclusive and
+vLLM raises if both are given). `ATTENTION_BACKEND` above is *this script's* env
+knob, which becomes that flag.
 
 **Why both are needed on a T4, and why only one of them is obvious.** The dtype
 half fails loudly at startup — vLLM refuses `bfloat16` below sm_80 and says so
@@ -75,10 +84,38 @@ fail at launch — an optimistic gate, not a missing one. The backend has to be
 named. `TRITON_ATTN` is the one that reports support down to sm_60 and takes
 fp16; **`FLASH_ATTN` does not support sm_75** and is not an alternative there.
 
+### float16 is not an option for this model
+
+The obvious dtype below sm_80 is fp16, and it is **silently wrong here**. The
+weights are bfloat16; cast to float16 the server starts, reports healthy, serves
+200s at full throughput — and every page comes back as `!!!!!!!!` (token 0, the
+signature of non-finite logits). Measured on one page of
+`tests/fixtures/31051047.pdf`, same image and request for all three:
+
+| `--dtype` | backend | output |
+|---|---|---|
+| `bfloat16` | FlashInfer | correct markdown |
+| `float16` | FlashInfer | `!!!!` |
+| `float16` | `TRITON_ATTN` | `!!!!` |
+
+So it is the **dtype**, not the backend — and a pre-Ampere card has no bfloat16
+to fall back on. That leaves `float32`, the only remaining width that cannot
+overflow. It costs ~4.8 GiB of weights (fine on a T4's 16 GiB, an OOM on a 6 GiB
+card) and it is slow. That is a bad trade taken deliberately: a server that OOMs
+at startup fails immediately and legibly, whereas one that OCRs every page to
+`!` fails at the far end of the pipeline, as empty documents.
+
+**The pre-Ampere path is not covered by the determinism spike, and fp32 output
+quality has not been verified on a T4** — it could not be measured on the 6 GiB
+development card, which OOMs before serving. Run `./smoke-test.sh` and confirm
+the output is markdown before trusting a document to it. If fp32 proves too slow,
+`deploy/p100/`'s transformers shim is the fallback — but note it runs fp16 too,
+so smoke-test its output as well rather than assuming it escapes this.
+
 Expect Turing to be materially slower than an Ampere+ card: Triton attention
-replaces FlashInfer, and the run sits outside the pinned-vLLM determinism gate
-the spike validated. A **P100 (sm_60) is out of scope for this image entirely** —
-it has no Pascal kernels at all; see `deploy/p100/` for that card.
+replaces FlashInfer, fp32 replaces bf16, and the run sits outside the pinned-vLLM
+determinism gate the spike validated. A **P100 (sm_60) is out of scope for this
+image entirely** — it has no Pascal kernels at all; see `deploy/p100/`.
 
 If a vLLM upgrade ever renames a backend, the valid names are its own enum:
 
@@ -87,6 +124,9 @@ podman run --rm --device nvidia.com/gpu=all --entrypoint python3 \
   docker.io/vllm/vllm-openai:v0.22.1 -c \
   'from vllm.v1.attention.backends.registry import AttentionBackendEnum as E; print(sorted(m.name for m in E))'
 ```
+
+Check the flag itself the same way — `vllm serve --help | grep attention` — since
+it is the half of this that a version bump is most likely to move.
 
 ## Single container (pdfparser + vLLM)
 

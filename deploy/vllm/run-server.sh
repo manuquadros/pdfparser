@@ -27,9 +27,10 @@ HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 
-# DTYPE and VLLM_ATTENTION_BACKEND default to whatever the card supports; an
-# explicit value here or in the environment wins.  See gpu-defaults.sh for why
-# the backend cannot be left to vLLM's own selection on a pre-Ampere card.
+# DTYPE and ATTENTION_BACKEND default to whatever the card supports; an explicit
+# value here or in the environment wins.  See gpu-defaults.sh for why the backend
+# cannot be left to vLLM's own selection on a pre-Ampere card — and why it is a
+# flag rather than the VLLM_ATTENTION_BACKEND variable most advice still names.
 # shellcheck source=deploy/vllm/gpu-defaults.sh
 . "$SCRIPT_DIR/gpu-defaults.sh"
 apply_gpu_defaults
@@ -53,10 +54,12 @@ podman_args=(
   -e VLLM_USE_FLASHINFER_SAMPLER=0
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 )
-# Pass the backend only when one was chosen: an empty VLLM_ATTENTION_BACKEND is
-# not the same as an unset one, and "let vLLM decide" is the Ampere+ path.
-if [ -n "${VLLM_ATTENTION_BACKEND:-}" ]; then
-  podman_args+=(-e VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND")
+
+# Name the backend only when one was chosen; "let vLLM decide" is the Ampere+
+# path, and vLLM rejects --attention-backend alongside --attention-config.
+backend_args=()
+if [ -n "${ATTENTION_BACKEND:-}" ]; then
+  backend_args=(--attention-backend "$ATTENTION_BACKEND")
 fi
 
 # ENFORCE_EAGER is deliberately unquoted below: empty must expand to *no*
@@ -70,4 +73,5 @@ exec podman run "${podman_args[@]}" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --limit-mm-per-prompt '{"image": 1}' \
+    "${backend_args[@]}" \
     $ENFORCE_EAGER
