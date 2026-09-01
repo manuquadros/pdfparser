@@ -15,7 +15,10 @@ sm_60 is research-grade (FlashAttention/FlashInfer/Triton assume sm_75/80+).
 is enough. The trade-off: serialized, eager attention, no continuous batching —
 **materially slower** than vLLM on a supported card, and outside the pinned-vLLM
 determinism/fidelity gate. If a T4/A10/A40/A6000/A100 (sm_75+) is available,
-prefer `deploy/vllm/` instead; this shim becomes unnecessary.
+prefer `deploy/vllm/` instead; this shim becomes unnecessary. A **T4** needs no
+hand-tuning there: `deploy/vllm/gpu-defaults.sh` reads the compute capability and
+picks `--dtype float16` with `VLLM_ATTENTION_BACKEND=TRITON_ATTN`, without which
+vLLM auto-selects FlashInfer and the engine dies on the first request.
 
 ## Setup (host venv)
 

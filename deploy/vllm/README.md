@@ -39,6 +39,55 @@ Two deployment shapes, both covered below:
    the `/var/run/cdi` copy** — the same qualified device name in two spec dirs
    makes podman reject the CDI registry as a duplicate.
 
+## GPU compute capability (dtype and attention backend)
+
+Two of the server's settings depend on the card. Both `run-server.sh` and the
+unified image derive them at start time from the GPU's compute capability
+(`gpu-defaults.sh`), so neither has to be edited per machine:
+
+| Card | Example | `--dtype` | `VLLM_ATTENTION_BACKEND` |
+|---|---|---|---|
+| Ampere or newer (sm_80+) | RTX Ada, A10, A100 | `bfloat16` | unset — vLLM chooses (FlashInfer) |
+| Turing (sm_75) | Tesla T4 | `float16` | `TRITON_ATTN` |
+| Undetectable (no `nvidia-smi`) | — | `float16` | `TRITON_ATTN`, with a warning |
+
+An explicit value always wins, so either can be forced:
+
+```
+DTYPE=float16 VLLM_ATTENTION_BACKEND=FLEX_ATTENTION ./run-server.sh
+```
+
+**Why both are needed on a T4, and why only one of them is obvious.** The dtype
+half fails loudly at startup — vLLM refuses `bfloat16` below sm_80 and says so
+(*"Bfloat16 is only supported on GPUs with compute capability of at least
+8.0"*). The backend half fails on the **first request**, killing the engine and
+taking the whole server down with it:
+
+```
+RuntimeError: BatchPrefillWithPagedKVCache failed with error invalid argument
+EngineCore encountered a fatal error … EngineDeadError
+```
+
+That one will not resolve itself by leaving the choice to vLLM.
+`FlashInferBackend`'s own gate answers `supports_compute_capability(7.5) → True`,
+so auto-selection picks FlashInfer on a T4 and the image's prebuilt kernels then
+fail at launch — an optimistic gate, not a missing one. The backend has to be
+named. `TRITON_ATTN` is the one that reports support down to sm_60 and takes
+fp16; **`FLASH_ATTN` does not support sm_75** and is not an alternative there.
+
+Expect Turing to be materially slower than an Ampere+ card: Triton attention
+replaces FlashInfer, and the run sits outside the pinned-vLLM determinism gate
+the spike validated. A **P100 (sm_60) is out of scope for this image entirely** —
+it has no Pascal kernels at all; see `deploy/p100/` for that card.
+
+If a vLLM upgrade ever renames a backend, the valid names are its own enum:
+
+```
+podman run --rm --device nvidia.com/gpu=all --entrypoint python3 \
+  docker.io/vllm/vllm-openai:v0.22.1 -c \
+  'from vllm.v1.attention.backends.registry import AttentionBackendEnum as E; print(sorted(m.name for m in E))'
+```
+
 ## Single container (pdfparser + vLLM)
 
 Build the unified image from the repo root (the build context needs `src/` and
@@ -150,10 +199,14 @@ podman **quadlet** (systemd user unit) — ask and I'll generate the
   prune old images (`podman image prune`) if a pull fails for space.
 - **6 GiB card:** `--enforce-eager` (no CUDA-graph capture) and
   `--gpu-memory-utilization 0.85` are what fit on this GPU in the spike. On a
-  bigger card, drop `--enforce-eager` for CUDA graphs and raise utilization.
+  bigger card, drop `--enforce-eager` for CUDA graphs (`ENFORCE_EAGER=""`) and
+  raise utilization.
 - **Image tag** is pinned to `v0.22.1` to match the validated spike. Bumping it
   re-opens the determinism/fidelity question — re-run the spike against the new
   tag before trusting it.
-- **flashinfer:** `VLLM_USE_FLASHINFER_SAMPLER=0` avoids the startup nvcc JIT
-  failure on this runtime-only host. The container itself has no CUDA toolkit
-  either, so leave it set unless you switch to a `flashinfer-jit-cache` image.
+- **flashinfer, twice over:** two unrelated settings carry the name.
+  `VLLM_USE_FLASHINFER_SAMPLER=0` (always set) avoids the startup nvcc JIT
+  failure on this runtime-only host — the container has no CUDA toolkit either,
+  so leave it set unless you switch to a `flashinfer-jit-cache` image. The
+  flashinfer *attention backend* is a separate matter, handled by capability
+  above; disabling the sampler does not disable it.

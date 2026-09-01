@@ -2,3 +2,5 @@
 !src
 !pyproject.toml
 !README.md
+!deploy/vllm/gpu-defaults.sh
+!deploy/vllm/entrypoint.sh
