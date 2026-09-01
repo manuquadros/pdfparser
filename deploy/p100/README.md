@@ -119,6 +119,23 @@ only specific tailnet users/devices can reach the VM.
 `deploy/vllm/smoke-test.sh` (OCRs fixture page 1 through the chat endpoint) works
 unchanged against the shim — it only needs the OpenAI-compatible endpoint up.
 
+## Troubleshooting
+
+- **`torch.OutOfMemoryError` partway through a document, in the vision-encoder
+  attention** (with a large "reserved but unallocated" figure): allocator
+  **fragmentation** across pages of varying image/context size, not a
+  genuinely-too-big page. The shim already reclaims cached blocks between
+  requests (`torch.cuda.empty_cache()`); also start it with
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to stop the fragmentation at
+  the source. Eager attention (forced on Pascal — no FlashAttention) is the
+  memory-heaviest op, so it OOMs first. If a *single* page still OOMs after both,
+  that page's image is genuinely too large for 16 GiB in eager mode — reduce the
+  render scale or cap image pixels before `Image.open`.
+- **Slow (minutes per page)**: expected on a P100 — eager, fp16, serialized, and
+  dense pages trigger the client's full-window re-OCR. Confirm progress via one
+  `POST /v1/chat/completions` log line per page and high `nvidia-smi` GPU-Util;
+  get a per-page baseline from a 1–2 page PDF before running a whole paper.
+
 ## Notes / caveats
 
 - **fp16, not bf16** — Pascal has no bfloat16. Minor numeric differences vs the

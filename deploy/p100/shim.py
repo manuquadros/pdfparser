@@ -132,12 +132,23 @@ def chat(body: dict) -> dict:
     prompt_tokens = int(inputs["input_ids"].shape[1])
 
     with _gpu_lock, torch.inference_mode():
-        # do_sample=False (greedy) matches the client's temperature=0.0 contract
-        # and keeps the transcription reproducible run-to-run.
-        out = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
-    new_ids = out[0, prompt_tokens:]
-    text = processor.decode(new_ids, skip_special_tokens=True)
-    completion_tokens = int(new_ids.shape[0])
+        try:
+            # do_sample=False (greedy) matches the client's temperature=0.0 contract
+            # and keeps the transcription reproducible run-to-run.
+            out = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
+            new_ids = out[0, prompt_tokens:]
+            text = processor.decode(new_ids, skip_special_tokens=True)
+            completion_tokens = int(new_ids.shape[0])
+        finally:
+            # Page images and context lengths vary request-to-request, so the CUDA
+            # caching allocator fragments; on a 16 GiB card a later *normal* page
+            # then OOMs in the eager vision-encoder attention (which materializes a
+            # full fp32 seq×seq matrix) even though no single request is too big.
+            # Return cached blocks between requests — safe because the GPU lock
+            # serializes generation.  Pair with, on the server env,
+            # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+            del inputs
+            torch.cuda.empty_cache()
     # finish_reason="length" is load-bearing: it triggers the client's dense-page
     # re-OCR with the full context window (pipeline/model.py _ocr_page).
     finish_reason = "length" if completion_tokens >= max_new else "stop"
