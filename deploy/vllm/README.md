@@ -179,6 +179,29 @@ Tunables are env overrides, e.g.:
 PORT=8001 GPU_MEM_UTIL=0.80 ./run-server.sh
 ```
 
+### Which interface the port lands on
+
+`-p` with no address publishes on **all** of them, which is fine on a laptop and
+wrong on a VM with a public IP: vLLM has no authentication of its own, so the
+model answers anyone who finds the port. `BIND_ADDR` pins it to one address:
+
+```
+BIND_ADDR="$(tailscale ip -4)" ./run-server.sh   # tailnet only
+BIND_ADDR=127.0.0.1 ./run-server.sh              # local only (podman exec, SSH tunnel)
+```
+
+An IPv6 literal is bracketed automatically, and a value that is already
+bracketed is taken as-is. The default is unchanged — every interface — so this
+is opt-in; set it on any host reachable from outside.
+
+The address must be up before the server starts. A boot-time unit can easily
+beat `tailscaled` to it, and podman's own bind failure names neither the address
+nor the cause, so the script checks first and says which address is missing.
+
+Note this is the *only* control over the public interface. A Tailscale ACL
+governs what may cross the tailnet; it has nothing to say about a port that is
+also listening on a public IP. The two are not substitutes.
+
 ## Smoke test
 
 With the server up, in another shell:
