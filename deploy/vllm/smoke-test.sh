@@ -5,16 +5,31 @@
 #
 #   ./smoke-test.sh                       # uses tests/fixtures/31051047.pdf p1
 #   PDF=tests/fixtures/30592559.pdf ./smoke-test.sh
+#   BASE_URL=http://10.0.0.5:8000/v1 ./smoke-test.sh   # server on another host
 set -euo pipefail
 
 PORT="${PORT:-8000}"
 PDF="${PDF:-tests/fixtures/31051047.pdf}"
-# 127.0.0.1, not localhost: rootless podman's port-forwarder answers on IPv4
-# only, so a localhost that resolves to IPv6 ::1 gets "connection reset".
-ENDPOINT="http://127.0.0.1:${PORT}/v1/chat/completions"
+# Defaults to the same env var the pipeline's model seam reads, so one export
+# points both the smoke test and a conversion at the same server. 127.0.0.1
+# rather than localhost in the fallback: rootless podman's port-forwarder
+# answers on IPv4 only, so a localhost resolving to ::1 gets "connection reset".
+BASE_URL="${BASE_URL:-${PDFPARSER_VLLM_URL:-http://127.0.0.1:${PORT}/v1}}"
+BASE_URL="${BASE_URL%/}"
+MODEL="${MODEL:-${PDFPARSER_VLLM_MODEL:-lightonocr}}"
+ENDPOINT="${BASE_URL}/chat/completions"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+
+echo "server: ${BASE_URL}   model: ${MODEL}" >&2
+# Probe /models before rendering: against a remote server the likeliest failure
+# is an unreachable host, a closed port or a dead tunnel, and it reads far more
+# clearly here than as a curl error after the multi-second render below.
+curl -sS -m 20 "${BASE_URL}/models" >/dev/null || {
+  echo "cannot reach ${BASE_URL}/models - is the server up and the port reachable?" >&2
+  exit 1
+}
 
 # Render with the project's own renderer so the image matches what the pipeline
 # would send (200 DPI, long side <= 1540).
@@ -46,7 +61,7 @@ if "choices" not in data:
 print(data["choices"][0]["message"]["content"][:1200])
 '
 {
-  "model": "lightonocr",
+  "model": "${MODEL}",
   "temperature": 0.0,
   "max_tokens": 2048,
   "messages": [

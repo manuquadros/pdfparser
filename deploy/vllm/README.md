@@ -191,6 +191,39 @@ Renders fixture page 1 with the project's own renderer and OCRs it through the
 chat endpoint; prints the first ~1200 chars of markdown. `PDF=… ./smoke-test.sh`
 to pick another file.
 
+### Against a server on another host
+
+The GPU box and the machine holding the PDFs need not be the same: the script
+renders locally and sends only the page image, so point it at the remote server.
+`BASE_URL` (or `PDFPARSER_VLLM_URL`, the same variable the pipeline reads)
+overrides the endpoint, and `MODEL`/`PDFPARSER_VLLM_MODEL` the served name:
+
+```
+BASE_URL=http://<vm-host>:8000/v1 ./smoke-test.sh
+```
+
+`run-server.sh` publishes the port with `-p ${PORT}:8000`, which binds all
+interfaces on the VM — so this works as soon as the VM's firewall/security group
+lets the port through. When it doesn't (the usual case for a cloud VM), forward
+it over SSH instead and keep the default endpoint:
+
+```
+ssh -N -L 8000:127.0.0.1:8000 <vm-host> &     # in one shell
+./smoke-test.sh                               # in another
+```
+
+An unreachable host, a closed port or a dead tunnel is reported by the `/models`
+probe before the render, so it fails in a second rather than after rendering.
+
+Once the smoke test passes, the same variable drives a full conversion:
+
+```
+PDFPARSER_VLLM_URL=http://<vm-host>:8000/v1 pdm run python -m pdfparser in.pdf out.html
+```
+
+A remote server makes the round-trip latency per page visible; raise
+`PDFPARSER_OCR_CONCURRENCY` (default 4) if the link is slow but the GPU is idle.
+
 ## Calling it from the pipeline
 
 OpenAI-compatible chat completions, one image per request, greedy:
