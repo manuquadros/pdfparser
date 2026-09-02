@@ -200,7 +200,13 @@ nor the cause, so the script checks first and says which address is missing.
 
 Note this is the *only* control over the public interface. A Tailscale ACL
 governs what may cross the tailnet; it has nothing to say about a port that is
-also listening on a public IP. The two are not substitutes.
+also listening on a public IP. The two are not substitutes — you want both, and
+`BIND_ADDR` is the half that lives here.
+
+The other half, and the network design around it — tailnet ACL and tags, host
+firewall, optional app-layer token, and how to verify the result actually
+holds — is in [`../SECURITY.md`](../SECURITY.md). It covers this server and the
+P100 shim alike; read it before exposing either on a VM with a public IP.
 
 ## Smoke test
 

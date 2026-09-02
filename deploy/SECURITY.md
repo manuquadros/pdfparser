@@ -1,37 +1,44 @@
-# P100 OCR Shim — Security Design
+# OCR server — security design
+
+Applies to **both** deployment paths. They differ only in what terminates the
+HTTP: `deploy/vllm/` (the vLLM container, `run-server.sh`) and `deploy/p100/`
+(the transformers shim, `shim.py`). The network design is identical for each;
+where a control has a different knob or default per path, both are given.
 
 ## Goal
 
-Expose the LightOnOCR transformers shim (`deploy/p100/shim.py`) running on the
-**P100 VM** so that it is reachable **solely from the annotation-hub backend
-VM** — and from nothing else: not the public internet, not other devices on the
-tailnet, not other tenants of the cloud project.
+Expose the OCR server running on the GPU VM so that it is reachable **solely
+from the annotation-hub backend VM** — and from nothing else: not the public
+internet, not other devices on the tailnet, not other tenants of the cloud
+project.
 
 This is a single, machine-to-machine (M2M) trust relationship: the annotation-hub
 backend holds one long-lived `OcrModel` (an httpx pool, see
-`pipeline/model.py::OcrModel`, which can `reconnect()` across shim restarts) and
-is the *only* intended client. That narrow requirement is what makes a strict
-lock-down practical.
+`pipeline/model.py::OcrModel`, which can `reconnect()` across server restarts)
+and is the *only* intended client. That narrow requirement is what makes a
+strict lock-down practical.
 
 ## System context
 
 ```
                           Tailscale tailnet (WireGuard, E2E encrypted)
                         ┌───────────────────────────────────────────────┐
-  annotation-hub VM     │                                               │      P100 VM
+  annotation-hub VM     │                                               │      GPU VM
   ┌───────────────┐     │   only tag:annotation-hub → tag:ocr:8000       │   ┌────────────────────┐
-  │ backend       │─────┼──────────────────────────────────────────────▶│   │ shim.py            │
+  │ backend       │─────┼──────────────────────────────────────────────▶│   │ vLLM  or  shim.py  │
   │ OcrModel      │     │                                               │   │ 127.0.0.1 / tsnet  │
-  │ (httpx pool)  │     │   everything else → tag:ocr : DENY             │   │ LightOnOCR (fp16)  │
+  │ (httpx pool)  │     │   everything else → tag:ocr : DENY             │   │ LightOnOCR         │
   └───────────────┘     └───────────────────────────────────────────────┘   └────────────────────┘
         │                                                                            │
         └── no public inbound ──────────────────── no public inbound ───────────────┘
                          (cloud firewall default-deny; port 8000 never opened)
 ```
 
-The shim itself is an **unauthenticated, plaintext** OpenAI-compatible HTTP
-server that binds `127.0.0.1` by default. It has no notion of identity — all
-access control is layered *around* it.
+Both servers are **unauthenticated, plaintext** OpenAI-compatible HTTP with no
+notion of identity — all access control is layered *around* them. Their bind
+defaults differ, and the difference is load-bearing here: the shim binds
+`127.0.0.1` unless `SHIM_HOST` says otherwise, whereas `run-server.sh` publishes
+on **every** interface unless `BIND_ADDR` says otherwise.
 
 ## Assets and threat model
 
@@ -69,6 +76,7 @@ access control is layered *around* it.
 | Control | Status | Defends against |
 |---|---|---|
 | Shim binds `127.0.0.1` (or tailnet IP), never a public interface | ✅ in code (`SHIM_HOST` default) | #1 scanners |
+| vLLM publishes on one address, never a public interface | ⚠️ opt-in (`BIND_ADDR`; the default is every interface) | #1 scanners |
 | No cloud firewall port opened for 8000 | ✅ operational | #1 scanners |
 | Tailscale WireGuard encryption of the hop | ✅ | #2 on-path |
 | `tailscale serve` optional TLS on top | ✅ optional | #2 on-path (belt) |
@@ -127,13 +135,18 @@ tailnet policy before it reaches the VM.
 
 ### Layer 2 — Bind + host firewall (no path from the public NIC)
 
-- Run the shim on the tailnet interface only, or on loopback behind
+- Run the server on the tailnet interface only, or on loopback behind
   `tailscale serve`:
   ```bash
+  # vLLM container
+  BIND_ADDR="$(tailscale ip -4)" ./deploy/vllm/run-server.sh
+  # transformers shim
   SHIM_HOST=$(tailscale ip -4) python deploy/p100/shim.py
   # or keep 127.0.0.1 and:  tailscale serve --bg http://127.0.0.1:8000
   ```
-  Never `SHIM_HOST=0.0.0.0` with a public NIC present.
+  Never bind `0.0.0.0` with a public NIC present. On the vLLM path that needs
+  saying out loud, because it is the default: omitting `BIND_ADDR` *is*
+  `0.0.0.0`, so this layer is skipped by doing nothing.
 - Host firewall default-deny inbound; allow only the `tailscale0` interface.
   Tailscale needs **no** inbound public port (it does NAT traversal outbound):
   ```bash
@@ -144,10 +157,11 @@ tailnet policy before it reaches the VM.
 
 ### Layer 3 — App-layer auth (defense in depth vs. an ACL mistake)
 
-Because the goal is single-tenant and strict, a static bearer token in the shim
-is worthwhile *belt-and-suspenders*: if Layer 1 is ever misconfigured, the shim
+Because the goal is single-tenant and strict, a static bearer token is
+worthwhile *belt-and-suspenders*: if Layer 1 is ever misconfigured, the server
 still refuses an unauthenticated caller.
 
+- vLLM: `--api-key <key>` is built in — no code needed on the server side.
 - Shim: read `SHIM_API_KEY`; if set, require `Authorization: Bearer <key>` on
   `/v1/chat/completions` (and optionally `/v1/models`), else `401`.
 - Client: `pipeline/model.py` does not send an auth header today. A small,
@@ -155,13 +169,17 @@ still refuses an unauthenticated caller.
   `load_ocr_model` and set `Authorization` on the shared `httpx.Client` — wires
   it through (the annotation-hub worker already owns the `OcrModel` lifecycle, so
   it just sets the env). **This requires that client change to be useful**; until
-  then, Layers 1–2 are the enforced controls.
+  then, Layers 1–2 are the enforced controls — and enabling a key on the server
+  *without* it does not harden anything, it simply breaks the pipeline, since
+  every request then gets a `401`.
 
 ### Layer 4 — Process hardening (contain a payload-parsing exploit)
 
-The shim decodes attacker-influenced bytes through `Pillow` and `transformers`;
-Pillow has a CVE history (decompression bombs, malformed-image parsing). Contain
-the blast radius:
+This layer is written for the shim, which runs directly on the host and decodes
+attacker-influenced bytes through `Pillow` and `transformers`; Pillow has a CVE
+history (decompression bombs, malformed-image parsing). The vLLM path gets much
+of it for free — rootless podman already confines the process — so read this as
+shim-specific unless noted. Contain the blast radius:
 
 - **Run as a non-root user.** A `Pillow`/`torch` RCE then isn't root.
 - **Cap input size** in `_decode_image`: reject payloads over a few MB and set

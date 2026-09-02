@@ -79,6 +79,10 @@ and `PDFPARSER_VLLM_MODEL=lightonocr`.
 
 ## Remote access (Tailscale — private, no public port)
 
+The full design behind this section — threat model, tailnet ACL and tags, host
+firewall, optional app-layer token — is in [`../SECURITY.md`](../SECURITY.md),
+which now covers the `deploy/vllm/` server too and so lives one level up.
+
 The shim is **unauthenticated and has no TLS**, so it must never bind a public
 interface. To reach it from other machines, put them on the same Tailscale
 tailnet — membership is the auth, WireGuard encrypts the hop, and **no cloud
