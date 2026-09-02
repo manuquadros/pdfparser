@@ -35,10 +35,10 @@ strict lock-down practical.
 ```
 
 Both servers are **unauthenticated, plaintext** OpenAI-compatible HTTP with no
-notion of identity — all access control is layered *around* them. Their bind
-defaults differ, and the difference is load-bearing here: the shim binds
-`127.0.0.1` unless `SHIM_HOST` says otherwise, whereas `run-server.sh` publishes
-on **every** interface unless `BIND_ADDR` says otherwise.
+notion of identity — all access control is layered *around* them. Both therefore
+bind `127.0.0.1` by default, and reaching either from another machine is an
+explicit act: `SHIM_HOST` for the shim, `BIND_ADDR` for the vLLM container.
+Exposure is something you ask for, never something you get by omission.
 
 ## Assets and threat model
 
@@ -76,7 +76,7 @@ on **every** interface unless `BIND_ADDR` says otherwise.
 | Control | Status | Defends against |
 |---|---|---|
 | Shim binds `127.0.0.1` (or tailnet IP), never a public interface | ✅ in code (`SHIM_HOST` default) | #1 scanners |
-| vLLM publishes on one address, never a public interface | ⚠️ opt-in (`BIND_ADDR`; the default is every interface) | #1 scanners |
+| vLLM publishes on one address, never a public interface | ✅ in code (`BIND_ADDR` default) | #1 scanners |
 | No cloud firewall port opened for 8000 | ✅ operational | #1 scanners |
 | Tailscale WireGuard encryption of the hop | ✅ | #2 on-path |
 | `tailscale serve` optional TLS on top | ✅ optional | #2 on-path (belt) |
@@ -144,9 +144,10 @@ tailnet policy before it reaches the VM.
   SHIM_HOST=$(tailscale ip -4) python deploy/p100/shim.py
   # or keep 127.0.0.1 and:  tailscale serve --bg http://127.0.0.1:8000
   ```
-  Never bind `0.0.0.0` with a public NIC present. On the vLLM path that needs
-  saying out loud, because it is the default: omitting `BIND_ADDR` *is*
-  `0.0.0.0`, so this layer is skipped by doing nothing.
+  Never bind `0.0.0.0` with a public NIC present. Both servers default to
+  loopback, so this layer holds unless someone overrides it — the failure mode
+  is a refused connection, which is noticed, rather than a silent exposure,
+  which is not.
 - Host firewall default-deny inbound; allow only the `tailscale0` interface.
   Tailscale needs **no** inbound public port (it does NAT traversal outbound):
   ```bash

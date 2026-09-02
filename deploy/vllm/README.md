@@ -181,22 +181,27 @@ PORT=8001 GPU_MEM_UTIL=0.80 ./run-server.sh
 
 ### Which interface the port lands on
 
-`-p` with no address publishes on **all** of them, which is fine on a laptop and
-wrong on a VM with a public IP: vLLM has no authentication of its own, so the
-model answers anyone who finds the port. `BIND_ADDR` pins it to one address:
+**The default is `127.0.0.1`** — the server is unreachable from other machines
+until you say otherwise. vLLM has no authentication of its own, so the port is
+the whole access control; publishing on every interface (podman's behaviour when
+`-p` names no address) would serve the model to anyone who reaches the host.
+`BIND_ADDR` names the one address to publish on:
 
 ```
 BIND_ADDR="$(tailscale ip -4)" ./run-server.sh   # tailnet only
-BIND_ADDR=127.0.0.1 ./run-server.sh              # local only (podman exec, SSH tunnel)
+./run-server.sh                                  # loopback: podman exec, SSH tunnel
+BIND_ADDR=0.0.0.0 ./run-server.sh                # every interface, deliberately
 ```
 
 An IPv6 literal is bracketed automatically, and a value that is already
-bracketed is taken as-is. The default is unchanged — every interface — so this
-is opt-in; set it on any host reachable from outside.
+bracketed is taken as-is. `0.0.0.0` and `::` are accepted as the explicit way to
+ask for every interface — that is a decision you now have to make out loud
+rather than get by omission.
 
 The address must be up before the server starts. A boot-time unit can easily
 beat `tailscaled` to it, and podman's own bind failure names neither the address
-nor the cause, so the script checks first and says which address is missing.
+nor the cause, so the script checks first and says which address is missing (the
+two wildcards are exempt, belonging to no interface).
 
 Note this is the *only* control over the public interface. A Tailscale ACL
 governs what may cross the tailnet; it has nothing to say about a port that is
@@ -231,10 +236,13 @@ overrides the endpoint, and `MODEL`/`PDFPARSER_VLLM_MODEL` the served name:
 BASE_URL=http://<vm-host>:8000/v1 ./smoke-test.sh
 ```
 
-`run-server.sh` publishes the port with `-p ${PORT}:8000`, which binds all
-interfaces on the VM — so this works as soon as the VM's firewall/security group
-lets the port through. When it doesn't (the usual case for a cloud VM), forward
-it over SSH instead and keep the default endpoint:
+For this to reach anything, the server must have been started with a
+`BIND_ADDR` that is reachable from here — it binds loopback otherwise, so a
+remote client gets a refused connection no matter what the firewall allows. On
+a tailnet that is `BIND_ADDR="$(tailscale ip -4)" ./run-server.sh`.
+
+Alternatively leave the server on loopback and forward the port over SSH, which
+keeps the default endpoint working unchanged:
 
 ```
 ssh -N -L 8000:127.0.0.1:8000 <vm-host> &     # in one shell

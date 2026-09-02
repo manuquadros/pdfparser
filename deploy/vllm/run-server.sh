@@ -22,11 +22,12 @@ IMAGE="${IMAGE:-docker.io/vllm/vllm-openai:v0.22.1}"
 NAME="${NAME:-lighton-vllm}"
 MODEL="${MODEL:-lightonai/LightOnOCR-2-1B-bbox}"
 PORT="${PORT:-8000}"
-# Podman publishes on every interface when the -p flag names no address, which
-# on a VM with a public IP serves the model to the internet — vLLM has no auth
-# of its own.  BIND_ADDR pins the published port to a single address, e.g. the
-# tailnet one:  BIND_ADDR="$(tailscale ip -4)" ./run-server.sh
-BIND_ADDR="${BIND_ADDR:-}"
+# Loopback by default: vLLM has no auth of its own, so publishing on every
+# interface — podman's behaviour when -p names no address — would serve the
+# model to anyone who reaches the host.  Reaching it from another machine is
+# therefore an explicit act:  BIND_ADDR="$(tailscale ip -4)" ./run-server.sh
+# Matches deploy/p100/shim.py's SHIM_HOST default; see deploy/SECURITY.md.
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
@@ -48,27 +49,31 @@ ENFORCE_EAGER="${ENFORCE_EAGER---enforce-eager}"
 # the 2.7 GiB model) whether the container runs as root or a non-root user.
 # Rootless podman maps the host user onto the container user, so the existing
 # weights remain readable through the mount.
-publish="${PORT}:8000"
-if [ -n "$BIND_ADDR" ]; then
-  # Accept a bracketed IPv6 literal as well, so the value can be pasted straight
-  # from a -p flag; the bare form is what the interface check below needs.
-  bind_bare="${BIND_ADDR#"["}"
-  bind_bare="${bind_bare%"]"}"
-  case "$bind_bare" in
-    # An IPv6 literal must be bracketed in -p or its colons read as the field
-    # separators between address, host port and container port.
-    *:*) publish="[${bind_bare}]:${PORT}:8000" ;;
-    *) publish="${bind_bare}:${PORT}:8000" ;;
-  esac
-  # A boot-time unit can start this before tailscaled (or any other late
-  # interface) has brought the address up, and podman's own bind failure names
-  # neither the address nor the reason.
-  if command -v ip >/dev/null 2>&1 &&
-    ! ip -o addr show | grep -qF " ${bind_bare}/"; then
-    echo "BIND_ADDR ${bind_bare} is not assigned to any local interface." >&2
-    echo "If it is a tailnet address, tailscaled may not be up yet." >&2
-    exit 1
-  fi
+# Accept a bracketed IPv6 literal as well, so the value can be pasted straight
+# from a -p flag; the bare form is what the interface check below needs.
+bind_bare="${BIND_ADDR#"["}"
+bind_bare="${bind_bare%"]"}"
+case "$bind_bare" in
+  # An IPv6 literal must be bracketed in -p or its colons read as the field
+  # separators between address, host port and container port.
+  *:*) publish="[${bind_bare}]:${PORT}:8000" ;;
+  *) publish="${bind_bare}:${PORT}:8000" ;;
+esac
+
+# A boot-time unit can start this before tailscaled (or any other late
+# interface) has brought the address up, and podman's own bind failure names
+# neither the address nor the reason.  The wildcards are exempt: they are valid
+# binds that belong to no interface, so the check would otherwise reject the one
+# deliberate way of asking for every interface.
+case "$bind_bare" in
+  0.0.0.0 | ::) wildcard=yes ;;
+  *) wildcard=no ;;
+esac
+if [ "$wildcard" = no ] && command -v ip >/dev/null 2>&1 &&
+  ! ip -o addr show | grep -qF " ${bind_bare}/"; then
+  echo "BIND_ADDR ${bind_bare} is not assigned to any local interface." >&2
+  echo "If it is a tailnet address, tailscaled may not be up yet." >&2
+  exit 1
 fi
 
 podman_args=(
